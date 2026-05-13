@@ -708,6 +708,10 @@ static func _probe_live_server_status(port: int, timeout_ms: int = SERVER_STATUS
 	result["name"] = str(parsed.get("name", ""))
 	result["version"] = _extract_server_version(parsed)
 	result["ws_port"] = int(parsed.get("ws_port", 0))
+	## `package_path` was added in v2.4.4 (#416) so the dock's
+	## "Incompatible server" banner can name the source of a version
+	## skew. Older servers omit it; treat the missing field as "".
+	result["package_path"] = str(parsed.get("package_path", ""))
 	return result
 
 
@@ -1509,7 +1513,10 @@ func start_dev_server() -> void:
 				OS.set_environment("PYTHONPATH", prev_pythonpath)
 
 		if pid > 0:
-			var suffix := " (PYTHONPATH=%s)" % worktree_src if not worktree_src.is_empty() else ""
+			## Match `server_lifecycle.gd::start_server`'s log wording —
+			## "prefix" since we prepended to any pre-existing PYTHONPATH,
+			## not replaced it. See #429 review.
+			var suffix := " (PYTHONPATH prefix=%s)" % worktree_src if not worktree_src.is_empty() else ""
 			print("MCP | started dev server with --reload (PID %d): %s %s%s" % [pid, cmd, " ".join(inner_args), suffix])
 		else:
 			push_warning("MCP | failed to start dev server")
