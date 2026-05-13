@@ -12,7 +12,9 @@ extends RefCounted
 ## previously-registered class_name disappears, and that failure mode is
 ## independent of the runner's install ordering. See CLAUDE.md's
 ## never-delete-published-class_name policy for the shape-aware shim path
-## that retirement (if ever needed) must follow.
+## that retirement (if ever needed) must follow. The bare-`Mcp*` lint in
+## `tests/unit/test_plugin_self_update_safety.py` allow-lists this single
+## site.
 ##
 ## All consumers use the preload-alias pattern
 ## (`const ErrorCodes := preload(...)`) introduced in #412. The alias is
