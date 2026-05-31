@@ -501,6 +501,15 @@ def test_is_allowed_host_dns_name_never_matches_network() -> None:
     assert is_allowed_host("attacker.example.com:8000", nets) is False
 
 
+def test_is_allowed_host_bracketed_ipv6_in_network() -> None:
+    # A bracketed IPv6 Host literal is unwrapped and matched against an IPv6
+    # CIDR; one outside the range is rejected.
+    nets = parse_allow_hosts(["fd00::/8"])
+    assert is_allowed_host("[fd00::1]:8000", nets) is True
+    assert is_allowed_host("[fd00::1]", nets) is True
+    assert is_allowed_host("[2001:db8::1]:8000", nets) is False
+
+
 def test_is_allowed_host_without_networks_unchanged() -> None:
     # Default (None) is byte-for-byte loopback-only.
     assert is_allowed_host("192.168.1.50:8000") is False
