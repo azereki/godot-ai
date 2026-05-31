@@ -13,6 +13,7 @@ import pytest
 
 from godot_ai.transport.origin_guard import (
     LocalhostOnlyHTTPMiddleware,
+    bind_host_for_networks,
     evaluate_loopback,
     is_allowed_host,
     is_allowed_origin,
@@ -566,3 +567,20 @@ async def test_middleware_rejects_lan_host_without_opt_in() -> None:
     )
     assert inner_called is False
     assert sent[0]["status"] == 403
+
+
+def test_bind_host_for_networks_none_keeps_loopback_default() -> None:
+    # No opt-in → None so callers keep their loopback default.
+    assert bind_host_for_networks(None) is None
+    assert bind_host_for_networks([]) is None
+
+
+def test_bind_host_for_networks_ipv4_only() -> None:
+    assert bind_host_for_networks(parse_allow_hosts(["192.168.1.0/24"])) == "0.0.0.0"
+
+
+def test_bind_host_for_networks_ipv6_present_binds_dual_stack() -> None:
+    # An IPv6 allowlist must actually listen on IPv6, not silently bind v4-only.
+    assert bind_host_for_networks(parse_allow_hosts(["fd00::/8"])) == "::"
+    # Mixed families also bind "::" (dual-stack accepts v4-mapped on Linux).
+    assert bind_host_for_networks(parse_allow_hosts(["192.168.1.0/24", "fd00::/8"])) == "::"

@@ -195,7 +195,9 @@ def run_with_reload(
 
     ## Bind off loopback only when an allowlist is named; the guard (rebuilt
     ## inside create_app from the same env) still gates every request.
-    bind_host = "0.0.0.0" if allow_host_networks else fastmcp.settings.host  # noqa: S104
+    from godot_ai.transport.origin_guard import bind_host_for_networks
+
+    bind_host = bind_host_for_networks(allow_host_networks) or fastmcp.settings.host
 
     src_dir = str(Path(__file__).resolve().parent.parent)
     uvicorn.run(

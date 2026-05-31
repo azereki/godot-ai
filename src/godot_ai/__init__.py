@@ -122,7 +122,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     ## #421: parse --allow-host CIDRs. A typo here fails loudly at startup
     ## rather than silently binding loopback-only (or worse, wide open).
-    from godot_ai.transport.origin_guard import parse_allow_hosts
+    from godot_ai.transport.origin_guard import bind_host_for_networks, parse_allow_hosts
 
     try:
         allow_host_networks = parse_allow_hosts(args.allow_host or [])
@@ -131,11 +131,11 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     ## Widen the HTTP bind off loopback only when an allowlist is named. The
     ## DNS-rebinding guard still gates every request by the CIDR(s); binding
-    ## 0.0.0.0 without the guard would be the footgun this flag avoids.
+    ## off loopback without the guard would be the footgun this flag avoids.
     if allow_host_networks and args.transport in ("sse", "streamable-http"):
         import fastmcp
 
-        fastmcp.settings.host = "0.0.0.0"  # noqa: S104
+        fastmcp.settings.host = bind_host_for_networks(allow_host_networks)
 
     from godot_ai.runtime_info import install_pid_file
 

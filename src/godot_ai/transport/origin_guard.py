@@ -112,6 +112,24 @@ def parse_allow_hosts(values: Iterable[str]) -> list[IPNetwork]:
     return networks
 
 
+def bind_host_for_networks(networks: Sequence[IPNetwork] | None) -> str | None:
+    """Bind address that exposes the transports to ``networks`` (issue #421).
+
+    Returns ``None`` when no networks are named so callers keep their
+    loopback default (the byte-for-byte unchanged path). Otherwise returns
+    ``"::"`` when any requested network is IPv6 — on a dual-stack host that
+    also accepts IPv4 — and ``"0.0.0.0"`` for an IPv4-only allowlist, so an
+    IPv6 ``--allow-host`` actually listens on IPv6 instead of silently
+    binding IPv4-only. Centralized so the HTTP bind, the WebSocket bind, and
+    the reload runner can't disagree about where to listen.
+    """
+    if not networks:
+        return None
+    if any(isinstance(net, ipaddress.IPv6Network) for net in networks):
+        return "::"  # noqa: S104 — opt-in, and the guard still gates every request
+    return "0.0.0.0"  # noqa: S104 — same
+
+
 def _host_ip_in_networks(host_header: str, networks: Sequence[IPNetwork] | None) -> bool:
     """Whether the Host header's IP literal falls inside one of ``networks``.
 

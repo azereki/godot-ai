@@ -64,7 +64,11 @@ from godot_ai.tools.signal import register_signal_tools
 from godot_ai.tools.testing import register_testing_tools
 from godot_ai.tools.theme import register_theme_tools
 from godot_ai.tools.ui import register_ui_tools
-from godot_ai.transport.origin_guard import IPNetwork, LocalhostOnlyHTTPMiddleware
+from godot_ai.transport.origin_guard import (
+    IPNetwork,
+    LocalhostOnlyHTTPMiddleware,
+    bind_host_for_networks,
+)
 from godot_ai.transport.websocket import GodotWebSocketServer
 
 logger = logging.getLogger(__name__)
@@ -113,7 +117,7 @@ def create_server(
     ## #421: --allow-host opt-in. When set, expose both transports to the
     ## named LAN CIDR(s) — bind the WS server off loopback and hand the
     ## networks to its rebinding guard. None/empty = unchanged loopback-only.
-    ws_bind_host = "0.0.0.0" if allow_host_networks else "127.0.0.1"  # noqa: S104
+    ws_bind_host = bind_host_for_networks(allow_host_networks) or "127.0.0.1"
 
     # Capture ws_port in the lifespan closure
     @asynccontextmanager
