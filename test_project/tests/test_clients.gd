@@ -755,6 +755,15 @@ func test_claude_code_has_claude_json_fallback() -> void:
 	assert_true(client.resolved_config_path().ends_with(".claude.json"), "fallback path should be ~/.claude.json, got %s" % client.resolved_config_path())
 
 
+func test_claude_code_manual_command_shows_json_fallback() -> void:
+	# The CLI form is still the primary hint, but a user without the `claude`
+	# binary (VS Code extension) needs the ~/.claude.json edit too (#463).
+	var cmd := McpClientConfigurator.manual_command("claude_code")
+	assert_contains(cmd, "claude mcp add", "manual command should still show the CLI form")
+	assert_contains(cmd, ".claude.json", "manual command should also show the JSON fallback path")
+	assert_contains(cmd, "\"type\": \"http\"", "JSON fallback should show the type:http entry shape")
+
+
 func test_cli_fallback_dispatch_writes_json_when_binary_missing() -> void:
 	var path := _scratch_dir.path_join("cli_fallback.json")
 	_remove_if_exists(path)
