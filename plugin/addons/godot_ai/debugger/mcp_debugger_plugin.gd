@@ -432,7 +432,7 @@ func _wait_then_eval(
 		await tree.process_frame
 	if not is_game_capture_ready():
 		_send_error(connection, request_id, ErrorCodes.INTERNAL_ERROR,
-			"Game-side autoload never registered its debugger capture within %ds. Is the game actually running? Start it with play_scene / the editor's Play button, then retry." % int(EVAL_READY_WAIT_SEC))
+			"Game-side autoload never registered its debugger capture within %ds. Is the game actually running? Start it with project_run / the editor's Play button, then retry." % int(EVAL_READY_WAIT_SEC))
 		return
 	_send_eval(tree, code, request_id, connection, timeout_sec)
 
