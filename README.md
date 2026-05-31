@@ -34,6 +34,12 @@
 - [uv](https://docs.astral.sh/uv/) (for the Python server):
   - **macOS / Linux:** `curl -LsSf https://astral.sh/uv/install.sh | sh`
   - **Windows (PowerShell):** `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
+  - **Prefer your package manager?** `uv` is a popular open-source tool packaged in
+    most distro repos, so you don't have to pipe a script from the web:
+    - **Arch:** `sudo pacman -S uv`
+    - **Debian / Ubuntu:** `sudo apt install uv` (older releases: `pipx install uv` or the script above)
+    - **Fedora:** `sudo dnf install uv`
+    - **macOS (Homebrew):** `brew install uv`
   - Other options: [uv install docs](https://docs.astral.sh/uv/getting-started/installation/)
 - An MCP client ([Claude Code](https://docs.anthropic.com/en/docs/claude-code) | [Codex](https://openai.com/index/codex/) | [Antigravity](https://www.antigravity.dev/))
 
