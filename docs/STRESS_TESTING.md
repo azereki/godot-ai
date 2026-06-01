@@ -63,6 +63,27 @@ SS_RELOAD=0 SS_WORKERS=4 SS_WAVES=3 .venv/bin/python script/stormtest.py
 SS_URL=http://127.0.0.1:8010/mcp .venv/bin/python script/stormtest.py
 ```
 
+### Windows / cross-platform notes
+
+> ⚠️ **Running on Windows? Watch the host-side paths.** The harness *logic* is
+> already platform-agnostic — the in-editor scratch paths (`res://_stormtest/…`)
+> use Godot's virtual filesystem, and the report path goes through
+> `tempfile.gettempdir()` / `os.path.join`, so both resolve correctly on every
+> OS. The **invocation** examples above are POSIX, though. On Windows:
+>
+> - **venv interpreter** — use `.venv\Scripts\python.exe`, not `.venv/bin/python`.
+> - **`script/serve-this-worktree`** is a bash script — run it under Git Bash or
+>   WSL, or start the external `--reload` server by hand (the command is in the
+>   script). Serving externally still matters on Windows: a plugin-managed server
+>   gets killed by `editor_reload_plugin` and won't come back.
+> - **`$TMPDIR`** in the examples is POSIX. The report actually lands in the
+>   platform temp dir (`%TEMP%` on Windows) — pass an explicit `SS_REPORT=…` if
+>   you want a known location, and prefer forward slashes (Python accepts them on
+>   Windows and they dodge backslash-escaping surprises).
+>
+> Making the tooling resilient enough to drop this heads-up is tracked in
+> [#509](https://github.com/hi-godot/godot-ai/issues/509).
+
 ### Knobs (env)
 
 | Var | Default | Meaning |
