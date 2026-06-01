@@ -34,10 +34,12 @@ const GAME_READY_WAIT_SEC := 20.0
 ## issuing a game_eval. This is deliberately MUCH shorter than the 20s
 ## screenshot wait above: the eval path's total editor-side budget is this wait
 ## plus the 10s eval backstop (request_game_eval's timeout_sec), and that total
-## MUST stay below the server-side game_eval command timeout (15s, see
-## handlers/editor.py::game_eval / dispatcher.gd's 15000ms game_eval budget).
+## MUST stay below the 15s game_eval timeout enforced at two layers: the Python
+## server's send_command budget (src/godot_ai/handlers/editor.py::game_eval) and
+## this plugin's own deferred budget (dispatcher.gd's 15000ms game_eval entry,
+## editor/plugin-side — not server-side). Either firing produces the opaque tail.
 ## With the 20s screenshot wait, a not-yet-ready game made the editor poll past
-## the 15s server deadline, so the server gave up first with an opaque
+## the 15s deadline, so the server gave up first with an opaque
 ## ~15s TimeoutError instead of the actionable "Is the game actually running?"
 ## error below ever reaching the client (#500's residual TimeoutError bucket).
 ## 3s wait + 10s backstop = 13s, comfortably under the 15s server timeout, so
@@ -432,7 +434,7 @@ func _wait_then_eval(
 		await tree.process_frame
 	if not is_game_capture_ready():
 		_send_error(connection, request_id, ErrorCodes.INTERNAL_ERROR,
-			"Game-side autoload never registered its debugger capture within %ds. Is the game actually running? Start it with project_run / the editor's Play button, then retry." % int(EVAL_READY_WAIT_SEC))
+			"Game-side autoload never registered its debugger capture within %ds. Is the game actually running? Start it with project_run / the editor's Play button, then retry. If it IS running, check Project Settings → Autoload for _mcp_game_helper (added automatically when the plugin is enabled)." % int(EVAL_READY_WAIT_SEC))
 		return
 	_send_eval(tree, code, request_id, connection, timeout_sec)
 
