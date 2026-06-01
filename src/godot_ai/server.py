@@ -64,11 +64,7 @@ from godot_ai.tools.signal import register_signal_tools
 from godot_ai.tools.testing import register_testing_tools
 from godot_ai.tools.theme import register_theme_tools
 from godot_ai.tools.ui import register_ui_tools
-from godot_ai.transport.origin_guard import (
-    IPNetwork,
-    LocalhostOnlyHTTPMiddleware,
-    bind_host_for_networks,
-)
+from godot_ai.transport.origin_guard import IPNetwork, LocalhostOnlyHTTPMiddleware
 from godot_ai.transport.websocket import GodotWebSocketServer
 
 logger = logging.getLogger(__name__)
@@ -114,21 +110,15 @@ def create_server(
 ) -> FastMCP:
     logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
 
-    ## #421: --allow-host opt-in. When set, expose both transports to the
-    ## named LAN CIDR(s) — bind the WS server off loopback and hand the
-    ## networks to its rebinding guard. None/empty = unchanged loopback-only.
-    ws_bind_host = bind_host_for_networks(allow_host_networks) or "127.0.0.1"
-
     # Capture ws_port in the lifespan closure
     @asynccontextmanager
     async def _lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
         registry = SessionRegistry()
-        ws_server = GodotWebSocketServer(
-            registry,
-            port=ws_port,
-            host=ws_bind_host,
-            allowed_networks=allow_host_networks,
-        )
+        ## The WS server is intentionally loopback-only even under --allow-host
+        ## (#421): it's the local editor↔server bridge, not a remote surface.
+        ## See GodotWebSocketServer.start for the rationale (LAN exposure +
+        ## Windows IPv6-only breakage).
+        ws_server = GodotWebSocketServer(registry, port=ws_port)
         client = GodotClient(ws_server, registry)
 
         ws_task = asyncio.create_task(ws_server.start())

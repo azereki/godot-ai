@@ -588,8 +588,14 @@ def test_bind_host_for_networks_ipv4_only() -> None:
     assert bind_host_for_networks(parse_allow_hosts(["192.168.1.0/24"])) == "0.0.0.0"
 
 
-def test_bind_host_for_networks_ipv6_present_binds_dual_stack() -> None:
-    # An IPv6 allowlist must actually listen on IPv6, not silently bind v4-only.
+def test_bind_host_for_networks_ipv6_only() -> None:
+    # An IPv6-only allowlist binds "::" (no IPv4 range to serve).
     assert bind_host_for_networks(parse_allow_hosts(["fd00::/8"])) == "::"
-    # Mixed families also bind "::" (dual-stack accepts v4-mapped on Linux).
-    assert bind_host_for_networks(parse_allow_hosts(["192.168.1.0/24", "fd00::/8"])) == "::"
+
+
+def test_bind_host_for_networks_prioritizes_ipv4_reachability() -> None:
+    # Any IPv4 in the allowlist → "0.0.0.0", so IPv4 stays reachable on every
+    # platform (incl. Windows v6-only). A mixed allowlist must NOT bind "::"
+    # and silently drop IPv4 reachability. See bind_host_for_networks docstring.
+    assert bind_host_for_networks(parse_allow_hosts(["192.168.1.0/24", "fd00::/8"])) == "0.0.0.0"
+    assert bind_host_for_networks(parse_allow_hosts(["fd00::/8", "10.0.0.0/8"])) == "0.0.0.0"

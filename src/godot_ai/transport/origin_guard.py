@@ -113,21 +113,29 @@ def parse_allow_hosts(values: Iterable[str]) -> list[IPNetwork]:
 
 
 def bind_host_for_networks(networks: Sequence[IPNetwork] | None) -> str | None:
-    """Bind address that exposes the transports to ``networks`` (issue #421).
+    """HTTP bind address that exposes the transport to ``networks`` (issue #421).
 
-    Returns ``None`` when no networks are named so callers keep their
-    loopback default (the byte-for-byte unchanged path). Otherwise returns
-    ``"::"`` when any requested network is IPv6 — on a dual-stack host that
-    also accepts IPv4 — and ``"0.0.0.0"`` for an IPv4-only allowlist, so an
-    IPv6 ``--allow-host`` actually listens on IPv6 instead of silently
-    binding IPv4-only. Centralized so the HTTP bind, the WebSocket bind, and
-    the reload runner can't disagree about where to listen.
+    Returns ``None`` when no networks are named so the caller keeps its
+    loopback default (the byte-for-byte unchanged path).
+
+    Otherwise **prioritizes IPv4 reachability**: if the allowlist contains
+    *any* IPv4 network we bind ``"0.0.0.0"`` (IPv4 all-interfaces, reachable
+    on every platform), and only bind ``"::"`` when the allowlist is
+    *exclusively* IPv6. This avoids the non-portable assumption that ``"::"``
+    yields a dual-stack listener — it does on Linux (``bindv6only=0``) but
+    sockets are IPv6-only by default on Windows, where binding ``"::"`` would
+    make an IPv4 range in the allowlist unreachable. The trade-off: an
+    allowlist that *mixes* IPv4 and IPv6 is served over IPv4 only (its IPv6
+    ranges won't be reachable over IPv6). That's the safe default — LAN MCP is
+    overwhelmingly IPv4, and IPv4 reachability is preserved everywhere. A
+    dual-stack / separate-listener setup for mixed allowlists can come later
+    if needed.
     """
     if not networks:
         return None
-    if any(isinstance(net, ipaddress.IPv6Network) for net in networks):
-        return "::"  # noqa: S104 — opt-in, and the guard still gates every request
-    return "0.0.0.0"  # noqa: S104 — same
+    if any(isinstance(net, ipaddress.IPv4Network) for net in networks):
+        return "0.0.0.0"  # noqa: S104 — opt-in; the guard still gates every request
+    return "::"  # noqa: S104 — allowlist is IPv6-only, no IPv4 to serve
 
 
 def _host_ip_in_networks(host_header: str, networks: Sequence[IPNetwork] | None) -> bool:

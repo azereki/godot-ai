@@ -102,36 +102,31 @@ def _sanitized_plugin_event_data(name: str, data: dict[str, Any]) -> dict[str, A
 class GodotWebSocketServer:
     """Accepts connections from Godot editor plugins and routes commands."""
 
-    def __init__(
-        self,
-        registry: SessionRegistry,
-        port: int = DEFAULT_PORT,
-        *,
-        host: str = "127.0.0.1",
-        allowed_networks=None,
-    ):
+    def __init__(self, registry: SessionRegistry, port: int = DEFAULT_PORT):
         self.registry = registry
         self.port = port
-        # #421: default loopback bind + None networks = unchanged behavior.
-        # The --allow-host opt-in widens both to expose the WS port to a
-        # named LAN range (the guard still rejects browser Origins).
-        self.host = host
-        self.allowed_networks = list(allowed_networks) if allowed_networks else None
         self._pending: dict[str, asyncio.Future[CommandResponse]] = {}
         self._connections: dict[str, ServerConnection] = {}
 
     async def start(self):
-        logger.info("Starting WebSocket server on %s:%d", self.host, self.port)
+        logger.info("Starting WebSocket server on port %d", self.port)
         try:
             async with websockets.serve(
                 self._handle_connection,
-                self.host,
+                # Always loopback. The WS channel is the *local* Python-server↔
+                # Godot-editor bridge; the editor connects via ws://127.0.0.1
+                # (plugin connection.gd). Remote agents reach us over HTTP only,
+                # so --allow-host (#421) must NOT widen this port — that would
+                # expose the unauthenticated plugin WS to the LAN, and binding
+                # "::" (IPv6-only by default on Windows) would break the editor's
+                # IPv4 loopback connection.
+                "127.0.0.1",
                 self.port,
                 max_size=4 * 1024 * 1024,  # 4 MB for screenshot base64
                 # Reject DNS-rebinding attempts before the upgrade — see
                 # godot_ai.transport.origin_guard. Native plugin clients
                 # carry a loopback Host and no Origin, so they pass through.
-                process_request=make_websocket_request_guard(self.allowed_networks),
+                process_request=make_websocket_request_guard(),
             ):
                 await asyncio.Future()  # run forever
         except OSError as e:
