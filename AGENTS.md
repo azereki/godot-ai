@@ -52,7 +52,7 @@ AI Client → MCP (stdio/sse/streamable-http) → Python FastMCP server → WebS
   - `integration/` — WebSocket server + mock Godot plugin, MCP tools, rollups
 - `script/` — dev and CI scripts
   - `setup-dev` / `setup-dev.ps1` / `verify-worktree` — dev environment + worktree health
-  - `serve-this-worktree` / `open-godot-here` — point dev server / editor at the current worktree
+  - `serve-this-worktree` (bash) / `serve-this-worktree.py` (cross-platform) / `open-godot-here` — point dev server / editor at the current worktree
   - `local-self-update-smoke` — interactive local fixture for self-update changes
   - `ci-start-server`, `ci-godot-tests`, `ci-reload-test`, `ci-quit-test`, `ci-check-gdscript` — CI scripts
   - `ci-find-regression-range` — helper for identifying CI regression windows
@@ -93,7 +93,7 @@ Assistant sessions may run in git worktrees. Claude Code commonly uses `.claude/
 
 - **File paths**: Your working directory is the worktree, not the repo root. Files you create live in that worktree.
 - **Godot editor**: The editor runs against a specific worktree's `test_project/`. The plugin is symlinked from that worktree's `plugin/` directory. Check `session_list` — the `project_path` field tells you which worktree the editor is using.
-- **Dev server**: The plugin-managed server (auto-spawned on editor start, no `--reload`) uses the root repo's `.venv` and `src/`. Python code changes in a worktree won't take effect there unless the root repo also has them. Two ways to serve the worktree's own Python source: (a) click **Start Dev Server** in the dock — it walks up from `res://` to find a sibling `src/godot_ai/` and auto-sets `PYTHONPATH` to that tree's `src/` before spawning `--reload`; (b) run `script/serve-this-worktree` from a terminal for the same effect outside the editor.
+- **Dev server**: The plugin-managed server (auto-spawned on editor start, no `--reload`) uses the root repo's `.venv` and `src/`. Python code changes in a worktree won't take effect there unless the root repo also has them. Two ways to serve the worktree's own Python source: (a) click **Start Dev Server** in the dock — it walks up from `res://` to find a sibling `src/godot_ai/` and auto-sets `PYTHONPATH` to that tree's `src/` before spawning `--reload`; (b) run `script/serve-this-worktree` (POSIX) or `python script/serve-this-worktree.py` (any OS) from a terminal for the same effect outside the editor.
 - **Passing info between sessions**: When writing prompts, handoff notes, or file references intended for another session, **always include the full worktree path** or specify the worktree name. Relative paths like `docs/friction-log.md` are ambiguous — a different session may be in a different worktree or on `main`. Use the absolute path.
 - **Merging**: Worktree branches must be merged to `main` and pulled into other worktrees for changes to propagate. The plugin symlink means GDScript changes propagate within the same worktree immediately, but not across worktrees.
 
@@ -280,15 +280,18 @@ Test suites extend `McpTestSuite` (assertion methods: `assert_true`, `assert_eq`
 `stormtest` opens many concurrent MCP clients and fires rapid, randomized tool calls across **every** domain at a live editor, with periodic `editor_reload_plugin` churn mixed in. It's a robustness test, not a correctness test: it answers "does the editor + plugin + WebSocket dispatcher + server survive sustained concurrent abuse and reload cycles without crashing?" and surfaces per-tool latency/error hot-spots. Use it after changes to the dispatcher, transport, readiness gating, session routing, or the reload/handoff path. Full reference: `docs/STRESS_TESTING.md`.
 
 ```bash
-.venv/bin/python script/stormtest.py                       # ≈ 1000 calls, with reload churn
-SS_WORKERS=12 SS_WAVES=30 .venv/bin/python script/stormtest.py   # brutal ≈ 9000 calls
-SS_RELOAD=0 .venv/bin/python script/stormtest.py           # reads-only smoke, no reloads
-SS_URL=http://127.0.0.1:8010/mcp .venv/bin/python script/stormtest.py  # target another stack
+python script/stormtest.py                       # ≈ 1000 calls, with reload churn
+SS_WORKERS=12 SS_WAVES=30 python script/stormtest.py   # brutal ≈ 9000 calls
+SS_RELOAD=0 python script/stormtest.py           # reads-only smoke, no reloads
+SS_URL=http://127.0.0.1:8010/mcp python script/stormtest.py  # target another stack
 ```
 
-To stress a *branch's* code (plugin + server), point a Godot editor at that worktree's `test_project/` and serve its `src/` via `script/serve-this-worktree` (external server, so `editor_reload_plugin` exercises reload without killing the server), then run stormtest against it. A full JSON snapshot lands in `$TMPDIR/stormtest_report.json` (override with `SS_REPORT`), flushed every few seconds so a crash/kill still leaves data. A small `EDITOR_NOT_READY` / `NODE_NOT_FOUND` / `CONNECTION` error rate is expected noise under concurrency + reloads — watch instead for the process dying, a reload that never recovers, or one op with pathological error/latency.
+(`python script/stormtest.py` re-execs into the project `.venv` on every OS;
+`SS_NO_REEXEC=1` opts out.)
 
-On Windows, a reads-dominant run (`SS_RELOAD=0`) works, but **reload churn (`SS_RELOAD=1`, the default) currently wedges the harness** and the external-server mitigation doesn't apply (`serve-this-worktree` is bash-only; a hand-started external `--reload` server gets killed by the reload). The editor itself survives reloads — only the harness hangs. Use `.venv\Scripts\python.exe` and note `$TMPDIR` is `%TEMP%`. See the "Windows / cross-platform notes" callout in `docs/STRESS_TESTING.md` (issues #513 / #514; resilience tracked in #509).
+To stress a *branch's* code (plugin + server), point a Godot editor at that worktree's `test_project/` and serve its `src/` via `script/serve-this-worktree` (POSIX) or `python script/serve-this-worktree.py` (any OS) — an external server, so `editor_reload_plugin` exercises reload without killing the server — then run stormtest against it. A full JSON snapshot lands in `$TMPDIR/stormtest_report.json` (override with `SS_REPORT`), flushed every few seconds so a crash/kill still leaves data. A small `EDITOR_NOT_READY` / `NODE_NOT_FOUND` / `CONNECTION` error rate is expected noise under concurrency + reloads — watch instead for the process dying, a reload that never recovers, or one op with pathological error/latency.
+
+On Windows, `python script/stormtest.py` re-execs into the `.venv` automatically (no `.venv\Scripts\python.exe` step) and `python script/serve-this-worktree.py` serves a worktree without bash. A reads-dominant run (`SS_RELOAD=0`) works, but **reload churn (`SS_RELOAD=1`, the default) still wedges the harness** and a hand-started external `--reload` server still gets killed by the reload. The editor itself survives reloads — only the harness hangs; note `$TMPDIR` is `%TEMP%`. See the "Windows / cross-platform notes" callout in `docs/STRESS_TESTING.md` (issues #513 / #514).
 
 **Guardrails built into the test runner:**
 - **Zero-assertion detection**: Tests that complete with 0 assertions are flagged as failures ("Test completed with 0 assertions — likely skipped its logic"). This catches tests that silently `return` before asserting anything.

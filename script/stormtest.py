@@ -21,9 +21,10 @@ A full JSON snapshot is flushed to stormtest_report.json every few seconds so
 a crash or kill still leaves analyzable data (latency p50/p95/max + per-op
 error codes).
 
-Run against a running editor whose MCP server is on :8000:
+Run against a running editor whose MCP server is on :8000 (works on every OS —
+the script re-execs into the project .venv automatically):
 
-    .venv/bin/python script/stormtest.py
+    python script/stormtest.py
 
 Knobs (all env-overridable):
     SS_WORKERS   parallel client connections           (default 8)
@@ -45,11 +46,25 @@ import json
 import os
 import random
 import signal
+import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
+from pathlib import Path
 
-from fastmcp import Client
+# Make script/ importable so the shared dev-env helpers resolve regardless of cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# Hop into the project venv interpreter before importing third-party deps, so the
+# documented command (`python script/stormtest.py`) is identical on every OS — no
+# `.venv/bin/python` vs `.venv\Scripts\python.exe` split. Opt out with
+# SS_NO_REEXEC=1. See issue #509.
+if __name__ == "__main__":
+    from _dev_env import reexec_into_venv
+
+    reexec_into_venv(guard_env="_SS_VENV_REEXEC", opt_out_env="SS_NO_REEXEC")
+
+from fastmcp import Client  # noqa: E402
 
 URL = os.environ.get("SS_URL", "http://127.0.0.1:8000/mcp")
 

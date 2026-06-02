@@ -44,28 +44,41 @@ under load and across the disable→extract→enable reload window.
 
 ## Running
 
-The target editor's MCP server must be reachable (default `:8000`). For a true
-test of a branch's code, point the editor at that branch's worktree and serve
-that worktree's `src/` (see `script/serve-this-worktree`), so both the GDScript
-plugin and the Python server are the code under test.
+The target editor's MCP server must be reachable (default `:8000`). `python
+script/stormtest.py` works on every OS — it re-execs into the project `.venv`
+automatically, so there's no `.venv/bin/python` vs `.venv\Scripts\python.exe`
+split (override with `SS_NO_REEXEC=1`). For a true test of a branch's code,
+point the editor at that branch's worktree and serve that worktree's `src/`
+(`python script/serve-this-worktree.py`, or `script/serve-this-worktree` on
+POSIX), so both the GDScript plugin and the Python server are the code under
+test.
 
 ```bash
 # default ≈ 1000 calls, with reload churn, against localhost:8000
-.venv/bin/python script/stormtest.py
+python script/stormtest.py
 
 # brutal ≈ 9000 calls
-SS_WORKERS=12 SS_WAVES=30 .venv/bin/python script/stormtest.py
+SS_WORKERS=12 SS_WAVES=30 python script/stormtest.py
 
 # reads-only smoke, no reloads
-SS_RELOAD=0 SS_WORKERS=4 SS_WAVES=3 .venv/bin/python script/stormtest.py
+SS_RELOAD=0 SS_WORKERS=4 SS_WAVES=3 python script/stormtest.py
 
 # target a server on another port / host
-SS_URL=http://127.0.0.1:8010/mcp .venv/bin/python script/stormtest.py
+SS_URL=http://127.0.0.1:8010/mcp python script/stormtest.py
 ```
 
 ### Windows / cross-platform notes
 
 > ⚠️ **Running on Windows? Reads/writes work; reload churn does not (yet).**
+>
+> **Invocation is now identical on every OS.** `python script/stormtest.py`
+> re-execs into the project `.venv` automatically (override with
+> `SS_NO_REEXEC=1`), and `python script/serve-this-worktree.py` is a
+> cross-platform (no-`bash`/no-`lsof`) way to serve a worktree's `src/` with
+> `--reload` — extra args like `--ws-port` pass straight through. The report
+> still lands in the platform temp dir (`%TEMP%` on Windows); pass an explicit
+> `SS_REPORT=…` for a known location, and prefer forward slashes (Python accepts
+> them on Windows and they dodge backslash-escaping surprises).
 >
 > **Concurrent reads/writes are fine.** The harness *logic* is platform-agnostic:
 > the in-editor scratch paths (`res://_stormtest/…`) use Godot's virtual
@@ -73,32 +86,22 @@ SS_URL=http://127.0.0.1:8010/mcp .venv/bin/python script/stormtest.py
 > `os.path.join`, so both resolve correctly on every OS. A reads-dominant run
 > (`SS_RELOAD=0`) is clean on Windows.
 >
-> **Reload churn (`SS_RELOAD=1`, the default) currently does NOT work on Windows**
-> — two independent problems, both tracked:
+> **Reload churn (`SS_RELOAD=1`, the default) still does NOT work on Windows** —
+> two independent problems, both tracked, and *not* addressed by the pathing work
+> above:
 > - Against a plugin-managed server, the first `editor_reload_plugin` **wedges the
 >   harness**: the asyncio loop stalls past `CALL_TIMEOUT` when the server is
 >   killed mid-reload under concurrent load. The *editor* survives fine (it
 >   reloads and re-registers a new session) — only the harness hangs. See
 >   [#513](https://github.com/hi-godot/godot-ai/issues/513).
-> - The "run the server externally" mitigation **also fails on Windows**:
->   `script/serve-this-worktree` is bash-only (no PowerShell port, and it never
->   passes `--ws-port`), and even a hand-started external `--reload` server gets
->   **killed by the reload** (`_stop_server` takes down the port owner with no
->   respawn). See [#514](https://github.com/hi-godot/godot-ai/issues/514).
+> - The "run the server externally" mitigation still doesn't fully hold: even a
+>   correctly-launched external `--reload` server gets **killed by the reload**
+>   (`_stop_server` takes down the port owner with no respawn). See
+>   [#514](https://github.com/hi-godot/godot-ai/issues/514).
 >
 >   Until those land, validate reload survival on Windows with a *single-threaded*
 >   reload loop (reload → reconnect → confirm a new `session_id`) rather than the
 >   concurrent churn mode.
->
-> **Invocation also differs (POSIX → Windows):**
-> - **venv interpreter** — use `.venv\Scripts\python.exe`, not `.venv/bin/python`.
-> - **`$TMPDIR`** in the examples is POSIX; the report lands in the platform temp
->   dir (`%TEMP%` on Windows). Pass an explicit `SS_REPORT=…` for a known
->   location, and prefer forward slashes (Python accepts them on Windows and they
->   dodge backslash-escaping surprises).
->
-> Making the tooling resilient enough to drop this heads-up is tracked in
-> [#509](https://github.com/hi-godot/godot-ai/issues/509).
 
 ### Knobs (env)
 
@@ -146,6 +149,7 @@ comes back** (managed-server-killed; recovery time unbounded), or one op with a
 **pathologically high error rate or latency** that points at a real regression.
 
 > If the target server is plugin-managed (auto-spawned), a reload may kill it
-> and not return — run the server **externally** (e.g. `serve-this-worktree`,
-> which uses `--reload`) so `editor_reload_plugin` exercises the plugin reload
-> without taking the server down with it.
+> and not return — run the server **externally** (`python
+> script/serve-this-worktree.py`, or `script/serve-this-worktree` on POSIX; both
+> use `--reload`) so `editor_reload_plugin` exercises the plugin reload without
+> taking the server down with it.
