@@ -172,9 +172,17 @@ def parse_netstat_pids(output: str, port: int) -> list[int]:
 
 
 def _port_listening(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(0.5)
-        return sock.connect_ex(("127.0.0.1", port)) == 0
+    # Check both families: a dev server (esp. on Windows, where sockets are
+    # commonly IPv6-only — see #511) may be bound to ::1 rather than 127.0.0.1.
+    for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.5)
+                if sock.connect_ex((host, port)) == 0:
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def _listener_pids(port: int) -> list[int]:

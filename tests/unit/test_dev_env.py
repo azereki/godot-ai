@@ -168,6 +168,19 @@ def test_reexec_execs_into_venv(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# port listening probe
+# --------------------------------------------------------------------------- #
+def test_port_listening_detects_bound_socket():
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        assert _dev_env._port_listening(port) is True
+
+
+# --------------------------------------------------------------------------- #
 # scripts parse cleanly
 # --------------------------------------------------------------------------- #
 def test_dev_scripts_compile():
