@@ -152,13 +152,8 @@ def extract_port(argv: list[str], default: int = 8000) -> tuple[int, list[str]]:
 
 
 def parse_lsof_pids(output: str) -> list[int]:
-    """PIDs from ``lsof -ti`` output (one PID per line), de-duplicated."""
-    pids: list[int] = []
-    for token in output.split():
-        token = token.strip()
-        if token.isdigit() and int(token) not in pids:
-            pids.append(int(token))
-    return pids
+    """PIDs from ``lsof -ti`` output (one PID per line), de-duplicated in order."""
+    return list(dict.fromkeys(int(tok) for tok in output.split() if tok.isdigit()))
 
 
 def parse_netstat_pids(output: str, port: int) -> list[int]:
@@ -169,13 +164,11 @@ def parse_netstat_pids(output: str, port: int) -> list[int]:
         parts = line.split()
         if len(parts) < 5 or "LISTENING" not in parts:
             continue
-        local = parts[1]  # e.g. 0.0.0.0:8000 or [::]:8000
-        if not local.endswith(needle):
+        if not parts[1].endswith(needle):  # local addr, e.g. 0.0.0.0:8000 or [::]:8000
             continue
-        pid = parts[-1]
-        if pid.isdigit() and int(pid) not in pids:
-            pids.append(int(pid))
-    return pids
+        if parts[-1].isdigit():
+            pids.append(int(parts[-1]))
+    return list(dict.fromkeys(pids))
 
 
 def _port_listening(port: int) -> bool:
