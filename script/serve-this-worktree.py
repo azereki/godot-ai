@@ -50,7 +50,11 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    port, passthrough = extract_port(argv, default=8000)
+    try:
+        port, passthrough = extract_port(argv, default=8000)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     # Free the port so we replace any plugin-spawned server rather than stack on it.
     free_port(port)
 

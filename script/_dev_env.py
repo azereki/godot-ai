@@ -126,28 +126,30 @@ def extract_port(argv: list[str], default: int = 8000) -> tuple[int, list[str]]:
 
     Returns ``(port, remaining_args)`` with the port flag removed, so the caller
     can pass the port explicitly (and free it) without duplicating the flag.
+    Raises ``ValueError`` on a missing or non-integer value — fail fast rather
+    than silently fall back to ``default`` and start on the wrong port.
     """
     port = default
     rest: list[str] = []
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg == "--port" and i + 1 < len(argv):
-            try:
-                port = int(argv[i + 1])
-            except ValueError:
-                pass
+        if arg == "--port":
+            if i + 1 >= len(argv):
+                raise ValueError("--port requires an integer value")
+            value = argv[i + 1]
             i += 2
-            continue
-        if arg.startswith("--port="):
-            try:
-                port = int(arg.split("=", 1)[1])
-            except ValueError:
-                pass
+        elif arg.startswith("--port="):
+            value = arg.split("=", 1)[1]
+            i += 1
+        else:
+            rest.append(arg)
             i += 1
             continue
-        rest.append(arg)
-        i += 1
+        try:
+            port = int(value)
+        except ValueError:
+            raise ValueError(f"--port value must be an integer, got {value!r}") from None
     return port, rest
 
 

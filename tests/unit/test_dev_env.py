@@ -11,6 +11,8 @@ import py_compile
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_DIR = REPO_ROOT / "script"
 if str(SCRIPT_DIR) not in sys.path:
@@ -86,6 +88,21 @@ def test_extract_port_default_when_absent():
     port, rest = _dev_env.extract_port(["--ws-port", "9000"])
     assert port == 8000
     assert rest == ["--ws-port", "9000"]
+
+
+def test_extract_port_missing_value_raises():
+    with pytest.raises(ValueError, match="requires an integer"):
+        _dev_env.extract_port(["--ws-port", "9000", "--port"])
+
+
+def test_extract_port_non_integer_raises():
+    with pytest.raises(ValueError, match="must be an integer"):
+        _dev_env.extract_port(["--port", "80O0"])
+
+
+def test_extract_port_non_integer_equals_raises():
+    with pytest.raises(ValueError, match="must be an integer"):
+        _dev_env.extract_port(["--port="])
 
 
 def test_parse_lsof_pids():

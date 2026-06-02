@@ -80,6 +80,11 @@ SS_URL=http://127.0.0.1:8010/mcp python script/stormtest.py
 > `SS_REPORT=…` for a known location, and prefer forward slashes (Python accepts
 > them on Windows and they dodge backslash-escaping surprises).
 >
+> The `SS_*` knob examples below use the POSIX `SS_FOO=… python …` inline-env
+> prefix, which PowerShell doesn't parse. In PowerShell, set the var first:
+> `$env:SS_RELOAD=0; python script/stormtest.py` (clear it afterward with
+> `Remove-Item Env:\SS_RELOAD`).
+>
 > **Concurrent reads/writes are fine.** The harness *logic* is platform-agnostic:
 > the in-editor scratch paths (`res://_stormtest/…`) use Godot's virtual
 > filesystem, and the report path goes through `tempfile.gettempdir()` /
