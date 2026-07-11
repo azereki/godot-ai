@@ -1430,6 +1430,20 @@ class TestMalformedFrameResilience:
         assert result == {"version": "4.4.1"}
         await plugin.close()
 
+    async def test_non_object_json_frame_is_skipped_and_session_survives(self, harness):
+        ## Valid JSON that isn't an object (`[]`, `42`) reaches `.get()` and
+        ## would raise AttributeError through the catch-all without the
+        ## isinstance guard (#526 Copilot follow-up).
+        plugin = await harness.connect_plugin(session_id="non-obj-frame")
+
+        await plugin.ws.send("[]")
+        await plugin.ws.send("42")
+        await asyncio.sleep(0.1)
+        assert harness.registry.get("non-obj-frame") is not None, (
+            "non-object JSON frames must not unregister the session"
+        )
+        await plugin.close()
+
     async def test_invalid_command_response_is_skipped_and_session_survives(self, harness):
         plugin = await harness.connect_plugin(session_id="bad-response")
 

@@ -217,9 +217,21 @@ class GodotWebSocketServer:
                 ## swallowed — everything else still propagates.
                 try:
                     data = json.loads(raw_msg)
-                except json.JSONDecodeError as exc:
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    ## UnicodeDecodeError covers a bytes frame with invalid
+                    ## UTF-8 — same malformed-frame class as bad JSON (#526).
                     logger.warning(
                         "Dropping non-JSON frame from session %s: %s", session_id[:8], exc
+                    )
+                    continue
+                if not isinstance(data, dict):
+                    ## Valid JSON but not an object (e.g. `[]` or `42`) —
+                    ## `.get()` below would raise AttributeError and tear the
+                    ## session down through the catch-all (#526).
+                    logger.warning(
+                        "Dropping non-object JSON frame from session %s: %s",
+                        session_id[:8],
+                        type(data).__name__,
                     )
                     continue
 
