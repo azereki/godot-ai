@@ -577,10 +577,16 @@ func _account_row_times(key: String, times: Dictionary) -> void:
 	if times.is_empty():
 		return
 	var accounted: Dictionary = _promoted_debugger_row_times.get(key, {})
-	if accounted.size() > MAX_ACCOUNTED_ROW_TIMES_PER_KEY:
-		accounted = {}
 	for time_text in times.keys():
 		accounted[time_text] = true
+	## Enforce the bound AFTER merging: a pre-merge `>` check let the set
+	## reach the cap and keep growing (and a batch of new times could jump
+	## past it). Past the cap, reset to just this scan's times — the live
+	## Errors tab is itself bounded, so this only fires under a pathological
+	## same-key flood, where "recent scan only" is an acceptable memory of
+	## what was promoted (worst case: a re-observed ancient row re-promotes).
+	if accounted.size() > MAX_ACCOUNTED_ROW_TIMES_PER_KEY:
+		accounted = times.duplicate()
 	_promoted_debugger_row_times[key] = accounted
 
 
