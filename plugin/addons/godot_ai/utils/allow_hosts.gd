@@ -139,7 +139,14 @@ static func _is_loopback(addr: String) -> bool:
 
 static func _is_link_local(addr: String) -> bool:
 	var a := addr.to_lower()
-	return a.begins_with("169.254.") or a.begins_with("fe80")
+	if a.begins_with("169.254."):
+		return true
+	## IPv6 link-local is fe80::/10 — the whole fe80-febf first hextet, not
+	## just literal "fe80" (Copilot review on #507's PR: fea0::... etc. must
+	## also be excluded from LAN-URL candidates).
+	if a.length() >= 4 and a.begins_with("fe") and a[2] in "89ab":
+		return true
+	return false
 
 
 static func _is_private_ipv4(addr: String) -> bool:

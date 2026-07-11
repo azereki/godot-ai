@@ -85,7 +85,7 @@ func test_non_loopback_allowlist_is_lan_active() -> void:
 
 func test_pick_prefers_private_ipv4_and_skips_loopback_link_local() -> void:
 	var pick := McpAllowHosts.pick_lan_address(PackedStringArray(
-		["127.0.0.1", "::1", "169.254.10.10", "fe80::1", "192.168.1.50"]
+		["127.0.0.1", "::1", "169.254.10.10", "fe80::1", "fea0::1", "192.168.1.50"]
 	))
 	assert_eq(String(pick["address"]), "192.168.1.50")
 	assert_false(bool(pick["ambiguous"]))
