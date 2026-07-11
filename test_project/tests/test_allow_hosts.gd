@@ -57,7 +57,7 @@ func test_valid_tokens() -> void:
 
 
 func test_invalid_tokens() -> void:
-	for token in ["", "example.com", "192.168.1", "192.168.1.0/33", "::1/129", "10.0.0.0/abc", "not-an-ip/24"]:
+	for token in ["", "example.com", "192.168.1", "192.168.1.0/33", "::1/129", "10.0.0.0/abc", "not-an-ip/24", "10.0.0.0/-1", "::1/-8"]:
 		assert_false(McpAllowHosts.token_is_valid(token), "expected invalid: %s" % token)
 
 

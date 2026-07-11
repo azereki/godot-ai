@@ -2101,9 +2101,12 @@ func _build_tools_tab(tabs: TabContainer) -> void:
 
 	_tools_close_confirm = ConfirmationDialog.new()
 	_tools_close_confirm.title = "Discard unapplied changes?"
+	## Generic wording: _settings_are_dirty() covers domain toggles, the
+	## telemetry switch, AND the Settings tab's allow-host field (#507) —
+	## the old "checked/unchecked domains" text misled non-domain edits.
 	_tools_close_confirm.dialog_text = (
-		"You've checked/unchecked domains but haven't clicked Apply.\n"
-		+ "Close the window and discard those changes?"
+		"You have unapplied changes in this window.\n"
+		+ "Close it and discard those changes?"
 	)
 	_tools_close_confirm.ok_button_text = "Discard"
 	_tools_close_confirm.confirmed.connect(_on_tools_discard_confirmed)

@@ -36,7 +36,11 @@ static func token_is_valid(token: String) -> bool:
 	if t.is_empty():
 		return false
 	var ip := t
-	var prefix := -1
+	var prefix := 0
+	## Track slash presence separately from the prefix value: reusing -1 as
+	## the "no slash" sentinel let an explicit negative prefix like
+	## "10.0.0.0/-1" validate (is_valid_int accepts "-1"). CodeRabbit review.
+	var has_prefix := false
 	var slash := t.find("/")
 	if slash != -1:
 		ip = t.substr(0, slash)
@@ -44,10 +48,11 @@ static func token_is_valid(token: String) -> bool:
 		if not prefix_text.is_valid_int():
 			return false
 		prefix = int(prefix_text)
+		has_prefix = true
 	if not ip.is_valid_ip_address():
 		return false
 	var max_prefix := 128 if ip.contains(":") else 32
-	return prefix == -1 or (prefix >= 0 and prefix <= max_prefix)
+	return not has_prefix or (prefix >= 0 and prefix <= max_prefix)
 
 
 ## Every token in `raw` that fails `token_is_valid` — the dock surfaces
