@@ -92,6 +92,16 @@ def test_main_exits_when_ws_port_taken(capsys: pytest.CaptureFixture[str]) -> No
     assert "godot_ai/ws_port" in err
 
 
+def _ipv6_available() -> bool:
+    import socket
+
+    try:
+        socket.socket(socket.AF_INET6, socket.SOCK_STREAM).close()
+        return True
+    except OSError:
+        return False
+
+
 def test_preflight_ipv6_host_binds_with_correct_family():
     ## Copilot review on the #647 PR: --allow-host can resolve an IPv6 bind
     ## host ("::"); an AF_INET probe would raise an address-family error and
@@ -99,6 +109,8 @@ def test_preflight_ipv6_host_binds_with_correct_family():
     ## clean (no SystemExit, no OSError).
     import socket
 
+    if not _ipv6_available():
+        pytest.skip("IPv6 not available in this environment")
     sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     sock.bind(("::1", 0))
     port = sock.getsockname()[1]
@@ -109,6 +121,8 @@ def test_preflight_ipv6_host_binds_with_correct_family():
 def test_preflight_ipv6_host_detects_occupied_port():
     import socket
 
+    if not _ipv6_available():
+        pytest.skip("IPv6 not available in this environment")
     holder = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     holder.bind(("::1", 0))
     holder.listen(1)
