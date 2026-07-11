@@ -62,6 +62,20 @@ func test_registry_ids_are_unique() -> void:
 	assert_gt(seen.size(), 0)
 
 
+func test_windsurf_rebrand_to_devin_desktop() -> void:
+	## #623: Windsurf was rebranded to Devin Desktop by Cognition (June 2026).
+	## The registry id must stay "windsurf" (stable key for configured-status
+	## lookups) and the config path is unchanged — migrated installs keep
+	## ~/.codeium/windsurf/mcp_config.json. Only the display name changed.
+	var client := McpClientRegistry.get_by_id("windsurf")
+	assert_true(client != null, "windsurf id must remain registered after #623 rebrand")
+	assert_eq(client.display_name, "Devin Desktop (Windsurf)")
+	assert_true(
+		String(client.path_template.get("unix", "")).ends_with(".codeium/windsurf/mcp_config.json"),
+		"windsurf config path must stay under ~/.codeium/windsurf/ (#623)"
+	)
+
+
 func test_every_client_has_required_fields() -> void:
 	for client in McpClientRegistry.all():
 		assert_true(not client.id.is_empty(), "Client missing id: %s" % client)
