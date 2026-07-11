@@ -1,0 +1,92 @@
+"""#647: startup pre-flight for HTTP/WS ports held by a foreign process."""
+
+from __future__ import annotations
+
+import socket
+from contextlib import closing
+
+import pytest
+
+from godot_ai import EXIT_PORT_IN_USE, main, preflight_check_port
+
+
+def _reserve_port() -> tuple[socket.socket, int]:
+    """Bind + listen a throwaway socket on a random free loopback port."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    return sock, sock.getsockname()[1]
+
+
+def _free_port() -> int:
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def test_preflight_passes_on_free_port() -> None:
+    ## Must also not leave the port unbindable afterwards (probe socket is
+    ## closed, SO_REUSEADDR set) — bind it again to prove that.
+    port = _free_port()
+    preflight_check_port(port, label="HTTP", setting="godot_ai/http_port")
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        sock.bind(("127.0.0.1", port))
+
+
+def test_preflight_exits_with_distinctive_code_and_message(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    blocker, port = _reserve_port()
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            preflight_check_port(port, label="HTTP", setting="godot_ai/http_port")
+    finally:
+        blocker.close()
+    assert excinfo.value.code == EXIT_PORT_IN_USE
+    err = capsys.readouterr().err
+    assert f"HTTP port {port} is already in use by another process" in err
+    assert "godot_ai/http_port" in err
+
+
+def test_main_exits_before_serving_when_http_port_taken(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    blocker, port = _reserve_port()
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            main(
+                [
+                    "--transport",
+                    "streamable-http",
+                    "--port",
+                    str(port),
+                    "--ws-port",
+                    str(_free_port()),
+                ]
+            )
+    finally:
+        blocker.close()
+    assert excinfo.value.code == EXIT_PORT_IN_USE
+    assert f"HTTP port {port} is already in use" in capsys.readouterr().err
+
+
+def test_main_exits_when_ws_port_taken(capsys: pytest.CaptureFixture[str]) -> None:
+    blocker, ws_port = _reserve_port()
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            main(
+                [
+                    "--transport",
+                    "streamable-http",
+                    "--port",
+                    str(_free_port()),
+                    "--ws-port",
+                    str(ws_port),
+                ]
+            )
+    finally:
+        blocker.close()
+    assert excinfo.value.code == EXIT_PORT_IN_USE
+    err = capsys.readouterr().err
+    assert f"WebSocket port {ws_port} is already in use" in err
+    assert "godot_ai/ws_port" in err
