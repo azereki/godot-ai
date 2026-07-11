@@ -74,7 +74,11 @@ def preflight_check_port(port: int, *, label: str, setting: str, host: str = "12
     Ports that fail to bind for other reasons (EACCES, Windows winnat
     exclusion ranges) keep their existing downstream failure modes.
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ## --allow-host can resolve an IPv6 bind host ("::") via
+    ## bind_host_for_networks(); an AF_INET socket can't bind those, so pick
+    ## the family from the host (Copilot review on #647's PR).
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
     try:
         if os.name != "nt":
             ## Mirror uvicorn/websockets SO_REUSEADDR so a just-stopped
@@ -93,6 +97,11 @@ def preflight_check_port(port: int, *, label: str, setting: str, host: str = "12
                     file=sys.stderr,
                 )
                 raise SystemExit(EXIT_PORT_IN_USE) from exc
+            ## Any other bind failure (EACCES, EADDRNOTAVAIL, winnat
+            ## exclusion ranges, exotic address families) is NOT the
+            ## condition this preflight exists to catch — let the real
+            ## server startup produce its existing failure mode instead
+            ## of the probe inventing a new earlier crash.
     finally:
         sock.close()
 

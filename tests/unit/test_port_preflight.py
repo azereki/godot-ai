@@ -90,3 +90,32 @@ def test_main_exits_when_ws_port_taken(capsys: pytest.CaptureFixture[str]) -> No
     err = capsys.readouterr().err
     assert f"WebSocket port {ws_port} is already in use" in err
     assert "godot_ai/ws_port" in err
+
+
+def test_preflight_ipv6_host_binds_with_correct_family():
+    ## Copilot review on the #647 PR: --allow-host can resolve an IPv6 bind
+    ## host ("::"); an AF_INET probe would raise an address-family error and
+    ## crash startup instead of preflighting. A free port on "::1" must probe
+    ## clean (no SystemExit, no OSError).
+    import socket
+
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    sock.bind(("::1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    preflight_check_port(port, label="HTTP", setting="godot_ai/http_port", host="::1")
+
+
+def test_preflight_ipv6_host_detects_occupied_port():
+    import socket
+
+    holder = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    holder.bind(("::1", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            preflight_check_port(port, label="HTTP", setting="godot_ai/http_port", host="::1")
+        assert excinfo.value.code == EXIT_PORT_IN_USE
+    finally:
+        holder.close()
