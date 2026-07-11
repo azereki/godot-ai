@@ -79,6 +79,20 @@ func test_trusted_download_url_accepts_repo_release_assets() -> void:
 		"the githubusercontent redirect target's release-asset key namespace must be trusted")
 
 
+func test_trusted_download_url_rejects_dot_segment_traversal() -> void:
+	## #599 review: dot-segments pass a raw prefix test but normalize
+	## server-side to a different repo. Encoded variants must fail too.
+	var bad := [
+		"https://github.com/hi-godot/godot-ai/releases/download/../../evil/releases/download/v1/x.zip",
+		"https://github.com/hi-godot/godot-ai/releases/download/v1/..%2f..%2fevil.zip",
+		"https://github.com/hi-godot/godot-ai/releases/download/%2e%2e/evil/x.zip",
+		"https://github.com/hi-godot/godot-ai/releases/download/v1/x%5c..%5cevil.zip",
+	]
+	for url in bad:
+		assert_false(McpUpdateManager._is_trusted_download_url(url),
+			"dot-segment/encoded traversal must be rejected: %s" % url)
+
+
 func test_trusted_download_url_rejects_wrong_repo_on_trusted_host() -> void:
 	## #599: a trusted GitHub host alone is not enough — the URL must be a
 	## hi-godot/godot-ai release asset. A tampered API response pointing at

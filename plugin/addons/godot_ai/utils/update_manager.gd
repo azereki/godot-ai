@@ -327,6 +327,15 @@ static func _is_trusted_download_url(url: String) -> bool:
 	var host := authority.to_lower()
 	if not _TRUSTED_DOWNLOAD_PATH_PREFIXES.has(host):
 		return false
+	## Reject dot-segments (and their percent-encoded forms) anywhere in the
+	## path: "/hi-godot/godot-ai/releases/download/../../evil/..." passes a
+	## raw string-prefix test but normalizes server-side to a different repo,
+	## defeating the scoping (#599 review). Also reject percent-encoded
+	## slashes, which some servers decode before routing.
+	var lower_path := path.to_lower()
+	for needle in ["/../", "/..", "%2e", "%2f", "%5c"]:
+		if lower_path.contains(needle):
+			return false
 	return path.begins_with(String(_TRUSTED_DOWNLOAD_PATH_PREFIXES[host]))
 
 
