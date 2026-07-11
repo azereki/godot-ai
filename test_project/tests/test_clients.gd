@@ -1482,6 +1482,21 @@ func test_atomic_write_leaves_no_stale_tmp_of_any_name() -> void:
 	assert_eq(leftovers.size(), 0, "no .tmp staging file may linger: %s" % str(leftovers))
 
 
+func test_atomic_write_leaves_no_stale_tmp_after_failed_write() -> void:
+	## #534 review follow-up: the PID-suffixed staging file must also be
+	## cleaned up when the write FAILS (destination is a directory, so the
+	## rename and the copy fallback both reject) — otherwise a regression
+	## could accumulate ".tmp.<pid>" files invisibly.
+	var dir_dest := _scratch_dir.path_join("tmp_fail_dir.txt")
+	DirAccess.make_dir_recursive_absolute(dir_dest)
+	assert_false(
+		McpAtomicWrite.write(dir_dest, "content"),
+		"writing over a directory must fail",
+	)
+	var leftovers := _leftover_tmp_files("tmp_fail_dir.txt.tmp")
+	assert_eq(leftovers.size(), 0, "no .tmp staging file may linger after a failed write: %s" % str(leftovers))
+
+
 func test_atomic_write_does_not_use_fixed_tmp_name() -> void:
 	## #534: two editors clicking Configure at once must not interleave bytes
 	## on a shared "<path>.tmp". Prove the fixed name is no longer the staging
