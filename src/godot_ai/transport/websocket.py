@@ -207,7 +207,21 @@ class GodotWebSocketServer:
                 if live is not None:
                     live.touch()
 
-                data = json.loads(raw_msg)
+                ## Parse/validation failures of a single frame must not tear
+                ## down the whole editor session (#526): before this guard,
+                ## one garbled frame raised out of the loop into the
+                ## catch-all, and the finally block unregistered the session
+                ## and dropped the editor↔server bridge. Skip the bad frame
+                ## with a warning instead, mirroring the event path's
+                ## ValidationError handling. Only parse/validation errors are
+                ## swallowed — everything else still propagates.
+                try:
+                    data = json.loads(raw_msg)
+                except json.JSONDecodeError as exc:
+                    logger.warning(
+                        "Dropping non-JSON frame from session %s: %s", session_id[:8], exc
+                    )
+                    continue
 
                 # Handle state events from the plugin
                 if data.get("type") == "event":
@@ -215,7 +229,29 @@ class GodotWebSocketServer:
                     continue
 
                 # Handle command responses
-                response = CommandResponse.model_validate(data)
+                try:
+                    response = CommandResponse.model_validate(data)
+                except ValidationError as exc:
+                    logger.warning(
+                        "Dropping malformed command response from session %s: %s",
+                        session_id[:8],
+                        exc.errors(include_url=False, include_context=False, include_input=False),
+                    )
+                    ## If the malformed frame carried a request_id for a
+                    ## pending command, fail that future immediately with a
+                    ## clear error instead of leaving the caller to hit its
+                    ## timeout (#526).
+                    request_id = data.get("request_id") if isinstance(data, dict) else None
+                    if isinstance(request_id, str):
+                        pending = self._pending.pop(request_id, None)
+                        if pending and not pending.done():
+                            pending.set_exception(
+                                ConnectionError(
+                                    f"Malformed response from session {session_id} "
+                                    f"for request {request_id}"
+                                )
+                            )
+                    continue
                 ## Heal `Session.readiness` from every response envelope.
                 ## The plugin stamps live readiness onto its dispatcher
                 ## output, so the cache stays in lockstep with editor
