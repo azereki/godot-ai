@@ -205,6 +205,18 @@ class TestRollupCapturesOp:
 # --- plugin_event allowlist ---------------------------------------------
 
 
+def _run_handle_event(stub, session_id: str, data: dict) -> None:
+    """Drive the (async) ``_handle_event`` to completion synchronously.
+
+    ``_handle_event`` became a coroutine when ``custom_tools_changed``
+    started awaiting the tools/list_changed broadcast — calling it bare
+    would create a never-executed coroutine and silently record nothing.
+    """
+    from godot_ai.transport import websocket as ws_mod
+
+    asyncio.run(ws_mod.GodotWebSocketServer._handle_event(stub, session_id, data))
+
+
 class TestPluginEventAllowlist:
     def test_known_event_recorded(self, captured) -> None:
         from godot_ai.transport import websocket as ws_mod
@@ -225,7 +237,7 @@ class TestPluginEventAllowlist:
         ## Build a minimal instance to call _handle_event on; the method
         ## reads only self.registry.
         stub = types.SimpleNamespace(registry=reg)
-        ws_mod.GodotWebSocketServer._handle_event(
+        _run_handle_event(
             stub,  # type: ignore[arg-type]
             "demo@a3f2",
             {
@@ -264,7 +276,7 @@ class TestPluginEventAllowlist:
         captured.clear()
 
         stub = types.SimpleNamespace(registry=reg)
-        ws_mod.GodotWebSocketServer._handle_event(
+        _run_handle_event(
             stub,  # type: ignore[arg-type]
             "demo@a3f2",
             {
@@ -297,7 +309,7 @@ class TestPluginEventAllowlist:
         captured.clear()
 
         stub = types.SimpleNamespace(registry=reg)
-        ws_mod.GodotWebSocketServer._handle_event(
+        _run_handle_event(
             stub,  # type: ignore[arg-type]
             "demo@a3f2",
             {
@@ -338,7 +350,7 @@ class TestPluginEventAllowlist:
         captured.clear()
 
         stub = types.SimpleNamespace(registry=reg)
-        ws_mod.GodotWebSocketServer._handle_event(
+        _run_handle_event(
             stub,  # type: ignore[arg-type]
             "demo@a3f2",
             {
@@ -383,7 +395,7 @@ class TestPluginEventAllowlist:
         captured.clear()
 
         stub = types.SimpleNamespace(registry=reg)
-        ws_mod.GodotWebSocketServer._handle_event(
+        _run_handle_event(
             stub,  # type: ignore[arg-type]
             "demo@a3f2",
             {
@@ -428,7 +440,7 @@ class TestPluginEventAllowlist:
             ("plugin_reload", {"success": "yes", "source": "shell"}),
             ("dev_server_toggle", {"action": "restart"}),
         ):
-            ws_mod.GodotWebSocketServer._handle_event(
+            _run_handle_event(
                 stub,  # type: ignore[arg-type]
                 "demo@a3f2",
                 {
@@ -463,7 +475,7 @@ class TestPluginEventAllowlist:
         captured.clear()
 
         stub = types.SimpleNamespace(registry=reg)
-        ws_mod.GodotWebSocketServer._handle_event(
+        _run_handle_event(
             stub,  # type: ignore[arg-type]
             "demo@a3f2",
             {

@@ -53,6 +53,8 @@ const DebuggerPlugin := preload("res://addons/godot_ai/debugger/mcp_debugger_plu
 const ExportPlugin := preload("res://addons/godot_ai/export/mcp_export_plugin.gd")
 const ClientConfigurator := preload("res://addons/godot_ai/client_configurator.gd")
 const WindowsPortReservation := preload("res://addons/godot_ai/utils/windows_port_reservation.gd")
+const McpToolRegistry := preload("res://addons/godot_ai/custom_tools/mcp_tool_registry.gd")
+const McpServiceLocator := preload("res://addons/godot_ai/custom_tools/mcp_service_locator.gd")
 
 ## Handlers are intentionally NOT preloaded here (#736). The old
 ## `const X := preload("res://addons/godot_ai/handlers/...")` block pulled
@@ -151,6 +153,8 @@ var _editor_logger: Logger
 var _dock
 var _debugger_plugin
 var _export_plugin
+var _custom_tool_registry
+var _custom_tool_service_locator
 ## Spawn / stop / adopt orchestration plus state machine; allocated in
 ## `_init` so test fixtures (which never enter the tree) can drive
 ## `_start_server`. Owns `_server_pid`, `_server_state`, the version-
@@ -285,6 +289,10 @@ func _enter_tree() -> void:
 		and not ServerStateScript.is_terminal_diagnosis(_lifecycle.get_state())
 	):
 		_arm_server_version_check()
+	## Replay the custom-tool catalog on (re)connect so tools registered
+	## before the initial connection or during a disconnect window reach
+	## the server — send_event silently drops while _connected is false.
+	_connection.connection_state_changed.connect(_on_connection_state_changed)
 
 	_telemetry = Telemetry.new(_connection)
 
@@ -471,6 +479,15 @@ func _enter_tree() -> void:
 	add_child(_connection)
 	_startup_trace_phase("handlers_registered")
 
+	# Custom tool registry
+	_custom_tool_service_locator = McpServiceLocator.new()
+	_custom_tool_service_locator.setup(_connection, _log_buffer)
+	_custom_tool_registry = McpToolRegistry.new()
+	_custom_tool_registry.setup(_dispatcher, _custom_tool_service_locator)
+	_custom_tool_registry.tools_changed.connect(_on_custom_tools_changed)
+	_custom_tool_registry.mark_ready()
+	_startup_trace_phase("custom_tools_ready")
+
 	# Dock panel
 	_dock = Dock.new()
 	_dock.name = "Godot AI"
@@ -527,6 +544,12 @@ func _exit_tree() -> void:
 		_server_started_this_session = false
 		_headless_disabled = false
 		return
+
+	if _custom_tool_registry != null:
+		_custom_tool_registry.clear()
+		_custom_tool_registry = null
+
+	_custom_tool_service_locator = null
 
 	## Outer-to-inner teardown. Dispatcher Callables hold RefCounted handlers
 	## alive past the point where Godot reloads their class_name scripts — the
@@ -1971,3 +1994,31 @@ func can_restart_managed_server() -> bool:
 	## means this plugin spawned/adopted a managed server; a non-empty
 	## managed record is the cross-session proof used by the drift branch.
 	return _lifecycle.can_restart_managed_server()
+
+
+func _on_custom_tools_changed() -> void:
+	if _connection == null:
+		push_warning("MCP | connection isn't established")
+		return
+	var tool_list: Array[Dictionary] = []
+	for spec in _custom_tool_registry.all():
+		tool_list.append({
+			"name": spec.name,
+			"description": spec.description,
+			"params_schema": spec.params_schema,
+			"source": spec.source,
+			"deferred": spec.deferred,
+			"timeout_ms": spec.timeout_ms,
+			"requires_writable": spec.requires_writable
+		})
+	_connection.send_event("custom_tools_changed", {"tools": tool_list})
+
+
+## On (re)connect, replay the current custom-tool catalog so tools
+## registered before the initial connection or during a disconnect
+## window reach the server. send_event silently drops while
+## _connected is false (connection.gd::_send_json), so without this
+## replay those tools only surface on the next registry mutation.
+func _on_connection_state_changed(is_open: bool) -> void:
+	if is_open and _custom_tool_registry != null:
+		_on_custom_tools_changed()

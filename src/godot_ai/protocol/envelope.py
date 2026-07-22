@@ -129,3 +129,7 @@ class ReadinessChangedEvent(BaseModel):
 class PluginTelemetryEvent(BaseModel):
     name: str = ""
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+class CustomToolsChangedEvent(BaseModel):
+    tools: list # without default value
