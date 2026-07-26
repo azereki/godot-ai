@@ -1514,17 +1514,42 @@ func test_forensics_distinguishes_a_real_crash_from_a_missing_pid_file() -> void
 	assert_contains(never_published, "shape=no_pid_file_published")
 
 
-func test_forensics_reports_true_death_time_separately_from_detection() -> void:
-	## After a #837 handoff wait, elapsed is when we gave up and first_dead is
-	## when the process actually died. Conflating them would misdate the event
-	## in exactly the reports this line exists to serve.
-	var line := McpServerLifecycleManagerScript.format_spawn_exit_forensics({
-		"elapsed_ms": 15000, "first_dead_ms": 312,
-		"spawn_pid": 1, "spawn_alive": false,
-		"pid_file_pid": 0, "pid_file_alive": false,
-	})
-	assert_contains(line, "elapsed=15000ms")
-	assert_contains(line, "first_dead=312ms")
+func test_forensics_wiring_reports_diagnosis_time_not_the_death_time() -> void:
+	## Caught in review after the formatter-only version of this test passed
+	## while production was broken: `check_server_health` calls
+	## `_diagnose_spawn_fast_exit(_spawn_dead_since_ms)` (#837, so the
+	## user-facing line dates the real exit), so forwarding that same value into
+	## the forensics made elapsed_ms and first_dead_ms identical — collapsing
+	## the one distinction they exist to record.
+	##
+	## Asserting on the ACTUAL logged line rather than on the formatter, because
+	## a formatter test cannot see the two inputs converge upstream.
+	var host := _ManagerHostStub.new()
+	host._log_buffer = McpLogBuffer.new()
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager._server_pid = 4242
+	## Spawned "a while ago", died early: a handoff wait between the two.
+	manager._server_spawn_ms = Time.get_ticks_msec() - 9000
+	manager._spawn_dead_since_ms = 300
+
+	manager._log_spawn_exit_forensics()
+	var lines: Array = host._log_buffer.get_recent(5)
+	host.free()
+
+	var found := ""
+	for line in lines:
+		if str(line).find("#797 spawn-exit forensics") >= 0:
+			found = str(line)
+	assert_false(found.is_empty(), "the forensics line must actually be logged")
+	assert_contains(found, "first_dead=300ms")
+	assert_false(found.contains("elapsed=300ms"),
+		"elapsed must be the diagnosis time, not a copy of the death time")
+	## Spawned ~9s ago, so the diagnosis timestamp is in that neighbourhood.
+	## Asserting the magnitude rather than an exact tick keeps it non-flaky.
+	var elapsed_at := found.find("elapsed=")
+	var reported := found.substr(elapsed_at + 8).split("ms")[0].to_int()
+	assert_true(reported >= 9000,
+		"elapsed should measure from spawn (>=9000ms), got %d" % reported)
 
 
 func test_forensics_is_a_single_line() -> void:

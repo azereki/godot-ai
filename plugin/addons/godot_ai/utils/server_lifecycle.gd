@@ -1065,13 +1065,21 @@ static func first_death_stamp(current_stamp_ms: int, elapsed_ms: int) -> int:
 ## a godot-ai server answers on the port, and `_diagnose_spawn_port_conflict`
 ## names a foreign occupant when there is one. If you are tempted to add the
 ## PID list back, put it behind that existing conflict path rather than here.
-func _log_spawn_exit_forensics(elapsed: int) -> void:
+func _log_spawn_exit_forensics() -> void:
 	var spawn_pid := int(_server_pid)
 	var pid_file_pid := int(_host._read_pid_file_for_proof())
+	## Computed here rather than accepted as a parameter. The caller's
+	## `elapsed` IS `_spawn_dead_since_ms` — #837 passes the true death time so
+	## the user-facing "server exited after Nms" line stays honest — so taking
+	## it would make these two fields report the same number, collapsing the
+	## exact distinction they exist to record.
+	var diagnosed_at_ms := 0
+	if int(_server_spawn_ms) > 0:
+		diagnosed_at_ms = Time.get_ticks_msec() - int(_server_spawn_ms)
 	_host._log_buffer.log(format_spawn_exit_forensics({
 		"os": OS.get_name(),
 		"launch_mode": ClientConfigurator.get_server_launch_mode(),
-		"elapsed_ms": elapsed,
+		"elapsed_ms": diagnosed_at_ms,
 		## Differs from elapsed_ms when a Windows handoff window was waited out
 		## (#824/#837): the true death time versus when we gave up on it.
 		"first_dead_ms": int(_spawn_dead_since_ms),
@@ -1177,7 +1185,7 @@ func check_server_health() -> void:
 ##   3. #172: stale uvx index -> one `--refresh` respawn.
 ##   4. Otherwise -> CRASHED, pointing at the Godot output log.
 func _diagnose_spawn_fast_exit(elapsed: int) -> void:
-	_log_spawn_exit_forensics(elapsed)
+	_log_spawn_exit_forensics()
 	var live: Dictionary = _host._probe_live_server_status_for_port(
 		ClientConfigurator.http_port()
 	)
