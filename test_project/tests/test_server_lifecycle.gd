@@ -1466,3 +1466,74 @@ func test_status_projection_keeps_whole_number_lease_counts() -> void:
 		assert_true(projected.has("active_lease_count"),
 			"a whole-number count (%s) is the normal wire shape and must project" % whole)
 		assert_eq(McpServerLifecycleManagerScript.active_lease_count(projected), int(whole))
+
+
+# ----- #797 forensics: capture evidence at the moment of judgement -----
+
+func test_forensics_names_the_handoff_shape() -> void:
+	## The shape #797 hypothesised: watched PID gone, a different live PID in
+	## the pid-file. Naming it in the line means a bug report answers the
+	## question without the reporter knowing to look.
+	var line := McpServerLifecycleManagerScript.format_spawn_exit_forensics({
+		"os": "Windows", "launch_mode": "dev_venv",
+		"elapsed_ms": 5146, "first_dead_ms": 5146,
+		"spawn_pid": 30188, "spawn_alive": false,
+		"pid_file_pid": 9360, "pid_file_alive": true,
+		"listeners": [9360],
+	})
+	assert_contains(line, "shape=handoff_child_alive")
+	assert_contains(line, "spawn_pid=30188(alive=false)")
+	assert_contains(line, "pid_file_pid=9360(alive=true)")
+	assert_contains(line, "elapsed=5146ms")
+
+
+func test_forensics_flags_a_watched_pid_that_is_actually_alive() -> void:
+	## The case the 12-boot smoke found: the trampoline never dies. If a
+	## fast-exit is ever diagnosed while the watched PID is alive here, the
+	## death was transient — a different bug from a process that really exited,
+	## and one nobody would guess from "server exited after Nms".
+	var line := McpServerLifecycleManagerScript.format_spawn_exit_forensics({
+		"os": "Windows", "launch_mode": "dev_venv",
+		"elapsed_ms": 5200, "first_dead_ms": 5100,
+		"spawn_pid": 30188, "spawn_alive": true,
+		"pid_file_pid": 9360, "pid_file_alive": true,
+		"listeners": [9360],
+	})
+	assert_contains(line, "shape=watched_pid_still_alive")
+
+
+func test_forensics_distinguishes_a_real_crash_from_a_missing_pid_file() -> void:
+	var crashed := McpServerLifecycleManagerScript.format_spawn_exit_forensics({
+		"spawn_pid": 111, "spawn_alive": false,
+		"pid_file_pid": 111, "pid_file_alive": false, "listeners": [],
+	})
+	assert_contains(crashed, "shape=all_dead")
+
+	var never_published := McpServerLifecycleManagerScript.format_spawn_exit_forensics({
+		"spawn_pid": 111, "spawn_alive": false,
+		"pid_file_pid": 0, "pid_file_alive": false, "listeners": [],
+	})
+	assert_contains(never_published, "shape=no_pid_file_published")
+
+
+func test_forensics_reports_true_death_time_separately_from_detection() -> void:
+	## After a #837 handoff wait, elapsed is when we gave up and first_dead is
+	## when the process actually died. Conflating them would misdate the event
+	## in exactly the reports this line exists to serve.
+	var line := McpServerLifecycleManagerScript.format_spawn_exit_forensics({
+		"elapsed_ms": 15000, "first_dead_ms": 312,
+		"spawn_pid": 1, "spawn_alive": false,
+		"pid_file_pid": 0, "pid_file_alive": false, "listeners": [],
+	})
+	assert_contains(line, "elapsed=15000ms")
+	assert_contains(line, "first_dead=312ms")
+
+
+func test_forensics_is_a_single_line() -> void:
+	## It has to survive being pasted into an issue with surrounding log noise.
+	var line := McpServerLifecycleManagerScript.format_spawn_exit_forensics({
+		"os": "Windows", "spawn_pid": 1, "pid_file_pid": 2, "listeners": [2, 3],
+	})
+	assert_eq(line.count("\n"), 0, "forensics must stay one line")
+	assert_true(line.begins_with("#797 "),
+		"prefix the issue number so a future reporter can search for it")

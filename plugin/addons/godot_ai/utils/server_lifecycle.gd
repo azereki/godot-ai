@@ -1034,6 +1034,82 @@ static func first_death_stamp(current_stamp_ms: int, elapsed_ms: int) -> int:
 	return current_stamp_ms if current_stamp_ms > 0 else elapsed_ms
 
 
+## One-line forensic snapshot taken the moment a spawn is judged to have
+## fast-exited (#797).
+##
+## #797 reported `server exited after 5146ms` on a healthy Windows boot, once
+## in four. It is still unexplained: a 12-boot run on the reported
+## configuration reproduced neither the symptom nor its suspected mechanism —
+## the uv trampoline was alive on every boot, with the child owning the
+## pid-file and the listener, so the shim's exit is ruled out as the cause.
+## What killed that watched PID is unknown, and the log line at the time
+## carried no evidence to answer it with.
+##
+## So capture the state at the moment of judgement rather than asking the next
+## person to reproduce a 1-in-4 bug under observation. Everything here is read
+## through seams the surrounding diagnosis already uses, on a path that only
+## runs when a spawn is being declared dead, so it costs nothing in the
+## healthy case.
+func _log_spawn_exit_forensics(elapsed: int) -> void:
+	var port := ClientConfigurator.http_port()
+	var spawn_pid := int(_server_pid)
+	var pid_file_pid := int(_host._read_pid_file_for_proof())
+	var listeners: Array[int] = _host._find_all_pids_on_port(port)
+	_host._log_buffer.log(format_spawn_exit_forensics({
+		"os": OS.get_name(),
+		"launch_mode": ClientConfigurator.get_server_launch_mode(),
+		"elapsed_ms": elapsed,
+		## Differs from elapsed_ms when a Windows handoff window was waited out
+		## (#824/#837): the true death time versus when we gave up on it.
+		"first_dead_ms": int(_spawn_dead_since_ms),
+		"spawn_pid": spawn_pid,
+		## Re-read rather than trusted from the watch tick: if the spawn PID is
+		## alive HERE, the death that triggered this was transient, which is a
+		## different bug from a process that really exited.
+		"spawn_alive": spawn_pid > 0 and bool(_host._pid_alive_for_proof(spawn_pid)),
+		"pid_file_pid": pid_file_pid,
+		"pid_file_alive": pid_file_pid > 0 and bool(_host._pid_alive_for_proof(pid_file_pid)),
+		"listeners": listeners,
+	}))
+
+
+## Render the forensic snapshot. Pure so the format is testable without a live
+## editor, and kept to one line so it survives log truncation in a bug report.
+static func format_spawn_exit_forensics(facts: Dictionary) -> String:
+	var spawn_pid := int(facts.get("spawn_pid", 0))
+	var pid_file_pid := int(facts.get("pid_file_pid", 0))
+	var listeners: Array = facts.get("listeners", [])
+	## The single most diagnostic bit, stated rather than left to be inferred:
+	## a live pid-file process while the watched one is gone is the launcher
+	## handoff shape; both gone is a real crash.
+	var shape := "unknown"
+	var spawn_alive := bool(facts.get("spawn_alive", false))
+	var file_alive := bool(facts.get("pid_file_alive", false))
+	if spawn_alive:
+		shape = "watched_pid_still_alive"
+	elif file_alive and pid_file_pid != spawn_pid:
+		shape = "handoff_child_alive"
+	elif not file_alive and pid_file_pid <= 0:
+		shape = "no_pid_file_published"
+	else:
+		shape = "all_dead"
+	return (
+		"#797 spawn-exit forensics: shape=%s os=%s launch=%s elapsed=%dms "
+		+ "first_dead=%dms spawn_pid=%d(alive=%s) pid_file_pid=%d(alive=%s) listeners=%s"
+	) % [
+		shape,
+		str(facts.get("os", "")),
+		str(facts.get("launch_mode", "")),
+		int(facts.get("elapsed_ms", 0)),
+		int(facts.get("first_dead_ms", 0)),
+		spawn_pid,
+		str(spawn_alive),
+		pid_file_pid,
+		str(file_alive),
+		str(listeners),
+	]
+
+
 ## Watch-loop callback (1 Hz, capped by SERVER_WATCH_MS).
 ## `--pid-file` is the source of truth on Windows / uvx where the
 ## launcher PID dies quickly after spawning the real interpreter.
@@ -1091,6 +1167,7 @@ func check_server_health() -> void:
 ##   3. #172: stale uvx index -> one `--refresh` respawn.
 ##   4. Otherwise -> CRASHED, pointing at the Godot output log.
 func _diagnose_spawn_fast_exit(elapsed: int) -> void:
+	_log_spawn_exit_forensics(elapsed)
 	var live: Dictionary = _host._probe_live_server_status_for_port(
 		ClientConfigurator.http_port()
 	)
