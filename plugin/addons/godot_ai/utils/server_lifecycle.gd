@@ -1050,11 +1050,24 @@ static func first_death_stamp(current_stamp_ms: int, elapsed_ms: int) -> int:
 ## through seams the surrounding diagnosis already uses, on a path that only
 ## runs when a spawn is being declared dead, so it costs nothing in the
 ## healthy case.
+## Deliberately does NOT scrape the port for listener PIDs. This runs from the
+## 1 Hz watch loop, on a live frame, so a `_find_all_pids_on_port` subprocess
+## here would stall the editor for a diagnostic. Deferring it via
+## `_run_blocking` was the alternative and is worse: that helper is
+## `await`-based, so it would turn this, `_diagnose_spawn_fast_exit` and
+## `check_server_health` into coroutines — making the watch callback resume
+## across arbitrary frames while its branches set terminal state and trigger
+## re-adoption walks. That is the teardown-ordering hazard
+## `_invalidate_async_startup` exists to contain, and it is not worth taking
+## on for a log line.
+##
+## Little is lost: the probe on the very next line already establishes whether
+## a godot-ai server answers on the port, and `_diagnose_spawn_port_conflict`
+## names a foreign occupant when there is one. If you are tempted to add the
+## PID list back, put it behind that existing conflict path rather than here.
 func _log_spawn_exit_forensics(elapsed: int) -> void:
-	var port := ClientConfigurator.http_port()
 	var spawn_pid := int(_server_pid)
 	var pid_file_pid := int(_host._read_pid_file_for_proof())
-	var listeners: Array[int] = _host._find_all_pids_on_port(port)
 	_host._log_buffer.log(format_spawn_exit_forensics({
 		"os": OS.get_name(),
 		"launch_mode": ClientConfigurator.get_server_launch_mode(),
@@ -1069,7 +1082,6 @@ func _log_spawn_exit_forensics(elapsed: int) -> void:
 		"spawn_alive": spawn_pid > 0 and bool(_host._pid_alive_for_proof(spawn_pid)),
 		"pid_file_pid": pid_file_pid,
 		"pid_file_alive": pid_file_pid > 0 and bool(_host._pid_alive_for_proof(pid_file_pid)),
-		"listeners": listeners,
 	}))
 
 
@@ -1078,7 +1090,6 @@ func _log_spawn_exit_forensics(elapsed: int) -> void:
 static func format_spawn_exit_forensics(facts: Dictionary) -> String:
 	var spawn_pid := int(facts.get("spawn_pid", 0))
 	var pid_file_pid := int(facts.get("pid_file_pid", 0))
-	var listeners: Array = facts.get("listeners", [])
 	## The single most diagnostic bit, stated rather than left to be inferred:
 	## a live pid-file process while the watched one is gone is the launcher
 	## handoff shape; both gone is a real crash.
@@ -1095,7 +1106,7 @@ static func format_spawn_exit_forensics(facts: Dictionary) -> String:
 		shape = "all_dead"
 	return (
 		"#797 spawn-exit forensics: shape=%s os=%s launch=%s elapsed=%dms "
-		+ "first_dead=%dms spawn_pid=%d(alive=%s) pid_file_pid=%d(alive=%s) listeners=%s"
+		+ "first_dead=%dms spawn_pid=%d(alive=%s) pid_file_pid=%d(alive=%s)"
 	) % [
 		shape,
 		str(facts.get("os", "")),
@@ -1106,7 +1117,6 @@ static func format_spawn_exit_forensics(facts: Dictionary) -> String:
 		str(spawn_alive),
 		pid_file_pid,
 		str(file_alive),
-		str(listeners),
 	]
 
 

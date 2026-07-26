@@ -1479,7 +1479,6 @@ func test_forensics_names_the_handoff_shape() -> void:
 		"elapsed_ms": 5146, "first_dead_ms": 5146,
 		"spawn_pid": 30188, "spawn_alive": false,
 		"pid_file_pid": 9360, "pid_file_alive": true,
-		"listeners": [9360],
 	})
 	assert_contains(line, "shape=handoff_child_alive")
 	assert_contains(line, "spawn_pid=30188(alive=false)")
@@ -1497,7 +1496,6 @@ func test_forensics_flags_a_watched_pid_that_is_actually_alive() -> void:
 		"elapsed_ms": 5200, "first_dead_ms": 5100,
 		"spawn_pid": 30188, "spawn_alive": true,
 		"pid_file_pid": 9360, "pid_file_alive": true,
-		"listeners": [9360],
 	})
 	assert_contains(line, "shape=watched_pid_still_alive")
 
@@ -1505,13 +1503,13 @@ func test_forensics_flags_a_watched_pid_that_is_actually_alive() -> void:
 func test_forensics_distinguishes_a_real_crash_from_a_missing_pid_file() -> void:
 	var crashed := McpServerLifecycleManagerScript.format_spawn_exit_forensics({
 		"spawn_pid": 111, "spawn_alive": false,
-		"pid_file_pid": 111, "pid_file_alive": false, "listeners": [],
+		"pid_file_pid": 111, "pid_file_alive": false,
 	})
 	assert_contains(crashed, "shape=all_dead")
 
 	var never_published := McpServerLifecycleManagerScript.format_spawn_exit_forensics({
 		"spawn_pid": 111, "spawn_alive": false,
-		"pid_file_pid": 0, "pid_file_alive": false, "listeners": [],
+		"pid_file_pid": 0, "pid_file_alive": false,
 	})
 	assert_contains(never_published, "shape=no_pid_file_published")
 
@@ -1523,7 +1521,7 @@ func test_forensics_reports_true_death_time_separately_from_detection() -> void:
 	var line := McpServerLifecycleManagerScript.format_spawn_exit_forensics({
 		"elapsed_ms": 15000, "first_dead_ms": 312,
 		"spawn_pid": 1, "spawn_alive": false,
-		"pid_file_pid": 0, "pid_file_alive": false, "listeners": [],
+		"pid_file_pid": 0, "pid_file_alive": false,
 	})
 	assert_contains(line, "elapsed=15000ms")
 	assert_contains(line, "first_dead=312ms")
@@ -1532,7 +1530,7 @@ func test_forensics_reports_true_death_time_separately_from_detection() -> void:
 func test_forensics_is_a_single_line() -> void:
 	## It has to survive being pasted into an issue with surrounding log noise.
 	var line := McpServerLifecycleManagerScript.format_spawn_exit_forensics({
-		"os": "Windows", "spawn_pid": 1, "pid_file_pid": 2, "listeners": [2, 3],
+		"os": "Windows", "spawn_pid": 1, "pid_file_pid": 2,
 	})
 	assert_eq(line.count("\n"), 0, "forensics must stay one line")
 	assert_true(line.begins_with("#797 "),
