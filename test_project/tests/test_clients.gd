@@ -1404,8 +1404,28 @@ func test_claude_code_has_claude_json_fallback() -> void:
 	assert_true(client.has_json_fallback(), "claude_code should declare a ~/.claude.json fallback (#463)")
 	assert_eq(client.server_key_path.size(), 1)
 	assert_eq(client.server_key_path[0], "mcpServers")
-	assert_eq(client.entry_extra_fields.get("type"), "http", "claude mcp add --transport http writes type:http")
+	assert_eq(client.entry_extra_fields.get("type"), "http", "URL-fallback rendering keeps the type:http shape")
 	assert_true(client.resolved_config_path().ends_with(".claude.json"), "fallback path should be ~/.claude.json, got %s" % client.resolved_config_path())
+
+
+func test_claude_code_declares_stdio_attach_registration() -> void:
+	## #838: registration goes through `claude mcp add --scope user <name> --
+	## <command> <args...>` (stdio is the CLI's default transport; verified
+	## live in an isolated CLAUDE_CONFIG_DIR). The JSON fallback file renders
+	## the same entry the CLI itself writes: type:stdio + command + args.
+	var client := McpClientRegistry.get_by_id("claude_code")
+	assert_eq(client.command_shape, McpClient.CommandShape.FLAT)
+	assert_eq(client.command_transport_key, "type")
+	assert_eq(client.command_transport_value, "stdio")
+	assert_true(client.command_legacy_keys.has("url"), "legacy HTTP entry's url must be removed")
+	assert_true(client.command_supports_url_fallback)
+	var register := client.cli_register_template
+	assert_true(register.has("--scope"), "registration stays user-scoped")
+	assert_true(register.has("--"), "`--` must stop claude's own flag parsing")
+	assert_true(register.has("{command}"), "register template must take the launch command token")
+	assert_true(register.has("{args...}"), "register template must splice the launch args")
+	assert_false(register.has("--transport"), "stdio is the default transport — no pin in argv")
+	assert_true(client.cli_unregister_template.has("--scope"), "unscoped remove could eat a project-local entry")
 
 
 func test_claude_code_manual_command_shows_json_fallback() -> void:
@@ -1414,7 +1434,10 @@ func test_claude_code_manual_command_shows_json_fallback() -> void:
 	var cmd := McpClientConfigurator.manual_command("claude_code")
 	assert_contains(cmd, "claude mcp add", "manual command should still show the CLI form")
 	assert_contains(cmd, ".claude.json", "manual command should also show the JSON fallback path")
-	assert_contains(cmd, "\"type\": \"http\"", "JSON fallback should show the type:http entry shape")
+	assert_contains(cmd, " -- ", "CLI form must carry the argv separator")
+	assert_contains(cmd, "\"type\": \"stdio\"", "JSON fallback should show the stdio entry shape")
+	assert_contains(cmd, "Advanced fallback", "URL mode stays available as the documented fallback")
+	assert_contains(cmd, "\"type\": \"http\"", "URL fallback entry keeps the type:http shape")
 
 
 func test_cli_fallback_dispatch_writes_json_when_binary_missing() -> void:
@@ -2472,24 +2495,97 @@ func test_handler_teardown_defers_status_worker_join() -> void:
 
 
 # ----- entry-builder shape sanity for shipped clients -----
+#
+# #838: every JSON client is command-shape now; the URL form survives only as
+# the manual-instruction fallback, so its per-client key shape is pinned via
+# `build_url_entry` and the command entry via `build_entry` + launch.
 
-func test_cursor_entry_uses_url() -> void:
+func test_cursor_attach_entry_and_url_fallback() -> void:
 	var c := McpClientRegistry.get_by_id("cursor")
-	var entry := McpJsonStrategy.build_entry(c, "http://x")
-	assert_eq(entry.get("url", ""), "http://x")
+	assert_eq(c.command_shape, McpClient.CommandShape.FLAT)
+	var launch := _test_attach_launch()
+	var entry := McpJsonStrategy.build_entry(c, "http://unused", {"url": "http://old", "type": "http"}, launch)
+	assert_eq(entry.get("command"), launch.get("command"))
+	assert_eq(entry.get("args"), launch.get("args"))
+	assert_eq(entry.get("type"), "stdio", "pin repins a stray legacy type value")
+	assert_false(entry.has("url"), "legacy url must not survive migration")
+	assert_true(McpJsonStrategy.verify_entry(c, entry, "http://unused", launch))
+	var fallback := McpJsonStrategy.build_url_entry(c, "http://x")
+	assert_eq(fallback.get("url", ""), "http://x")
 
 
-func test_antigravity_entry_uses_serverUrl() -> void:
+func test_antigravity_attach_entry_and_serverUrl_fallback() -> void:
 	var c := McpClientRegistry.get_by_id("antigravity")
-	var entry := McpJsonStrategy.build_entry(c, "http://x")
-	assert_eq(entry.get("serverUrl", ""), "http://x")
-	assert_eq(entry.get("disabled", true), false)
+	assert_eq(c.command_shape, McpClient.CommandShape.FLAT)
+	var launch := _test_attach_launch()
+	var entry := McpJsonStrategy.build_entry(c, "http://unused", {"serverUrl": "http://old"}, launch)
+	assert_eq(entry.get("command"), launch.get("command"))
+	assert_false(entry.has("serverUrl"), "legacy serverUrl must not survive next to a command")
+	assert_false(entry.has("type"), "Antigravity documents no type field — never write one")
+	assert_eq(entry.get("disabled", true), false, "disabled seeds on fresh entries")
+	assert_true(McpJsonStrategy.verify_entry(c, entry, "http://unused", launch))
+	var fallback := McpJsonStrategy.build_url_entry(c, "http://x")
+	assert_eq(fallback.get("serverUrl", ""), "http://x")
+	assert_eq(fallback.get("disabled", true), false)
 
 
-func test_gemini_cli_entry_uses_httpUrl() -> void:
+func test_gemini_cli_attach_entry_removes_both_url_forms() -> void:
 	var c := McpClientRegistry.get_by_id("gemini_cli")
-	var entry := McpJsonStrategy.build_entry(c, "http://x")
-	assert_eq(entry.get("httpUrl", ""), "http://x")
+	assert_eq(c.command_shape, McpClient.CommandShape.FLAT)
+	var launch := _test_attach_launch()
+	## Gemini's config is one-of command|url|httpUrl — a leftover of EITHER
+	## URL key next to command violates the one-of and must be scrubbed.
+	var entry := McpJsonStrategy.build_entry(
+		c, "http://unused", {"httpUrl": "http://old", "url": "http://sse-old"}, launch
+	)
+	assert_eq(entry.get("command"), launch.get("command"))
+	assert_false(entry.has("httpUrl"))
+	assert_false(entry.has("url"))
+	assert_false(entry.has("type"), "gemini-cli has no type field")
+	assert_true(McpJsonStrategy.verify_entry(c, entry, "http://unused", launch))
+	var fallback := McpJsonStrategy.build_url_entry(c, "http://x")
+	assert_eq(fallback.get("httpUrl", ""), "http://x")
+
+
+func test_qwen_code_matches_gemini_attach_shape() -> void:
+	var c := McpClientRegistry.get_by_id("qwen_code")
+	assert_eq(c.command_shape, McpClient.CommandShape.FLAT)
+	assert_true(c.command_legacy_keys.has("httpUrl"))
+	assert_true(c.command_legacy_keys.has("url"))
+	assert_true(c.command_user_fields.has("discoveryTimeoutMs"), "Qwen-only stdio discovery cap is user-owned")
+
+
+func test_kimi_code_attach_entry_removes_transport_key() -> void:
+	var c := McpClientRegistry.get_by_id("kimi_code")
+	assert_eq(c.command_shape, McpClient.CommandShape.FLAT)
+	assert_eq(c.config_home_env, "KIMI_CODE_HOME", "documented $KIMI_CODE_HOME relocation (#617 analogue)")
+	assert_eq(c.config_home_env_subpath, "mcp.json")
+	var launch := _test_attach_launch()
+	## `transport` is only defined for SSE-with-url in Kimi's docs — the
+	## legacy `transport: "http"` pin must not survive on a command entry.
+	var entry := McpJsonStrategy.build_entry(
+		c, "http://unused", {"url": "http://old", "transport": "http"}, launch
+	)
+	assert_false(entry.has("url"))
+	assert_false(entry.has("transport"))
+	assert_true(McpJsonStrategy.verify_entry(c, entry, "http://unused", launch))
+	assert_false(
+		McpJsonStrategy.verify_entry(c, {"command": "x", "args": [], "transport": "http"}, "http://unused", launch),
+		"a lingering transport key is migration drift",
+	)
+
+
+func test_windsurf_and_trae_and_kiro_attach_declarations() -> void:
+	for probe in [
+		["windsurf", "serverUrl"],
+		["trae", "url"],
+		["kiro", "url"],
+	]:
+		var c := McpClientRegistry.get_by_id(String(probe[0]))
+		assert_eq(c.command_shape, McpClient.CommandShape.FLAT, "%s must be FLAT" % probe[0])
+		assert_true(c.command_legacy_keys.has(String(probe[1])), "%s must scrub %s" % [probe[0], probe[1]])
+		assert_true(c.command_transport_key.is_empty(), "%s documents no type field" % probe[0])
+		assert_true(c.command_supports_url_fallback, "%s keeps a documented URL mode" % probe[0])
 
 
 func test_claude_desktop_declares_flat_attach_shape() -> void:
@@ -2677,139 +2773,145 @@ func test_json_manual_command_rejects_unsupported_command_shape() -> void:
 	assert_false(manual.contains('"godot-ai": {}'), "unsupported shapes must not render an empty entry")
 
 
-func test_zed_uses_url() -> void:
+func test_zed_attach_entry_scrubs_every_http_only_key() -> void:
 	var c := McpClientRegistry.get_by_id("zed")
-	var entry := McpJsonStrategy.build_entry(c, "http://x")
-	assert_eq(entry.get("url", ""), "http://x")
+	assert_eq(c.command_shape, McpClient.CommandShape.FLAT)
+	var launch := _test_attach_launch()
+	## Zed's context_servers entry is an UNTAGGED serde enum — an entry
+	## carrying `command` plus any HTTP-only key (url/headers/oauth) matches
+	## no variant and breaks outright, so scrubbing them is load-bearing.
+	var entry := McpJsonStrategy.build_entry(
+		c,
+		"http://unused",
+		{"url": "http://old", "headers": {"X": "y"}, "enabled": false, "timeout": 90},
+		launch,
+	)
+	assert_false(entry.has("url"))
+	assert_false(entry.has("headers"))
+	assert_false(entry.has("type"), "current Zed is shape-discriminated — no type/source tag")
+	assert_eq(entry.get("enabled"), false, "user enabled toggle survives")
+	assert_eq(entry.get("timeout"), 90, "stdio timeout is user-owned")
+	assert_true(McpJsonStrategy.verify_entry(c, entry, "http://unused", launch))
+	var fallback := McpJsonStrategy.build_url_entry(c, "http://x")
+	assert_eq(fallback.get("url", ""), "http://x")
 
 
+func test_vscode_attach_entry_flips_type_pin_to_stdio() -> void:
+	for id in ["vscode", "vscode_insiders"]:
+		var c := McpClientRegistry.get_by_id(id)
+		assert_eq(c.server_key_path.size(), 1, "%s key path" % id)
+		assert_eq(c.server_key_path[0], "servers", "%s uses the servers key" % id)
+		assert_eq(c.command_shape, McpClient.CommandShape.FLAT, "%s shape" % id)
+		var launch := _test_attach_launch()
+		## VS Code's stdio schema is additionalProperties:false — leftover
+		## url/headers invalidate the entry, and the legacy `type: "http"`
+		## must flip to "stdio" rather than survive the deep copy.
+		var entry := McpJsonStrategy.build_entry(
+			c, "http://unused", {"type": "http", "url": "http://old"}, launch
+		)
+		assert_eq(entry.get("type"), "stdio", "%s type pin" % id)
+		assert_false(entry.has("url"), "%s legacy url" % id)
+		assert_true(McpJsonStrategy.verify_entry(c, entry, "http://unused", launch), "%s verify" % id)
+		var fallback := McpJsonStrategy.build_url_entry(c, "http://x")
+		assert_eq(fallback.get("type", ""), "http", "%s fallback keeps type:http" % id)
+		assert_eq(fallback.get("url", ""), "http://x", "%s fallback url" % id)
 
 
-func test_vscode_uses_servers_key_with_type_http() -> void:
-	var c := McpClientRegistry.get_by_id("vscode")
-	assert_eq(c.server_key_path.size(), 1)
-	assert_eq(c.server_key_path[0], "servers")
-	var entry := McpJsonStrategy.build_entry(c, "http://x")
-	assert_eq(entry.get("type", ""), "http")
-	assert_eq(entry.get("url", ""), "http://x")
+func test_roo_family_attach_entries_pin_stdio_except_kilo() -> void:
+	## #838: cline/roo/zoo write `type: "stdio"` (documented/schema-accepted in
+	## each), which also flips the legacy streamable-http pin in place. Kilo is
+	## the deliberate exception — its v7 migrator routes on `type` and only a
+	## TYPELESS command entry works in both product generations, so kilo lists
+	## `type` as a legacy key instead of pinning it.
+	var launch := _test_attach_launch()
+	for probe in [
+		["cline", "streamableHttp"],
+		["roo_code", "streamable-http"],
+		["zoo_code", "streamable-http"],
+	]:
+		var c := McpClientRegistry.get_by_id(String(probe[0]))
+		assert_eq(c.command_shape, McpClient.CommandShape.FLAT, "%s shape" % probe[0])
+		var legacy := {"type": String(probe[1]), "url": "http://old", "disabled": true, "alwaysAllow": ["x"]}
+		var entry := McpJsonStrategy.build_entry(c, "http://unused", legacy, launch)
+		assert_eq(entry.get("type"), "stdio", "%s must repin type to stdio" % probe[0])
+		assert_false(entry.has("url"), "%s legacy url must be removed" % probe[0])
+		assert_eq(entry.get("disabled"), true, "%s user disabled state survives" % probe[0])
+		assert_true(McpJsonStrategy.verify_entry(c, entry, "http://unused", launch), "%s verify" % probe[0])
+	var kilo := McpClientRegistry.get_by_id("kilo_code")
+	assert_eq(kilo.command_shape, McpClient.CommandShape.FLAT)
+	assert_true(kilo.command_transport_key.is_empty(), "kilo stdio entries must stay typeless")
+	assert_true(kilo.command_legacy_keys.has("type"), "kilo must scrub the legacy type key")
+	var kilo_entry := McpJsonStrategy.build_entry(
+		kilo, "http://unused", {"type": "streamable-http", "url": "http://old"}, launch
+	)
+	assert_false(kilo_entry.has("type"), "an http type left behind routes kilo's v7 migrator to the remote branch")
+	assert_false(kilo_entry.has("url"))
+	assert_true(McpJsonStrategy.verify_entry(kilo, kilo_entry, "http://unused", launch))
+	assert_false(
+		McpJsonStrategy.verify_entry(
+			kilo,
+			{"type": "stdio", "command": launch.get("command"), "args": launch.get("args")},
+			"http://unused",
+			launch,
+		),
+		"even a stdio-typed kilo entry is drift — the verified-safe form is typeless",
+	)
 
 
-func test_roo_code_pins_streamable_http_transport() -> void:
-	## Regression for #189: without an explicit "type", Roo defaults to SSE
-	## transport and our streamable-http /mcp endpoint returns HTTP 400.
-	## The entry and the manual-command string must both pin the type so the
-	## out-of-the-box config negotiates the right transport.
-	var c := McpClientRegistry.get_by_id("roo_code")
-	var entry := McpJsonStrategy.build_entry(c, "http://x")
-	assert_eq(entry.get("type", ""), "streamable-http")
-	assert_eq(entry.get("url", ""), "http://x")
-	var manual := McpManualCommand.build(c, "godot-ai", "http://x", "/tmp/roo.json")
-	assert_contains(manual, "\"type\": \"streamable-http\"")
+func test_roo_family_legacy_url_entries_register_as_migration_drift() -> void:
+	## Every pre-#838 URL entry — typeless, sse, or correctly pinned — must
+	## read CONFIGURED_MISMATCH against the command contract so the dock
+	## offers migration through the existing Configure flow (issue #838 rule:
+	## legacy URL entries report CONFIGURED_MISMATCH, not CONFIGURED).
+	var launch := _test_attach_launch()
+	for id in ["cline", "roo_code", "kilo_code", "zoo_code"]:
+		var c := McpClientRegistry.get_by_id(id)
+		for legacy in [
+			{"url": "http://x", "disabled": false},
+			{"type": "sse", "url": "http://x"},
+			{"type": "streamable-http", "url": "http://x"},
+			{"type": "streamableHttp", "url": "http://x"},
+		]:
+			assert_false(
+				McpJsonStrategy.verify_entry(c, legacy, "http://x", launch),
+				"%s legacy entry %s must register as drift" % [id, str(legacy)],
+			)
 
 
-func test_roo_code_verify_flags_pre_189_typeless_entry_as_drift() -> void:
-	## Users who configured Roo before the #189 fix have a correct URL but no
-	## "type" field — the URL-only default verifier would report CONFIGURED and
-	## hide the broken SSE negotiation. The default verifier (deep-equal of
-	## entry_extra_fields) treats a missing/wrong type as drift so the dock
-	## prompts them to re-configure.
-	var c := McpClientRegistry.get_by_id("roo_code")
-	var current := McpJsonStrategy.build_entry(c, "http://x")
-	assert_true(McpJsonStrategy.verify_entry(c, current, "http://x"), "current entry must verify")
-	var legacy_typeless := {"url": "http://x", "disabled": false, "alwaysAllow": []}
-	assert_false(McpJsonStrategy.verify_entry(c, legacy_typeless, "http://x"), "pre-#189 typeless entry must register as drift")
-	var legacy_sse := {"type": "sse", "url": "http://x", "disabled": false, "alwaysAllow": []}
-	assert_false(McpJsonStrategy.verify_entry(c, legacy_sse, "http://x"), "explicit sse entry must register as drift")
-	var url_drift := {"type": "streamable-http", "url": "http://other", "disabled": false, "alwaysAllow": []}
-	assert_false(McpJsonStrategy.verify_entry(c, url_drift, "http://x"), "URL drift must still register as drift")
-
-
-func test_cline_pins_streamable_http_transport() -> void:
-	## Parallel to the Roo #189 fix: without an explicit "type", Cline also
-	## defaults to SSE transport and our streamable-http /mcp endpoint returns
-	## HTTP 400. Cline's schema accepts "streamableHttp" (camelCase) — distinct
-	## from Roo's "streamable-http" — per src/services/mcp/schemas.ts upstream.
-	var c := McpClientRegistry.get_by_id("cline")
-	var entry := McpJsonStrategy.build_entry(c, "http://x")
-	assert_eq(entry.get("type", ""), "streamableHttp")
-	assert_eq(entry.get("url", ""), "http://x")
-	var manual := McpManualCommand.build(c, "godot-ai", "http://x", "/tmp/cline.json")
-	assert_contains(manual, "\"type\": \"streamableHttp\"")
-
-
-func test_cline_verify_flags_pre_fix_typeless_entry_as_drift() -> void:
-	## Users who configured Cline before this fix have a correct URL but no
-	## "type" field — the URL-only default verifier would report CONFIGURED and
-	## hide the broken SSE negotiation. The default verifier deep-equals every
-	## entry_extra_fields key, so a missing/wrong type registers as drift.
-	var c := McpClientRegistry.get_by_id("cline")
-	var current := McpJsonStrategy.build_entry(c, "http://x")
-	assert_true(McpJsonStrategy.verify_entry(c, current, "http://x"), "current entry must verify")
-	var legacy_typeless := {"url": "http://x", "disabled": false, "autoApprove": []}
-	assert_false(McpJsonStrategy.verify_entry(c, legacy_typeless, "http://x"), "pre-fix typeless entry must register as drift")
-	var legacy_sse := {"type": "sse", "url": "http://x", "disabled": false, "autoApprove": []}
-	assert_false(McpJsonStrategy.verify_entry(c, legacy_sse, "http://x"), "explicit sse entry must register as drift")
-	var wrong_case := {"type": "streamable-http", "url": "http://x", "disabled": false, "autoApprove": []}
-	assert_false(McpJsonStrategy.verify_entry(c, wrong_case, "http://x"), "Roo's kebab-case 'streamable-http' must register as drift in Cline (Cline accepts only 'streamableHttp')")
-	var url_drift := {"type": "streamableHttp", "url": "http://other", "disabled": false, "autoApprove": []}
-	assert_false(McpJsonStrategy.verify_entry(c, url_drift, "http://x"), "URL drift must still register as drift")
-
-
-func test_kilo_code_pins_streamable_http_transport() -> void:
-	## Parallel to the Roo #189 fix. Kilo Code is a Roo Code fork (legacy v5.x)
-	## and its McpHub.ts validates against {"stdio", "sse", "streamable-http"}
-	## — same kebab-case spelling as Roo, distinct from Cline's camelCase.
-	var c := McpClientRegistry.get_by_id("kilo_code")
-	var entry := McpJsonStrategy.build_entry(c, "http://x")
-	assert_eq(entry.get("type", ""), "streamable-http")
-	assert_eq(entry.get("url", ""), "http://x")
-	var manual := McpManualCommand.build(c, "godot-ai", "http://x", "/tmp/kilo.json")
-	assert_contains(manual, "\"type\": \"streamable-http\"")
-
-
-func test_kilo_code_verify_flags_pre_fix_typeless_entry_as_drift() -> void:
-	## Pre-fix Kilo entries have a correct URL but no "type" field. The
-	## default verifier (deep-equal of entry_extra_fields) flags them as
-	## drift so the dock prompts a re-configure.
-	var c := McpClientRegistry.get_by_id("kilo_code")
-	var current := McpJsonStrategy.build_entry(c, "http://x")
-	assert_true(McpJsonStrategy.verify_entry(c, current, "http://x"), "current entry must verify")
-	var legacy_typeless := {"url": "http://x", "disabled": false, "alwaysAllow": []}
-	assert_false(McpJsonStrategy.verify_entry(c, legacy_typeless, "http://x"), "pre-fix typeless entry must register as drift")
-	var legacy_sse := {"type": "sse", "url": "http://x", "disabled": false, "alwaysAllow": []}
-	assert_false(McpJsonStrategy.verify_entry(c, legacy_sse, "http://x"), "explicit sse entry must register as drift")
-	var url_drift := {"type": "streamable-http", "url": "http://other", "disabled": false, "alwaysAllow": []}
-	assert_false(McpJsonStrategy.verify_entry(c, url_drift, "http://x"), "URL drift must still register as drift")
-
-
-func test_zoo_code_pins_streamable_http_transport() -> void:
-	## Zoo Code uses the Roo-family `mcp_settings.json` / `mcpServers` shape.
-	## Pin `type: streamable-http` so a fresh entry negotiates against our
-	## streamable-http endpoint without relying on upstream defaults.
-	var c := McpClientRegistry.get_by_id("zoo_code")
-	var entry := McpJsonStrategy.build_entry(c, "http://x")
-	assert_eq(entry.get("type", ""), "streamable-http")
-	assert_eq(entry.get("url", ""), "http://x")
-	var manual := McpManualCommand.build(c, "godot-ai", "http://x", "/tmp/zoo.json")
-	assert_contains(manual, "\"type\": \"streamable-http\"")
-
-
-func test_zoo_code_verify_flags_typeless_entry_as_drift() -> void:
-	## Local extension inspection confirmed Zoo stores MCP settings in the same
-	## `mcp_settings.json` shape as Roo. A typeless legacy entry must therefore
-	## register as drift so Configure rewrites it with the transport pin.
-	var c := McpClientRegistry.get_by_id("zoo_code")
-	var current := McpJsonStrategy.build_entry(c, "http://x")
-	assert_true(McpJsonStrategy.verify_entry(c, current, "http://x"), "current entry must verify")
-	var legacy_typeless := {"url": "http://x", "disabled": false, "alwaysAllow": []}
-	assert_false(McpJsonStrategy.verify_entry(c, legacy_typeless, "http://x"), "typeless Zoo entry must register as drift")
-	var legacy_sse := {"type": "sse", "url": "http://x", "disabled": false, "alwaysAllow": []}
-	assert_false(McpJsonStrategy.verify_entry(c, legacy_sse, "http://x"), "explicit sse entry must register as drift")
-	var url_drift := {"type": "streamable-http", "url": "http://other", "disabled": false, "alwaysAllow": []}
-	assert_false(McpJsonStrategy.verify_entry(c, url_drift, "http://x"), "URL drift must still register as drift")
+func test_roo_family_url_fallback_entries_keep_transport_pins() -> void:
+	## The URL form survives as the manual-instruction fallback; its per-client
+	## transport pin (#189/#190) must stay intact there.
+	for probe in [
+		["cline", "streamableHttp"],
+		["roo_code", "streamable-http"],
+		["kilo_code", "streamable-http"],
+		["zoo_code", "streamable-http"],
+	]:
+		var c := McpClientRegistry.get_by_id(String(probe[0]))
+		var fallback := McpJsonStrategy.build_url_entry(c, "http://x")
+		assert_eq(fallback.get("type", ""), String(probe[1]), "%s fallback type pin" % probe[0])
+		assert_eq(fallback.get("url", ""), "http://x")
+		assert_eq(fallback.get("disabled"), false, "%s fallback seeds disabled" % probe[0])
 
 
 # ----- entry_initial_fields: user-state preservation across reconfigure -----
+#
+# #838 moved every registered JSON client to a command shape, so these
+# URL-contract tests run on a synthetic Roo-shaped URL descriptor — the URL
+# path is still live code (manual fallback rendering and any future URL-only
+# client), and the command-side twin of this contract is pinned by the
+# claude_desktop / attach-config suites via command_initial_fields.
+
+func _make_roo_shaped_url_client() -> McpClient:
+	var c := McpClient.new()
+	c.id = "url_contract_test"
+	c.display_name = "URL Contract Test"
+	c.config_type = "json"
+	c.server_key_path = PackedStringArray(["mcpServers"])
+	c.entry_extra_fields = {"type": "streamable-http"}
+	c.entry_initial_fields = {"disabled": false, "alwaysAllow": []}
+	return c
+
 
 func test_verify_entry_ignores_initial_field_drift() -> void:
 	## Default verifier must NOT compare `entry_initial_fields` keys: those are
@@ -2817,7 +2919,7 @@ func test_verify_entry_ignores_initial_field_drift() -> void:
 	## expected to mutate after the initial Configure. A user with a customised
 	## `alwaysAllow` array must not be flagged as drift — otherwise the dock's
 	## Configure-All-Mismatched sweep silently overwrites their state.
-	var c := McpClientRegistry.get_by_id("roo_code")
+	var c := _make_roo_shaped_url_client()
 	var customised := {
 		"type": "streamable-http",
 		"url": "http://x",
@@ -2841,7 +2943,7 @@ func test_build_entry_preserves_existing_initial_fields() -> void:
 	## defaults. The strategy passes the existing entry to `build_entry`; this
 	## test locks in that contract by simulating a reconfigure on an entry the
 	## user has customised.
-	var c := McpClientRegistry.get_by_id("roo_code")
+	var c := _make_roo_shaped_url_client()
 	var existing := {
 		"type": "streamable-http",
 		"url": "http://old:8000/mcp",
@@ -2860,7 +2962,7 @@ func test_build_entry_preserves_existing_initial_fields() -> void:
 func test_build_entry_seeds_initial_fields_when_absent() -> void:
 	## First-time Configure (no existing entry) must populate initial defaults
 	## so the dock surfaces a fully-formed entry — same shape as pre-split.
-	var c := McpClientRegistry.get_by_id("roo_code")
+	var c := _make_roo_shaped_url_client()
 	var fresh := McpJsonStrategy.build_entry(c, "http://x")  # existing = null
 	assert_eq(fresh.get("type"), "streamable-http", "type pin must be set on fresh entries")
 	assert_eq(fresh.get("disabled"), false, "initial `disabled: false` must seed on fresh entries")
@@ -2872,7 +2974,7 @@ func test_build_entry_force_overwrites_drifted_required_fields() -> void:
 	## reconfigure — the type pin is in `entry_extra_fields` precisely because
 	## a wrong value breaks transport negotiation. User-state preservation
 	## must not extend to broken transport pins.
-	var c := McpClientRegistry.get_by_id("roo_code")
+	var c := _make_roo_shaped_url_client()
 	var legacy_sse := {
 		"type": "sse",  # ← wrong, broken transport
 		"url": "http://old/mcp",
@@ -2893,38 +2995,59 @@ func test_hermes_is_registered() -> void:
 	assert_eq(c.config_type, "yaml")
 
 
-func test_hermes_entry_is_url_only_no_transport_type() -> void:
-	## Hermes HTTP entries are transport-inferred: just `url`, no `type`
-	## field. The official shape is `mcp_servers: { url: ... }`.
+func test_hermes_attach_entry_is_flat_and_typeless() -> void:
+	## #838: Hermes stdio entries are flat command/args, transport-inferred
+	## exactly like the URL form — so the legacy url (and HTTP-only headers)
+	## must be scrubbed, and no type field may ever be written.
 	var c := McpClientRegistry.get_by_id("hermes")
-	var entry := McpYamlStrategy.build_entry(c, "http://x")
-	assert_eq(entry.get("url", ""), "http://x")
+	assert_eq(c.command_shape, McpClient.CommandShape.FLAT)
+	var launch := _test_attach_launch()
+	var entry := McpYamlStrategy.build_entry(
+		c, "http://unused", {"url": "http://old", "headers": {"X": "y"}, "enabled": false}, launch
+	)
+	assert_eq(entry.get("command"), launch.get("command"))
+	assert_eq(entry.get("args"), launch.get("args"))
+	assert_false(entry.has("url"), "an entry with both url and command picks the wrong transport")
+	assert_false(entry.has("headers"), "headers is HTTP-only and must not survive")
+	assert_eq(entry.get("enabled"), false, "user enabled toggle survives")
 	assert_false(entry.has("type"), "Hermes entries must NOT carry a type field")
-	var manual := McpManualCommand.build(c, "godot-ai", "http://x", "/tmp/hermes/config.yaml")
+	assert_true(McpYamlStrategy.verify_entry(c, entry, "http://unused", launch))
+	var manual := McpManualCommand.build(c, "godot-ai", "http://x", "/tmp/hermes/config.yaml", launch)
 	assert_contains(manual, "mcp_servers")
+	assert_contains(manual, "command: C:/Python313/pythonw.exe")
+	assert_contains(manual, "args: [")
+	assert_contains(manual, "\"attach\"")
+	assert_contains(manual, "Advanced fallback")
 	assert_contains(manual, "url: http://x")
 	assert_false(manual.contains("type:"), "manual hint must not mention a type field")
 
 
-func test_hermes_entry_verifies_as_match() -> void:
-	## The standard entry shape must round-trip through verify_entry so the
-	## dock shows a green CONFIGURED dot.
+func test_hermes_verify_flags_launch_and_legacy_drift() -> void:
 	var c := McpClientRegistry.get_by_id("hermes")
-	var entry := McpYamlStrategy.build_entry(c, "http://x")
-	assert_true(McpYamlStrategy.verify_entry(c, entry, "http://x"),
-		"built entry must verify as a match")
-
-
-func test_hermes_verify_flags_url_drift_as_drift() -> void:
-	## A Hermes entry whose URL doesn't match must register as drift so the
-	## dock prompts reconfiguration. Verify only checks url (transport is
-	## inferred, so there is no type field to drift on).
-	var c := McpClientRegistry.get_by_id("hermes")
-	var current := McpYamlStrategy.build_entry(c, "http://x")
-	assert_true(McpYamlStrategy.verify_entry(c, current, "http://x"), "current entry must verify")
-	var url_drift := {"url": "http://other"}
-	assert_false(McpYamlStrategy.verify_entry(c, url_drift, "http://x"),
-		"URL drift must register as drift")
+	var launch := _test_attach_launch()
+	var current := McpYamlStrategy.build_entry(c, "http://unused", null, launch)
+	assert_true(McpYamlStrategy.verify_entry(c, current, "http://unused", launch), "current entry must verify")
+	assert_false(
+		McpYamlStrategy.verify_entry(c, {"url": "http://x"}, "http://x", launch),
+		"legacy URL entry must register as migration drift",
+	)
+	var lingering_url := current.duplicate(true)
+	lingering_url["url"] = "http://x"
+	assert_false(
+		McpYamlStrategy.verify_entry(c, lingering_url, "http://unused", launch),
+		"a url lingering next to command must register as drift",
+	)
+	var args_drift := current.duplicate(true)
+	args_drift["args"] = ["attach", "--port", "9999"]
+	assert_false(
+		McpYamlStrategy.verify_entry(c, args_drift, "http://unused", launch),
+		"args drift (port change) must register as drift",
+	)
+	var unavailable := {"ok": false, "error": "Install uv first."}
+	assert_false(
+		McpYamlStrategy.verify_entry(c, current, "http://unused", unavailable),
+		"no verified launcher → nothing can verify",
+	)
 
 
 func test_hermes_windows_path_template_uses_local_appdata() -> void:
@@ -2985,19 +3108,26 @@ func test_hermes_yaml_roundtrips_through_configure() -> void:
 	# Point the descriptor at our temp file for this test.
 	var real_path := c.path_template
 	c.path_template = {"unix": path, "windows": path}
-	var res := McpYamlStrategy.configure(c, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var launch := _test_attach_launch()
+	var res := McpYamlStrategy.configure(c, "godot-ai", "http://127.0.0.1:8000/mcp", launch)
+	var status := McpYamlStrategy.check_status(c, "godot-ai", "http://127.0.0.1:8000/mcp", launch)
 	c.path_template = real_path
 	assert_eq(res.get("status", ""), "ok", "configure must report ok: %s" % res.get("message", ""))
+	assert_eq(status, McpClient.Status.CONFIGURED, "written command entry must read back CONFIGURED")
 
 	# Read back and assert shape.
 	var reread := FileAccess.get_file_as_string(path)
 	assert_contains(reread, "mcp_servers:")
 	assert_contains(reread, "godot-ai:")
-	assert_contains(reread, "url: http://127.0.0.1:8000/mcp")
+	assert_contains(reread, "command: C:/Python313/pythonw.exe")
+	assert_contains(reread, "args: [\"-c\", ")
+	assert_contains(reread, "\"attach\"")
+	assert_false(reread.contains("godot-ai:\n    url:"), "our entry must be command-mode, not url-mode")
 	# Unrelated key preserved.
 	assert_contains(reread, "model: openai/gpt-4o")
-	# github entry preserved.
+	# github entry preserved, still URL-shaped.
 	assert_contains(reread, "github:")
+	assert_contains(reread, "url: https://mcp.github.com/mcp")
 	DirAccess.remove_absolute(path)
 
 
@@ -3022,7 +3152,7 @@ func test_hermes_yaml_empty_block_does_not_swallow_sibling_key() -> void:
 
 	var real_path := c.path_template
 	c.path_template = {"unix": path, "windows": path}
-	var res := McpYamlStrategy.configure(c, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var res := McpYamlStrategy.configure(c, "godot-ai", "http://127.0.0.1:8000/mcp", _test_attach_launch())
 	c.path_template = real_path
 	assert_eq(res.get("status", ""), "ok", "configure must report ok: %s" % res.get("message", ""))
 
@@ -3066,7 +3196,7 @@ func test_hermes_yaml_comments_in_block_are_not_parsed_as_entries() -> void:
 
 	var real_path := c.path_template
 	c.path_template = {"unix": path, "windows": path}
-	var res := McpYamlStrategy.configure(c, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var res := McpYamlStrategy.configure(c, "godot-ai", "http://127.0.0.1:8000/mcp", _test_attach_launch())
 	c.path_template = real_path
 	assert_eq(res.get("status", ""), "ok", "configure must report ok: %s" % res.get("message", ""))
 
@@ -3081,12 +3211,19 @@ func test_hermes_yaml_comments_in_block_are_not_parsed_as_entries() -> void:
 	DirAccess.remove_absolute(path)
 
 
-func test_hermes_yaml_reconfigure_preserves_user_headers_drops_stdio_keys() -> void:
-	## Reconfigure preservation contract (mirrors JSON's entry_initial_fields
-	## split): user-mutable keys like `headers` survive a repoint; stale
-	## stdio-bridge keys (`command`) are scrubbed so Hermes never sees both a
-	## url and a command on one entry.
-	var c := McpClientRegistry.get_by_id("hermes")
+func test_yaml_url_reconfigure_preserves_user_headers_drops_stdio_keys() -> void:
+	## URL-mode reconfigure preservation contract (mirrors JSON's
+	## entry_initial_fields split): user-mutable keys like `headers` survive a
+	## repoint; stale stdio-bridge keys (`command`) are scrubbed so the client
+	## never sees both a url and a command on one entry. Runs on a synthetic
+	## URL-mode YAML descriptor — registered hermes is command-shape now
+	## (#838), but the URL path stays live for its manual fallback.
+	var c := McpClient.new()
+	c.id = "yaml_url_contract_test"
+	c.display_name = "YAML URL Contract Test"
+	c.config_type = "yaml"
+	c.server_key_path = PackedStringArray(["mcp_servers"])
+	c.entry_url_field = "url"
 	var existing := {
 		"url": "http://old:1234/mcp",
 		"command": "uvx mcp-proxy",
@@ -3097,6 +3234,40 @@ func test_hermes_yaml_reconfigure_preserves_user_headers_drops_stdio_keys() -> v
 	assert_false(entry.has("command"), "stdio-bridge command must be scrubbed")
 	var headers: Dictionary = entry.get("headers", {})
 	assert_eq(headers.get("Authorization", ""), "Bearer abc", "user headers must survive reconfigure")
+
+
+func test_hermes_yaml_command_args_round_trip_through_flow_parser() -> void:
+	## The emitted flow-style args line must parse back into the SAME array —
+	## including items carrying quotes, spaces, and backslashes (the Windows
+	## pythonw -c bootstrap) — or verification would drift on every refresh.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var dir := OS.get_environment("TMPDIR")
+	if dir.is_empty():
+		dir = "/tmp"
+	var path := dir.path_join("godot_ai_hermes_flow_args.yaml")
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(path)
+	var launch := {
+		"ok": true,
+		"tier": "uvx",
+		"command": "C:/Python313/pythonw.exe",
+		"args": [
+			"-c", "import subprocess; \"quoted arg\"", 'C:\\Users\\Agent "quoted"\\bin\\uvx.exe',
+			"godot-ai", "attach", "--port", "8123",
+		],
+	}
+	var real_path := c.path_template
+	c.path_template = {"unix": path, "windows": path}
+	var res := McpYamlStrategy.configure(c, "godot-ai", "http://unused", launch)
+	var status := McpYamlStrategy.check_status(c, "godot-ai", "http://unused", launch)
+	var drifted := launch.duplicate(true)
+	drifted["args"][6] = "9999"
+	var drift_status := McpYamlStrategy.check_status(c, "godot-ai", "http://unused", drifted)
+	c.path_template = real_path
+	assert_eq(res.get("status", ""), "ok", "configure must succeed: %s" % res.get("message", ""))
+	assert_eq(status, McpClient.Status.CONFIGURED, "hazardous-char args must round-trip to CONFIGURED")
+	assert_eq(drift_status, McpClient.Status.CONFIGURED_MISMATCH, "a changed port must read as drift")
+	DirAccess.remove_absolute(path)
 
 
 func test_opencode_client_uses_home_config_on_windows() -> void:
