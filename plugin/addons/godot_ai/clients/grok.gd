@@ -28,7 +28,7 @@ func _init() -> void:
 	command_legacy_keys = PackedStringArray(["url", "headers"])
 	command_initial_fields = {"startup_timeout_sec": 60}
 	command_user_fields = PackedStringArray([
-		"env", "headers", "enabled", "startup_timeout_sec", "tool_timeout_sec",
+		"env", "enabled", "startup_timeout_sec", "tool_timeout_sec",
 	])
 	command_timeout_fields = PackedStringArray(["startup_timeout_sec", "tool_timeout_sec"])
 	command_supports_url_fallback = true

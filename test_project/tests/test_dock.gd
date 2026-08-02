@@ -1928,6 +1928,8 @@ func test_client_transport_tag_tracks_descriptor_shape() -> void:
 	assert_eq(McpDockScript._client_transport_tag("cursor"), "attach")
 	assert_eq(McpDockScript._client_transport_tag("claude_code"), "attach", "CLI clients register attach too")
 	assert_eq(McpDockScript._client_transport_tag("hermes"), "attach", "YAML clients included")
+	assert_eq(McpDockScript._client_transport_tag("codex"), "attach",
+		"TOML COMMAND_ARRAY clients tag attach too")
 	assert_eq(McpDockScript._client_transport_tag("cherry_studio"), "URL",
 		"cherry_studio deliberately stays URL-mode (#838 follow-up)")
 	assert_eq(McpDockScript._client_transport_tag("__missing_client__"), "")

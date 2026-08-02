@@ -406,8 +406,8 @@ static func check_status_details_for_url_with_cli_path(
 
 
 ## #691: main-thread pre-warm of McpPathTemplate's env snapshot, covering
-## the base vars plus every descriptor-declared `config_home_env`
-## (CLAUDE_CONFIG_DIR, CODEX_HOME, …), so worker-thread config-path
+## the base vars plus every descriptor-declared config-file/config-home env
+## (OPENCODE_CONFIG, CLAUDE_CONFIG_DIR, CODEX_HOME, …), so worker-thread config-path
 ## resolution never calls OS.get_environment concurrently with the spawn
 ## window's setenv/unsetenv. Also warms the EditorSettings snapshot for
 ## the mode/trace overrides so worker-thread mode_override() /
@@ -417,8 +417,11 @@ static func warm_env_snapshot() -> void:
 	var extras := PackedStringArray()
 	for id in client_ids():
 		var client := ClientRegistry.get_by_id(String(id))
-		if client != null and not client.config_home_env.is_empty():
-			extras.append(client.config_home_env)
+		if client == null:
+			continue
+		for env_name in [client.config_file_env, client.config_home_env]:
+			if not String(env_name).is_empty() and not extras.has(String(env_name)):
+				extras.append(String(env_name))
 	McpPathTemplate.warm_env_snapshot(extras)
 	_editor_setting_lookup(MODE_OVERRIDE_SETTING)
 	_editor_setting_lookup(SETTING_STARTUP_TRACE)

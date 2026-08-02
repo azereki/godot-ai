@@ -12,14 +12,14 @@ func _init() -> void:
 	## `$HOME` on Windows is deliberate: OpenCode reads ~/.config/... on ALL
 	## platforms (verified via `opencode debug paths`), and
 	## McpPathTemplate._home() falls back to USERPROFILE when HOME is unset —
-	## pinned by test_opencode_client_uses_home_config_on_windows.
-	## (`OPENCODE_CONFIG` can relocate the file entirely — it points at a
-	## file, not a directory, which the config_home_env mechanism cannot
-	## express; tracked as a follow-up.)
+	## pinned by test_opencode_client_uses_home_config_on_windows. The documented
+	## `OPENCODE_CONFIG` override names an exact file and must win over this
+	## default for configure, status, remove, and manual instructions.
 	path_template = {
 		"unix": "~/.config/opencode/opencode.json",
 		"windows": "$HOME/.config/opencode/opencode.json",
 	}
+	config_file_env = "OPENCODE_CONFIG"
 	server_key_path = PackedStringArray(["mcp"])
 	entry_extra_fields = {"type": "remote"}
 	## `enabled` is user-state (they may have toggled the server off).

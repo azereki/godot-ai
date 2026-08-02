@@ -1198,38 +1198,45 @@ func test_capture_launch_context_worker_thread_serves_snapshot() -> void:
 	)
 
 
-func test_warm_env_snapshot_covers_descriptor_config_home_envs() -> void:
+func test_warm_env_snapshot_covers_descriptor_config_path_envs() -> void:
 	## ClientConfigurator.warm_env_snapshot must include every descriptor's
-	## config_home_env (CLAUDE_CONFIG_DIR, CODEX_HOME, …) so worker-side
-	## config_home_override() never falls into the degraded un-warmed path.
+	## config-file/config-home env so worker-side path resolution never falls
+	## into the degraded un-warmed path.
 	var tested_count := 0
 	for id in McpClientConfigurator.client_ids():
 		var client := McpClientRegistry.get_by_id(String(id))
-		if client == null or client.config_home_env.is_empty():
+		if client == null:
 			continue
-		tested_count += 1
-		OS.set_environment(client.config_home_env, "warm-probe")
-		McpClientConfigurator.warm_env_snapshot()
-		OS.unset_environment(client.config_home_env)
-		var thread := Thread.new()
-		var env_name := client.config_home_env
-		var start_err := thread.start(func() -> String:
-			return McpPathTemplate.env_lookup(env_name)
-		)
-		assert_eq(start_err, OK)
-		var worker_value := str(thread.wait_to_finish())
-		assert_eq(worker_value, "warm-probe",
-			"%s must be pre-warmed by ClientConfigurator.warm_env_snapshot" % env_name)
-		## Re-warm now that the var is unset so the snapshot doesn't leak
-		## the probe value into later tests.
-		McpClientConfigurator.warm_env_snapshot()
+		for env_variant in [client.config_file_env, client.config_home_env]:
+			var env_name := String(env_variant)
+			if env_name.is_empty():
+				continue
+			tested_count += 1
+			var prior_env := OS.get_environment(env_name)
+			OS.set_environment(env_name, "warm-probe")
+			McpClientConfigurator.warm_env_snapshot()
+			if prior_env.is_empty():
+				OS.unset_environment(env_name)
+			else:
+				OS.set_environment(env_name, prior_env)
+			var thread := Thread.new()
+			var start_err := thread.start(func() -> String:
+				return McpPathTemplate.env_lookup(env_name)
+			)
+			assert_eq(start_err, OK)
+			var worker_value := str(thread.wait_to_finish())
+			assert_eq(worker_value, "warm-probe",
+				"%s must be pre-warmed by ClientConfigurator.warm_env_snapshot" % env_name)
+			## Re-warm the restored value so the probe cannot leak into later tests.
+			McpClientConfigurator.warm_env_snapshot()
 	assert_true(tested_count > 0,
-		"no descriptor declared config_home_env — this test exercised nothing")
+		"no descriptor declared a config path env — this test exercised nothing")
 
 
 # ----- config-home env override (#617) -----
 
 const TEST_CFG_HOME_ENV := "GODOT_AI_TEST_CFG_HOME"
+const TEST_CFG_FILE_ENV := "GODOT_AI_TEST_CFG_FILE"
 
 
 func _make_env_override_toml_client(default_path: String) -> McpClient:
@@ -1327,6 +1334,65 @@ func test_config_home_env_configure_and_drift_use_override() -> void:
 	assert_eq(post_remove, McpClient.Status.NOT_CONFIGURED)
 
 
+func test_config_file_env_configure_status_remove_and_manual_use_exact_file() -> void:
+	## Exact-file overrides must drive every path consumer. Otherwise Configure
+	## and its post-verification can agree with each other while the client reads
+	## a different file — the OPENCODE_CONFIG false-success regression.
+	var default_path := _scratch_dir.path_join("file_env_default_untouched.json")
+	var override_path := _scratch_dir.path_join("file_env_override/opencode.json")
+	_remove_if_exists(default_path)
+	_remove_if_exists(override_path)
+	var client := _make_test_json_client(default_path)
+	client.display_name = "Exact File Test"
+	client.config_file_env = TEST_CFG_FILE_ENV
+	var prior_env := OS.get_environment(TEST_CFG_FILE_ENV)
+	OS.set_environment(TEST_CFG_FILE_ENV, override_path)
+
+	var resolution := client.resolved_config_path_details()
+	var result := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var status := McpJsonStrategy.check_status(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var drift := McpJsonStrategy.check_status(client, "godot-ai", "http://127.0.0.1:9000/mcp")
+	var manual := McpManualCommand.build(
+		client, "godot-ai", "http://127.0.0.1:8000/mcp", str(resolution.get("path", ""))
+	)
+	var installed := client.is_installed()
+	var removed := McpJsonStrategy.remove(client, "godot-ai")
+	var post_remove := McpJsonStrategy.check_status(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+
+	if prior_env.is_empty():
+		OS.unset_environment(TEST_CFG_FILE_ENV)
+	else:
+		OS.set_environment(TEST_CFG_FILE_ENV, prior_env)
+	_remove_if_exists(override_path)
+
+	assert_eq(resolution.get("path"), override_path)
+	assert_eq(resolution.get("error"), "")
+	assert_eq(result.get("status"), "ok")
+	assert_false(FileAccess.file_exists(default_path),
+		"Configure must not touch the path_template default")
+	assert_eq(status, McpClient.Status.CONFIGURED)
+	assert_eq(drift, McpClient.Status.CONFIGURED_MISMATCH)
+	assert_contains(manual, override_path, "manual instructions must name the exact-file override")
+	assert_true(installed, "the exact-file override must count as installation evidence")
+	assert_eq(removed.get("status"), "ok")
+	assert_eq(post_remove, McpClient.Status.NOT_CONFIGURED)
+
+
+func test_config_file_env_relative_path_fails_closed() -> void:
+	var client := _make_test_json_client(_scratch_dir.path_join("file_env_default.json"))
+	client.display_name = "Exact File Test"
+	client.config_file_env = TEST_CFG_FILE_ENV
+	var prior_env := OS.get_environment(TEST_CFG_FILE_ENV)
+	OS.set_environment(TEST_CFG_FILE_ENV, "relative/opencode.json")
+	var details := client.resolved_config_path_details()
+	if prior_env.is_empty():
+		OS.unset_environment(TEST_CFG_FILE_ENV)
+	else:
+		OS.set_environment(TEST_CFG_FILE_ENV, prior_env)
+	assert_eq(details.get("path"), "")
+	assert_contains(str(details.get("error", "")), "absolute config-file path")
+
+
 func test_codex_declares_codex_home_override() -> void:
 	var client := McpClientRegistry.get_by_id("codex")
 	assert_true(client != null, "codex must be registered")
@@ -1339,6 +1405,12 @@ func test_claude_code_declares_claude_config_dir_override() -> void:
 	assert_true(client != null, "claude_code must be registered")
 	assert_eq(client.config_home_env, "CLAUDE_CONFIG_DIR")
 	assert_eq(client.config_home_env_subpath, ".claude.json")
+
+
+func test_opencode_declares_exact_config_file_override() -> void:
+	var client := McpClientRegistry.get_by_id("opencode")
+	assert_true(client != null, "opencode must be registered")
+	assert_eq(client.config_file_env, "OPENCODE_CONFIG")
 
 
 # ----- JSON strategy round-trip -----
@@ -1424,6 +1496,12 @@ func test_claude_code_declares_stdio_attach_registration() -> void:
 	assert_true(register.has("--"), "`--` must stop claude's own flag parsing")
 	assert_true(register.has("{command}"), "register template must take the launch command token")
 	assert_true(register.has("{args...}"), "register template must splice the launch args")
+	var separator_index := register.find("--")
+	var command_index := register.find("{command}")
+	var args_index := register.find("{args...}")
+	assert_true(separator_index >= 0 and separator_index < command_index,
+		"`--` must precede {command} so Claude stops parsing its own flags")
+	assert_eq(args_index, command_index + 1, "{args...} must immediately follow {command}")
 	assert_false(register.has("--transport"), "stdio is the default transport — no pin in argv")
 	assert_true(client.cli_unregister_template.has("--scope"), "unscoped remove could eat a project-local entry")
 
@@ -1438,6 +1516,22 @@ func test_claude_code_manual_command_shows_json_fallback() -> void:
 	assert_contains(cmd, "\"type\": \"stdio\"", "JSON fallback should show the stdio entry shape")
 	assert_contains(cmd, "Advanced fallback", "URL mode stays available as the documented fallback")
 	assert_contains(cmd, "\"type\": \"http\"", "URL fallback entry keeps the type:http shape")
+
+
+func test_manual_cli_shell_renderers_preserve_literal_argv() -> void:
+	var powershell_parts: Array[String] = [
+		"tool", "hello world", "C:\\Users\\Agent Name\\pythonw.exe",
+		'say "hello"', "it's", "$HOME", "`literal`", "@splat", "a,b", "",
+	]
+	assert_eq(
+		McpManualCommand._format_shell_command(powershell_parts, McpManualCommand.SHELL_POWERSHELL),
+		"Run in PowerShell:\ntool 'hello world' 'C:\\Users\\Agent Name\\pythonw.exe' 'say \"hello\"' 'it''s' '$HOME' '`literal`' '@splat' 'a,b' ''",
+	)
+	var posix_parts: Array[String] = powershell_parts.duplicate()
+	assert_eq(
+		McpManualCommand._format_shell_command(posix_parts, McpManualCommand.SHELL_POSIX),
+		"Run in a POSIX shell:\ntool 'hello world' 'C:\\Users\\Agent Name\\pythonw.exe' 'say \"hello\"' 'it'\"'\"'s' '$HOME' '`literal`' '@splat' 'a,b' ''",
+	)
 
 
 func test_cli_fallback_dispatch_writes_json_when_binary_missing() -> void:
@@ -2569,8 +2663,10 @@ func test_kimi_code_attach_entry_removes_transport_key() -> void:
 	assert_false(entry.has("url"))
 	assert_false(entry.has("transport"))
 	assert_true(McpJsonStrategy.verify_entry(c, entry, "http://unused", launch))
+	var lingering_transport := entry.duplicate(true)
+	lingering_transport["transport"] = "http"
 	assert_false(
-		McpJsonStrategy.verify_entry(c, {"command": "x", "args": [], "transport": "http"}, "http://unused", launch),
+		McpJsonStrategy.verify_entry(c, lingering_transport, "http://unused", launch),
 		"a lingering transport key is migration drift",
 	)
 
@@ -2771,6 +2867,15 @@ func test_json_manual_command_rejects_unsupported_command_shape() -> void:
 	)
 	assert_contains(manual, "command shape not supported by JSON yet")
 	assert_false(manual.contains('"godot-ai": {}'), "unsupported shapes must not render an empty entry")
+
+
+func test_yaml_build_entry_rejects_unsupported_command_shape() -> void:
+	var client := McpClient.new()
+	client.command_shape = McpClient.CommandShape.COMMAND_ARRAY
+	assert_true(
+		McpYamlStrategy.build_entry(client, "http://unused", null, _test_attach_launch()).is_empty(),
+		"YAML must not silently flatten an unsupported command shape",
+	)
 
 
 func test_zed_attach_entry_scrubs_every_http_only_key() -> void:
@@ -3243,6 +3348,8 @@ func test_hermes_yaml_command_args_round_trip_through_flow_parser() -> void:
 	var c := McpClientRegistry.get_by_id("hermes")
 	var dir := OS.get_environment("TMPDIR")
 	if dir.is_empty():
+		dir = OS.get_environment("TEMP")
+	if dir.is_empty():
 		dir = "/tmp"
 	var path := dir.path_join("godot_ai_hermes_flow_args.yaml")
 	if FileAccess.file_exists(path):
@@ -3261,7 +3368,10 @@ func test_hermes_yaml_command_args_round_trip_through_flow_parser() -> void:
 	var res := McpYamlStrategy.configure(c, "godot-ai", "http://unused", launch)
 	var status := McpYamlStrategy.check_status(c, "godot-ai", "http://unused", launch)
 	var drifted := launch.duplicate(true)
-	drifted["args"][6] = "9999"
+	var port_index: int = drifted["args"].find("--port")
+	assert_true(port_index >= 0 and port_index + 1 < drifted["args"].size(),
+		"launch args must contain --port <value>")
+	drifted["args"][port_index + 1] = "9999"
 	var drift_status := McpYamlStrategy.check_status(c, "godot-ai", "http://unused", drifted)
 	c.path_template = real_path
 	assert_eq(res.get("status", ""), "ok", "configure must succeed: %s" % res.get("message", ""))

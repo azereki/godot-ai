@@ -137,7 +137,7 @@ static func build_entry(
 	existing: Variant = null,
 	launch: Dictionary = {},
 ) -> Dictionary:
-	if client.command_shape != McpClient.CommandShape.NONE:
+	if client.command_shape == McpClient.CommandShape.FLAT:
 		var command_entry: Dictionary = (existing as Dictionary).duplicate(true) if existing is Dictionary else {}
 		command_entry["command"] = str(launch.get("command", ""))
 		command_entry["args"] = _array_copy(launch.get("args", []))
@@ -149,6 +149,11 @@ static func build_entry(
 		for key in client.command_legacy_keys:
 			command_entry.erase(String(key))
 		return command_entry
+	if client.command_shape != McpClient.CommandShape.NONE:
+		## Every production caller checks command_launch_error first. Keep this
+		## builder defensive too so a future unsupported shape cannot silently
+		## degrade into a flat YAML entry.
+		return {}
 	var entry: Dictionary = {}
 	if existing is Dictionary:
 		## User-mutable keys (headers, enabled, tools, ...) survive a

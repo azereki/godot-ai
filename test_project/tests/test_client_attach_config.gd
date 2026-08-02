@@ -675,7 +675,7 @@ func test_grok_renders_attach_toml_and_preserves_undocumented_enabled() -> void:
 		path,
 		'[mcp_servers."godot-ai"]\n'
 		+ 'url = "http://127.0.0.1:8000/mcp"\n'
-		+ "enabled = true\n"
+		+ "enabled = false\n"
 		+ "tool_timeout_sec = 420\n",
 	)
 	var client := _grok_clone(path)
@@ -691,7 +691,8 @@ func test_grok_renders_attach_toml_and_preserves_undocumented_enabled() -> void:
 	assert_false(content.contains("url ="), "legacy url must be removed")
 	assert_contains(content, "command = ")
 	assert_contains(content, "args = [")
-	assert_contains(content, "enabled = true", "undocumented user key must survive untouched")
+	assert_contains(content, "enabled = false", "undocumented user key must survive untouched")
+	assert_false(content.contains("enabled = true"), "seeding must not overwrite the user's toggle")
 	assert_contains(content, "tool_timeout_sec = 420", "user-tuned timeout must survive")
 	## Initial seeding is per-key: the legacy entry had no startup override, so
 	## migration seeds the uvx cold-start headroom (docs default 30s is too

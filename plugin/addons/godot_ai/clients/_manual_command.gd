@@ -2,6 +2,13 @@
 class_name McpManualCommand
 extends RefCounted
 
+const SHELL_POSIX := "posix"
+const SHELL_POWERSHELL := "powershell"
+## Keep this intersection deliberately small. PowerShell treats a leading `@`
+## as splatting syntax and commas as list separators, while POSIX shells accept
+## both literally; quoting either is safer than trying to infer token position.
+const _SHELL_BARE_SAFE_CHARS := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_+=:./-"
+
 ## Synthesize the "Run this manually" string the dock surfaces when
 ## auto-configure can't find a CLI / write a file. Generated from the
 ## descriptor's declarative fields — there is no per-client builder
@@ -42,6 +49,7 @@ static func _build_cli(
 ) -> String:
 	if client.cli_register_template.is_empty() or client.cli_names.is_empty():
 		return ""
+	var shell_kind := _shell_kind_for_platform()
 	var short_name: String = String(client.cli_names[0])
 	# Prefer the non-.exe form for a cross-platform-looking command line.
 	for n in client.cli_names:
@@ -57,13 +65,14 @@ static func _build_cli(
 			var args := McpCliStrategy.format_args(client.cli_register_template, server_name, server_url, launch)
 			var parts: Array[String] = [short_name]
 			for arg in args:
-				parts.append(_shell_display_arg(String(arg)))
-			cmd = " ".join(parts)
+				parts.append(String(arg))
+			cmd = _format_shell_command(parts, shell_kind)
 	else:
 		var args := McpCliStrategy.format_args(client.cli_register_template, server_name, server_url)
 		var parts: Array[String] = [short_name]
-		parts.append_array(args)
-		cmd = " ".join(parts)
+		for arg in args:
+			parts.append(String(arg))
+		cmd = _format_shell_command(parts, shell_kind)
 	# #463: a CLI client with a JSON fallback (Claude Code) may have no `claude`
 	# binary at all — e.g. installed only as a VS Code/Cursor extension. The CLI
 	# line above is useless to that user, so also show the config-file edit that
@@ -75,17 +84,38 @@ static func _build_cli(
 	return cmd
 
 
-## Quote one argv element for the paste-into-terminal hint. JSON string
-## quoting is a safe cross-shell display approximation for elements carrying
-## whitespace, quotes, or backslashes (e.g. the Windows pythonw `-c`
-## bootstrap); everything else stays bare for readability.
-static func _shell_display_arg(arg: String) -> String:
+static func _shell_kind_for_platform() -> String:
+	return SHELL_POWERSHELL if OS.get_name() == "Windows" else SHELL_POSIX
+
+
+## Render a command for one explicitly named shell. The label is load-bearing:
+## POSIX and PowerShell use different escaping for embedded single quotes, so
+## presenting the command without its target shell invites a bad copy/paste.
+static func _format_shell_command(parts: Array[String], shell_kind: String) -> String:
+	var rendered: Array[String] = []
+	for part in parts:
+		rendered.append(_shell_display_arg(part, shell_kind))
+	var label := "Run in PowerShell:" if shell_kind == SHELL_POWERSHELL else "Run in a POSIX shell:"
+	return "%s\n%s" % [label, " ".join(rendered)]
+
+
+## Quote one argv element for the paste-into-terminal hint. Single-quoted
+## strings are literal in both supported shells, but embedded single quotes
+## have shell-specific spellings. Backslashes, double quotes, dollar signs,
+## and PowerShell backticks remain byte-for-byte unchanged inside the quotes.
+static func _shell_display_arg(arg: String, shell_kind: String) -> String:
 	if arg.is_empty():
-		return "\"\""
-	for needle in [" ", "\t", "\"", "'", "\\"]:
-		if arg.contains(needle):
-			return JSON.stringify(arg)
-	return arg
+		return "''"
+	var stays_bare := true
+	for index in range(arg.length()):
+		if _SHELL_BARE_SAFE_CHARS.find(arg.substr(index, 1)) < 0:
+			stays_bare = false
+			break
+	if stays_bare:
+		return arg
+	if shell_kind == SHELL_POWERSHELL:
+		return "'%s'" % arg.replace("'", "''")
+	return "'%s'" % arg.replace("'", "'\"'\"'")
 
 
 static func _build_json(
