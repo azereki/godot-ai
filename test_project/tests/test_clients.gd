@@ -3191,16 +3191,20 @@ func test_hermes_is_in_required_registry_check() -> void:
 	assert_true(McpClientRegistry.has_id("hermes"), "hermes client must be in registry")
 
 
-func test_hermes_yaml_roundtrips_through_configure() -> void:
-	## End-to-end: a configure write must produce YAML Hermes can read back
-	## as CONFIGURED, preserving other top-level keys in the user's file.
-	var c := McpClientRegistry.get_by_id("hermes")
+func _hermes_scratch_path(filename: String) -> String:
 	var dir := OS.get_environment("TMPDIR")
 	if dir.is_empty():
 		dir = OS.get_environment("TEMP")
 	if dir.is_empty():
 		dir = "/tmp"
-	var path := dir.path_join("godot_ai_hermes_rt.yaml")
+	return dir.path_join(filename)
+
+
+func test_hermes_yaml_roundtrips_through_configure() -> void:
+	## End-to-end: a configure write must produce YAML Hermes can read back
+	## as CONFIGURED, preserving other top-level keys in the user's file.
+	var c := McpClientRegistry.get_by_id("hermes")
+	var path := _hermes_scratch_path("godot_ai_hermes_rt.yaml")
 	if FileAccess.file_exists(path):
 		DirAccess.remove_absolute(path)
 	# Seed a config.yaml with an unrelated top-level key.
@@ -3242,12 +3246,7 @@ func test_hermes_yaml_empty_block_does_not_swallow_sibling_key() -> void:
 	## as a server entry — that would re-emit `model:` nested under
 	## mcp_servers on rewrite and corrupt the user's config.
 	var c := McpClientRegistry.get_by_id("hermes")
-	var dir := OS.get_environment("TMPDIR")
-	if dir.is_empty():
-		dir = OS.get_environment("TEMP")
-	if dir.is_empty():
-		dir = "/tmp"
-	var path := dir.path_join("godot_ai_hermes_empty_block.yaml")
+	var path := _hermes_scratch_path("godot_ai_hermes_empty_block.yaml")
 	if FileAccess.file_exists(path):
 		DirAccess.remove_absolute(path)
 	var f := FileAccess.open(path, FileAccess.WRITE)
@@ -3280,12 +3279,7 @@ func test_hermes_yaml_comments_in_block_are_not_parsed_as_entries() -> void:
 	## headers or keys (a `# note` entry would be re-emitted as a bogus
 	## `# note:` server on rewrite).
 	var c := McpClientRegistry.get_by_id("hermes")
-	var dir := OS.get_environment("TMPDIR")
-	if dir.is_empty():
-		dir = OS.get_environment("TEMP")
-	if dir.is_empty():
-		dir = "/tmp"
-	var path := dir.path_join("godot_ai_hermes_comments.yaml")
+	var path := _hermes_scratch_path("godot_ai_hermes_comments.yaml")
 	if FileAccess.file_exists(path):
 		DirAccess.remove_absolute(path)
 	var f := FileAccess.open(path, FileAccess.WRITE)
@@ -3346,12 +3340,7 @@ func test_hermes_yaml_command_args_round_trip_through_flow_parser() -> void:
 	## including items carrying quotes, spaces, and backslashes (the Windows
 	## pythonw -c bootstrap) — or verification would drift on every refresh.
 	var c := McpClientRegistry.get_by_id("hermes")
-	var dir := OS.get_environment("TMPDIR")
-	if dir.is_empty():
-		dir = OS.get_environment("TEMP")
-	if dir.is_empty():
-		dir = "/tmp"
-	var path := dir.path_join("godot_ai_hermes_flow_args.yaml")
+	var path := _hermes_scratch_path("godot_ai_hermes_flow_args.yaml")
 	if FileAccess.file_exists(path):
 		DirAccess.remove_absolute(path)
 	var launch := {
