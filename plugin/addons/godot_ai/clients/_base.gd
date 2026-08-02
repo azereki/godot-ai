@@ -104,12 +104,28 @@ var entry_extra_fields: Dictionary = {}
 ## restores that contract under the data-only descriptor model.
 var entry_initial_fields: Dictionary = {}
 
-## Client-owned stdio launch shape.
+## Client-owned stdio launch shape. Each strategy renders the shape in its
+## config language:
 ##
-## COMMAND_ARRAY is consumed by the TOML strategy and FLAT by the JSON
-## strategy. The remaining values are shared vocabulary for later JSON, YAML,
-## and CLI migrations; keeping them data-only avoids reintroducing the
-## descriptor Callable race from #229.
+## - FLAT — `command` string + `args` array as sibling keys. JSON and YAML
+##   strategies. A client whose docs require a type discriminator next to the
+##   flat keys (VS Code's `type: "stdio"`, Claude Code's fallback file) stays
+##   FLAT and declares it via `command_transport_key` / `command_transport_value`,
+##   so TYPED_FLAT remains reserved vocabulary.
+## - COMMAND_ARRAY — the launch argv carried as one array. In the JSON
+##   strategy the entry's `command` field IS that array (OpenCode's
+##   `"command": ["uvx", …]`). In the TOML strategy the launcher renders as a
+##   `command = "…"` line plus an `args = […]` array (Codex, Grok) — the name
+##   refers to the argv-as-TOML-array body it emits.
+## - NESTED_COMMAND — command/args nested inside a sub-object. Reserved; no
+##   current client needs it and strategies reject it with an actionable error.
+##
+## CLI-registered clients (`config_type == "cli"`) express the launch through
+## `cli_register_template` tokens instead; their `command_shape` governs the
+## JSON-fallback file rendering (Claude Code, #463).
+##
+## Values are data-only shared vocabulary; keeping them data-only avoids
+## reintroducing the descriptor Callable race from #229.
 enum CommandShape { NONE, FLAT, TYPED_FLAT, COMMAND_ARRAY, NESTED_COMMAND }
 var command_shape: CommandShape = CommandShape.NONE
 
@@ -169,7 +185,10 @@ var config_home_env_subpath: String = ""
 var cli_names: PackedStringArray = PackedStringArray()
 ## Argument templates with `{name}` and `{url}` tokens; the strategy
 ## substitutes them at call time. Tokens are matched verbatim — no escaping
-## semantics, no shell expansion. Populated by CLI descriptors (`claude_code`, `kimi_code`).
+## semantics, no shell expansion. Command-shape templates additionally use the
+## whole-element tokens `{command}` / `{args...}` (see `McpCliStrategy.format_args`).
+## Populated by CLI descriptors (currently `claude_code`; `kimi_code` moved to
+## mcp.json in #813).
 var cli_register_template: PackedStringArray = PackedStringArray()
 var cli_unregister_template: PackedStringArray = PackedStringArray()
 ## Args run to read current state; stdout is scanned for the server name and

@@ -17,21 +17,29 @@ static func build(
 ) -> String:
 	match client.config_type:
 		"cli":
-			return _build_cli(client, server_name, server_url, resolved_path)
+			return _build_cli(client, server_name, server_url, resolved_path, launch)
 		"json":
 			return _build_json(client, server_name, server_url, resolved_path, launch)
 		"toml":
 			return _build_toml(client, server_name, server_url, resolved_path, launch)
 		"yaml":
-			return _build_yaml(client, server_name, server_url, resolved_path)
+			return _build_yaml(client, server_name, server_url, resolved_path, launch)
 	return ""
 
 
 ## CLI clients: format the register template against the *short* CLI name so
 ## the user can paste it into a terminal regardless of where their binary
 ## lives. (The auto-configure path resolves to an absolute uvx-style path;
-## that's noise for a paste-into-terminal hint.)
-static func _build_cli(client: McpClient, server_name: String, server_url: String, resolved_path: String = "") -> String:
+## that's noise for a paste-into-terminal hint. The attach launcher path
+## inside a command-shape line stays absolute — status verification compares
+## the registered command against the resolved launcher verbatim.)
+static func _build_cli(
+	client: McpClient,
+	server_name: String,
+	server_url: String,
+	resolved_path: String = "",
+	launch: Dictionary = {},
+) -> String:
 	if client.cli_register_template.is_empty() or client.cli_names.is_empty():
 		return ""
 	var short_name: String = String(client.cli_names[0])
@@ -40,19 +48,44 @@ static func _build_cli(client: McpClient, server_name: String, server_url: Strin
 		if not String(n).ends_with(".exe"):
 			short_name = String(n)
 			break
-	var args := McpCliStrategy.format_args(client.cli_register_template, server_name, server_url)
-	var parts: Array[String] = [short_name]
-	parts.append_array(args)
-	var cmd := " ".join(parts)
+	var cmd := ""
+	if client.command_shape != McpClient.CommandShape.NONE:
+		var launch_error := McpCliStrategy.command_launch_error(client, launch)
+		if not launch_error.is_empty():
+			cmd = "Attach launch command unavailable: %s" % launch_error
+		else:
+			var args := McpCliStrategy.format_args(client.cli_register_template, server_name, server_url, launch)
+			var parts: Array[String] = [short_name]
+			for arg in args:
+				parts.append(_shell_display_arg(String(arg)))
+			cmd = " ".join(parts)
+	else:
+		var args := McpCliStrategy.format_args(client.cli_register_template, server_name, server_url)
+		var parts: Array[String] = [short_name]
+		parts.append_array(args)
+		cmd = " ".join(parts)
 	# #463: a CLI client with a JSON fallback (Claude Code) may have no `claude`
 	# binary at all — e.g. installed only as a VS Code/Cursor extension. The CLI
 	# line above is useless to that user, so also show the config-file edit that
 	# auto-configure falls back to writing.
 	if client.has_json_fallback() and not resolved_path.is_empty():
 		return "%s\n\nNo `%s` CLI (e.g. installed as a VS Code/Cursor extension)? %s" % [
-			cmd, short_name, _build_json(client, server_name, server_url, resolved_path),
+			cmd, short_name, _build_json(client, server_name, server_url, resolved_path, launch),
 		]
 	return cmd
+
+
+## Quote one argv element for the paste-into-terminal hint. JSON string
+## quoting is a safe cross-shell display approximation for elements carrying
+## whitespace, quotes, or backslashes (e.g. the Windows pythonw `-c`
+## bootstrap); everything else stays bare for readability.
+static func _shell_display_arg(arg: String) -> String:
+	if arg.is_empty():
+		return "\"\""
+	for needle in [" ", "\t", "\"", "'", "\\"]:
+		if arg.contains(needle):
+			return JSON.stringify(arg)
+	return arg
 
 
 static func _build_json(
@@ -115,9 +148,33 @@ static func _build_toml(
 	return "\n".join(lines)
 
 
-static func _build_yaml(client: McpClient, server_name: String, server_url: String, resolved_path: String) -> String:
-	var entry := McpYamlStrategy.build_entry(client, server_url)
+static func _build_yaml(
+	client: McpClient,
+	server_name: String,
+	server_url: String,
+	resolved_path: String,
+	launch: Dictionary = {},
+) -> String:
 	var key := client.server_key_path[0] if client.server_key_path.size() > 0 else "mcp_servers"
+	if client.command_shape != McpClient.CommandShape.NONE:
+		var lines: Array[String] = []
+		var launch_error := McpYamlStrategy.command_launch_error(client, launch)
+		if launch_error.is_empty():
+			var command_entry := McpYamlStrategy.build_entry(client, server_url, null, launch)
+			lines.append("Edit %s and add under '%s':" % [resolved_path, key])
+			for entry_line in McpYamlStrategy.render_entry_lines(server_name, command_entry):
+				lines.append(String(entry_line))
+		else:
+			lines.append("Attach launch command unavailable: %s" % launch_error)
+		if client.command_supports_url_fallback:
+			lines.append("")
+			lines.append("Advanced fallback — use this URL-mode entry instead; never configure both shapes together. URL mode depends on your client's own reconnect behavior. If the server is down when the client starts, restarting the client may be required.")
+			lines.append("Edit %s and add under '%s':" % [resolved_path, key])
+			var fallback_entry := {client.entry_url_field: server_url}
+			for entry_line in McpYamlStrategy.render_entry_lines(server_name, fallback_entry):
+				lines.append(String(entry_line))
+		return "\n".join(lines)
+	var entry := McpYamlStrategy.build_entry(client, server_url)
 	var lines: Array[String] = [
 		"Edit %s and add under '%s':" % [resolved_path, key],
 		"  %s:" % server_name,

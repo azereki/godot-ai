@@ -557,13 +557,13 @@ static func _dispatch_configure(client: Client, url: String, launch: Dictionary 
 		"toml":
 			return TomlStrategy.configure(client, SERVER_NAME, url, launch)
 		"yaml":
-			return YamlStrategy.configure(client, SERVER_NAME, url)
+			return YamlStrategy.configure(client, SERVER_NAME, url, launch)
 		"cli":
 			# #463: fall back to writing the config file directly when the CLI
 			# binary isn't on PATH (Claude Code as a VS Code/Cursor extension).
 			if client.has_json_fallback() and CliStrategy.resolve_cli_path(client).is_empty():
 				return JsonStrategy.configure(client, SERVER_NAME, url, launch)
-			return CliStrategy.configure(client, SERVER_NAME, url)
+			return CliStrategy.configure(client, SERVER_NAME, url, launch)
 	return {"status": "error", "message": "Unknown config_type for %s: %s" % [client.id, client.config_type]}
 
 
@@ -615,8 +615,20 @@ static func _dispatch_check_status_with_cli_path_details(
 				launch = _resolved_or_discovered_launch(resolved_launch, launch_context)
 			return TomlStrategy.check_status_details(client, SERVER_NAME, url, launch)
 		"yaml":
-			return YamlStrategy.check_status_details(client, SERVER_NAME, url)
+			var yaml_launch := {}
+			if client.command_shape != Client.CommandShape.NONE:
+				yaml_launch = _resolved_or_discovered_launch(resolved_launch, launch_context)
+			return YamlStrategy.check_status_details(client, SERVER_NAME, url, yaml_launch)
 		"cli":
+			# Command-shape CLI clients register through their CLI, but the entry
+			# lands in the same file the JSON fallback reads (`claude mcp add
+			# --scope user` writes mcpServers in ~/.claude.json). Reading that
+			# file gives exact launch-drift detection — a changed port, version
+			# pin, or exclusion list — which scanning `mcp list` stdout cannot,
+			# so it is preferred even when the CLI binary resolves.
+			if client.command_shape != Client.CommandShape.NONE and client.has_json_fallback():
+				var command_launch := _resolved_or_discovered_launch(resolved_launch, launch_context)
+				return JsonStrategy.check_status_details(client, SERVER_NAME, url, command_launch)
 			var resolved_cli := cli_path if not cli_path.is_empty() else CliStrategy.resolve_cli_path(client)
 			# #463: with no CLI binary, read the JSON fallback config so a
 			# fallback-configured entry reports CONFIGURED instead of red.
@@ -625,7 +637,10 @@ static func _dispatch_check_status_with_cli_path_details(
 				if client.command_shape != Client.CommandShape.NONE:
 					fallback_launch = _resolved_or_discovered_launch(resolved_launch, launch_context)
 				return JsonStrategy.check_status_details(client, SERVER_NAME, url, fallback_launch)
-			return CliStrategy.check_status_details(client, SERVER_NAME, url, resolved_cli)
+			var cli_launch := {}
+			if client.command_shape != Client.CommandShape.NONE:
+				cli_launch = _resolved_or_discovered_launch(resolved_launch, launch_context)
+			return CliStrategy.check_status_details(client, SERVER_NAME, url, resolved_cli, cli_launch)
 	return {"status": Client.Status.NOT_CONFIGURED, "error_msg": ""}
 
 
