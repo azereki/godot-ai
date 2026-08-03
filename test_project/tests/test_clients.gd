@@ -1378,6 +1378,42 @@ func test_config_file_env_configure_status_remove_and_manual_use_exact_file() ->
 	assert_eq(post_remove, McpClient.Status.NOT_CONFIGURED)
 
 
+func test_configure_message_names_the_written_transport() -> void:
+	## The success line must describe the transport that was actually written:
+	## "stdio attach" for command-shape entries, "(HTTP: <url>)" only for
+	## URL-mode entries. Found live in the #838 Windows smoke — every attach
+	## write reported the HTTP URL the migration had just moved away from.
+	var attach_path := _scratch_dir.path_join("message_attach.json")
+	_remove_if_exists(attach_path)
+	var attach_client := _make_test_json_client(attach_path)
+	attach_client.command_shape = McpClient.CommandShape.FLAT
+	var configured := McpJsonStrategy.configure(
+		attach_client, "godot-ai", "http://127.0.0.1:8000/mcp", _test_attach_launch()
+	)
+	assert_eq(configured.get("status"), "ok")
+	var message := str(configured.get("message", ""))
+	assert_contains(message, "stdio attach", "attach write must name its transport: %s" % message)
+	assert_false(
+		message.contains("HTTP:"),
+		"attach write must not claim an HTTP transport: %s" % message,
+	)
+	_remove_if_exists(attach_path)
+
+	var url_path := _scratch_dir.path_join("message_url.json")
+	_remove_if_exists(url_path)
+	var url_client := _make_test_json_client(url_path)
+	var url_configured := McpJsonStrategy.configure(
+		url_client, "godot-ai", "http://127.0.0.1:8000/mcp"
+	)
+	assert_eq(url_configured.get("status"), "ok")
+	assert_contains(
+		str(url_configured.get("message", "")),
+		"HTTP: http://127.0.0.1:8000/mcp",
+		"URL-mode write keeps the HTTP wording",
+	)
+	_remove_if_exists(url_path)
+
+
 func test_config_file_env_relative_path_fails_closed() -> void:
 	var client := _make_test_json_client(_scratch_dir.path_join("file_env_default.json"))
 	client.display_name = "Exact File Test"

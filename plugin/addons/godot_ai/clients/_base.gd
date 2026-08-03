@@ -37,6 +37,17 @@ static func status_label(status: McpClient.Status) -> String:
 			return "configured_mismatch"
 	return "error"
 
+
+## One-line configure success message, shared by every strategy so the dock
+## and the `client_manage` tool describe the transport that was actually
+## written. Command-shape clients register the stdio `godot-ai attach`
+## bridge — the URL-era "(HTTP: <url>)" suffix would name a transport the
+## write never touched (found live in the #838 Windows smoke).
+static func configured_message(client: McpClient, server_url: String) -> String:
+	if client.command_shape != CommandShape.NONE:
+		return "%s configured (stdio attach)" % client.display_name
+	return "%s configured (HTTP: %s)" % [client.display_name, server_url]
+
 var id: String = ""                              ## stable key, e.g. "cursor"
 var display_name: String = ""                    ## "Cursor"
 var config_type: String = ""                     ## "json" | "toml" | "yaml" | "cli"

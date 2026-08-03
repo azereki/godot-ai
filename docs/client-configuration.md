@@ -30,12 +30,16 @@ URL. As of #838 every registered client is command-shape except
 `cherry_studio` (its `mcp_servers.json` path is not read by the app at all —
 servers live in an internal database — so a file-based migration would be a
 no-op; it stays URL-mode pending a deep-link design). The dock captures
-ports, canonical excluded domains, plugin version, and dev/user mode on the
-main thread, then workers resolve the same three launch tiers used by server
-startup (dev venv → exact-version uvx → matching system install). Package
-pins, command paths, ports, exclusions, and required uv options are verified
-as launch drift; **Configure all** is the repair path after a self-update,
-port change, or tool-domain change. Never silently fall back to a bare `uvx`
+ports, canonical excluded domains, plugin version, dev/user mode, and the
+telemetry preference on the main thread, then workers resolve the same three
+launch tiers used by server startup (dev venv → exact-version uvx → matching
+system install). A disabled telemetry preference renders as
+`--disable-telemetry` on the attach argv — the env-injection path that covers
+plugin-spawned servers never runs for a client-spawned bridge or its backend
+(see docs/TELEMETRY.md). Package pins, command paths, ports, exclusions,
+telemetry, and required uv options are verified as launch drift;
+**Configure all** is the repair path after a self-update, port change,
+telemetry toggle, or tool-domain change. Never silently fall back to a bare `uvx`
 command for these entries—report ERROR and leave the config untouched when no
 verified tier exists.
 

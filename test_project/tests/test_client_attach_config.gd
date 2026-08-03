@@ -49,6 +49,45 @@ func test_launch_resolver_dev_venv_shape() -> void:
 	)
 
 
+func test_disabled_telemetry_renders_flag_and_participates_in_drift() -> void:
+	## The editor's env-injection opt-out path never runs for a client-spawned
+	## bridge/backend, so the preference must ride the attach argv (#838 smoke).
+	var overrides := {
+		"venv_python": "C:/repo/.venv/Scripts/python.exe",
+		"uvx_path": "",
+		"system_path": "",
+		"consoleless_python": "C:/repo/.venv/Scripts/pythonw.exe",
+	}
+	var context := _context()
+	context["telemetry_enabled"] = false
+	var launch := McpClientConfigurator.resolve_attach_launch(context, overrides)
+	assert_true(bool(launch.get("ok", false)))
+	assert_eq(
+		launch.get("args"),
+		["-m", "godot_ai", "attach", "--port", "8123", "--ws-port", "9623", "--disable-telemetry"],
+	)
+
+	## Enabled AND absent (hand-built contexts, stale pre-upgrade snapshots)
+	## must both render without the flag — send-by-default matches the server.
+	var enabled_context := _context()
+	enabled_context["telemetry_enabled"] = true
+	for ctx in [enabled_context, _context()]:
+		var clean := McpClientConfigurator.resolve_attach_launch(ctx, overrides)
+		assert_eq(
+			clean.get("args"),
+			["-m", "godot_ai", "attach", "--port", "8123", "--ws-port", "9623"],
+			"telemetry on (or unspecified) must not add the flag",
+		)
+
+	## A toggle is launch drift: distinct cache keys, so a stale resolution
+	## cannot serve an argv rendered under the old preference.
+	assert_ne(
+		McpClientConfigurator._attach_launch_cache_key(context),
+		McpClientConfigurator._attach_launch_cache_key(enabled_context),
+		"telemetry preference must key the launch cache",
+	)
+
+
 func test_windows_dev_resolver_discovers_sibling_pythonw() -> void:
 	var python := _scratch_dir.path_join("python.exe")
 	var pythonw := _scratch_dir.path_join("pythonw.exe")

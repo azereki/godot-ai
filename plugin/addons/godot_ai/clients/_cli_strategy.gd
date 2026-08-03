@@ -56,7 +56,7 @@ static func configure(
 	if result.get("spawn_failed", false):
 		return {"status": "error", "message": "Failed to spawn %s" % client.display_name}
 	if int(result.get("exit_code", -1)) == 0:
-		return {"status": "ok", "message": "%s configured (HTTP: %s)" % [client.display_name, server_url]}
+		return {"status": "ok", "message": McpClient.configured_message(client, server_url)}
 	## `claude mcp add` writes its real failure diagnostics to stderr, so
 	## prefer `output` (stdout + stderr) over `stdout` alone — otherwise
 	## the user sees "exit code 1" instead of the actual error.

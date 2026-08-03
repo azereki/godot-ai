@@ -51,7 +51,7 @@ static func configure(
 	var out := _assemble(text, block["prefix_lines"], entries, block["suffix_lines"])
 	if not McpAtomicWrite.write(path, out):
 		return {"status": "error", "message": "Cannot write to %s" % path}
-	return {"status": "ok", "message": "%s configured (HTTP: %s)" % [client.display_name, server_url]}
+	return {"status": "ok", "message": McpClient.configured_message(client, server_url)}
 
 
 static func check_status(
