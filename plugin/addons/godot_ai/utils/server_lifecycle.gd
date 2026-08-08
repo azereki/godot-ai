@@ -136,6 +136,12 @@ func _init(host) -> void:
 ## churn (main CI, post-#682). Null when no blocking work is in flight.
 var _active_blocking_thread: Thread = null
 
+## When a cancelled worker thread needs to be joined later (rather than
+## synchronously), this holds the thread reference until
+## `_wait_for_worker_completion` joins it. Null when no deferred join is
+## pending. Only set by `_invalidate_async_startup(join_worker=false)`.
+var _deferred_join_thread: Thread = null
+
 
 ## Run `work` off the main thread and suspend until it completes (#678).
 ## Falls back to inline execution when `defer_blocking_work` is off, or
@@ -201,13 +207,72 @@ func _async_stale(generation: int) -> bool:
 ## port-drain wait). `stop_server` runs this from `_exit_tree`, so once
 ## it returns no worker thread can still be executing a method of the
 ## plugin that is about to be freed — the macOS reload-churn wedge.
-func _invalidate_async_startup() -> void:
+##
+## `join_worker`: when true (default), synchronously joins the active
+## worker thread. Teardown paths (stop_server, detach_server) must pass
+## true to prevent use-after-free. Synchronous verdict paths
+## (handshake mismatch) pass false so the main thread doesn't block —
+## the worker completes naturally and its own staleness check discards
+## the result, but the thread itself is kept alive in
+## `_deferred_join_thread` for `_wait_for_worker_completion` to join.
+func _invalidate_async_startup(join_worker := true) -> void:
 	_async_generation += 1
 	_start_in_flight = false
 	var thread := _active_blocking_thread
 	_active_blocking_thread = null
 	if thread != null:
-		thread.wait_to_finish()
+		if join_worker:
+			thread.wait_to_finish()
+		else:
+			## Defer the join: the thread must still be joined before
+			## it's freed (Godot requirement), but we don't want to
+			## block the main thread here. Stash it for
+			## _wait_for_worker_completion to handle.
+			## Edge case: if there's already a deferred thread, join it
+			## first to prevent leaking the old thread handle. The join
+			## is bounded by that op's own timeout (same as the
+			## synchronous path above).
+			if _deferred_join_thread != null:
+				_deferred_join_thread.wait_to_finish()
+			_deferred_join_thread = thread
+
+
+## Wait for any active worker thread to complete naturally, then join
+## any deferred worker thread. Used by synchronous verdict paths that
+## cancelled a walk without joining — the worker's `_run_blocking` loop
+## sees the cancellation flag and unwinds on its own, but we must wait
+## for it to finish AND join it (Godot requirement) before starting a
+## new `_run_blocking` operation (which needs exclusive ownership of the
+## `_active_blocking_thread` slot). Suspends frame-by-frame until the
+## worker is gone, then joins the deferred thread if present. No-ops
+## immediately when no worker is active.
+func _wait_for_worker_completion() -> void:
+	if _active_blocking_thread == null and _deferred_join_thread == null:
+		return
+	var tree := Engine.get_main_loop()
+	if not (tree is SceneTree):
+		## No SceneTree available to pump frames against. If there's a
+		## deferred join pending, we must join it synchronously to
+		## satisfy Godot's Thread requirements, even though this
+		## defeats the non-blocking intent. This is a failsafe for edge
+		## cases (tool scripts, tests) where defer_blocking_work might
+		## be on but no SceneTree is available.
+		if _deferred_join_thread != null:
+			_deferred_join_thread.wait_to_finish()
+			_deferred_join_thread = null
+		return
+	## Wait for the deferred worker to naturally complete. The
+	## _run_blocking loop detects the cancellation and returns null
+	## without joining, so the thread is still alive and running its
+	## work. Poll until it finishes.
+	while _deferred_join_thread != null and _deferred_join_thread.is_alive():
+		await (tree as SceneTree).process_frame
+	## Join the deferred thread. By this point the thread has exited,
+	## so wait_to_finish is non-blocking (just retrieves the already-
+	## completed result).
+	if _deferred_join_thread != null:
+		_deferred_join_thread.wait_to_finish()
+		_deferred_join_thread = null
 
 
 # ---- Public state accessors --------------------------------------------
@@ -441,14 +506,14 @@ func _set_incompatible_server(
 	## flag false, so the head takes ownership for them: a handshake
 	## verdict lands from `_process` while a startup walk can still be
 	## suspended in `_run_blocking`, and starting the tail's worker then
-	## would steal the slot — the walk's op is orphaned from the
-	## `_invalidate_async_startup` join guarantee and its resume gets a
-	## null without a generation bump (the Nil-into-Dictionary crash on
-	## the incompatible-occupant walk). Cancelling the walk first mirrors
+	## would steal the slot. Cancelling the walk without joining mirrors
 	## the recovery click (#712): the diagnosis in hand supersedes
-	## whatever the walk was still probing for.
+	## whatever the walk was still probing for, and the cancelled walk's
+	## worker completes naturally (its resume checks `_async_stale()` and
+	## unwinds). The tail waits for that natural completion before taking
+	## the worker slot.
 	if not caller_owns_worker_slot:
-		_invalidate_async_startup()
+		_invalidate_async_startup(false)
 	transition_state(McpServerStateScript.INCOMPATIBLE)
 	_connection_blocked = true
 	_server_expected_version = expected_version
@@ -482,6 +547,14 @@ func _set_incompatible_server(
 	## Off-thread recovery proof (#712), mirroring recover_strong_port_occupant:
 	## the EditorSettings record is read on the main thread up front and
 	## injected as record_override — EditorSettings is main-thread-only.
+	##
+	## When `caller_owns_worker_slot` is false, the `_invalidate_async_startup`
+	## call above cancelled any in-flight walk WITHOUT joining its worker thread,
+	## so we must wait for that worker to complete naturally before our own
+	## `_run_blocking` can take the slot. The worker's `_run_blocking` loop checks
+	## `_active_blocking_thread != thread` and returns null, unwinding the walk.
+	if not caller_owns_worker_slot:
+		await _wait_for_worker_completion()
 	var async_gen := _async_generation
 	var record: Dictionary = _host._read_managed_server_record()
 	var proof_result: Variant = await _run_blocking(func() -> Variant:
