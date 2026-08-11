@@ -186,4 +186,8 @@ def test_main_plumbs_pid_file_into_runtime_info(monkeypatch, tmp_path):
     )
 
     assert captured["path"] == str(pid_path)
-    assert captured["run_kwargs"] == {"transport": "streamable-http", "port": 8123}
+    assert captured["run_kwargs"] == {
+        "transport": "streamable-http",
+        "port": 8123,
+        "uvicorn_config": {"access_log": False},
+    }
