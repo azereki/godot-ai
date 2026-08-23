@@ -94,7 +94,7 @@ _FROZEN_NO_EXCLUSION_TEXT = (
     "  godot://class/{class_name},\n"
     "  godot://script/{path}, godot://project/info, godot://project/settings,\n"
     "  godot://materials, godot://input_map, godot://performance,\n"
-    "  godot://test/results\n\n"
+    "  godot://test/results, godot://custom-tools\n\n"
     "Always connect to an editor session first (session_activate or "
     'session_manage(op="list")). Write operations require session readiness; '
     "check editor_state if a call is rejected as 'not writable'. After driving a "

@@ -210,6 +210,9 @@ def _event_stub(auth_token: str | None, token_authenticated: bool, service):
         registry=registry,
         _auth_token=auth_token,
         _custom_tool_service=service,
+        ## _handle_event schedules the broadcast via the server; the stub
+        ## only needs it to be callable (catalog mutation is what's asserted).
+        _schedule_tools_broadcast=lambda: None,
     )
 
 

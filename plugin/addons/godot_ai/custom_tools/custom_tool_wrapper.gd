@@ -42,10 +42,18 @@ func invoke(params: Dictionary) -> Dictionary:
 	ctx.locator = _locator
 	ctx.deadline_msec = Time.get_ticks_msec() + _spec.timeout_ms
 	var result: Dictionary = _handler_instance.call(_spec.method, clean_params, ctx)
-	if result.get("_deferred", false) and _spec.timeout_ms > 0:
-		## Handlers return the SHARED McpDispatcher.DEFERRED_RESPONSE const,
-		## which Godot makes read-only — stamping the per-spec deferred
-		## budget on it directly is a script error that aborts the call.
-		result = result.duplicate()
-		result["_deferred_timeout_ms"] = _spec.timeout_ms
+	if result.get("_deferred", false):
+		## Enforce the declared contract: batch_execute and the server's
+		## timeout budget both trust spec.deferred, so a non-deferred spec
+		## whose handler defers anyway would report success while its real
+		## reply arrives uncorrelated later.
+		if not _spec.deferred:
+			return ErrorCodes.make(ErrorCodes.INTERNAL_ERROR,
+				"Custom tool '%s' returned a deferred response but its spec declares deferred=false" % _spec.name)
+		if _spec.timeout_ms > 0:
+			## Handlers return the SHARED McpDispatcher.DEFERRED_RESPONSE
+			## const, which Godot makes read-only — stamping the per-spec
+			## budget on it directly is a script error that aborts the call.
+			result = result.duplicate()
+			result["_deferred_timeout_ms"] = _spec.timeout_ms
 	return result

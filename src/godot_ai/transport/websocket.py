@@ -126,6 +126,11 @@ class GodotWebSocketServer:
         ## in depth on top of loopback-only binding (see AGENTS.md's WS
         ## trust-boundary note), not an authentication boundary.
         self._auth_token = auth_token or None
+        ## Live tools/list_changed broadcast tasks. Broadcasts run OFF the
+        ## per-editor receive loop (a stalled MCP transport must not delay
+        ## queued command responses behind its notify_timeout_s cap); the
+        ## set keeps strong refs so tasks aren't GC'd mid-flight.
+        self._broadcast_tasks: set[asyncio.Task] = set()
         ## request_id -> (owner session_id, future). The session id is part
         ## of the entry (#690) so (a) a disconnect can immediately fail that
         ## session's in-flight futures instead of leaving callers to wait
@@ -381,13 +386,7 @@ class GodotWebSocketServer:
                 ## MCP clients — a closed editor's tools must not linger as
                 ## invokable entries. Only broadcast if it actually had any.
                 if self._custom_tool_service.remove_session(session_id):
-                    try:
-                        await self._custom_tool_service.notify_tools_change()
-                    except Exception:
-                        logger.debug(
-                            "tools/list_changed broadcast failed on disconnect",
-                            exc_info=True,
-                        )
+                    self._schedule_tools_broadcast()
                 ## Fail this session's in-flight futures NOW (#690): a close
                 ## settles nothing by itself, so every in-flight command used
                 ## to wait out its full per-command timeout (120s for
@@ -405,6 +404,28 @@ class GodotWebSocketServer:
                                 f"Session {session_id} disconnected while the command was in flight"
                             )
                         )
+
+    def _schedule_tools_broadcast(self) -> None:
+        """Fire a tools/list_changed broadcast without blocking the caller.
+
+        Called from the per-editor receive loop and disconnect cleanup —
+        awaiting the broadcast inline would let one stalled MCP transport
+        (bounded, but up to ``notify_timeout_s`` per session) delay queued
+        command responses behind it. ``notify_tools_change`` already
+        isolates and times out per-session sends internally; the done
+        callback catches anything that still escapes (e.g. test doubles).
+        """
+        task = asyncio.create_task(self._custom_tool_service.notify_tools_change())
+        self._broadcast_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._broadcast_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.debug(
+                    "tools/list_changed broadcast failed", exc_info=t.exception()
+                )
+
+        task.add_done_callback(_done)
 
     async def _handle_event(self, session_id: str, data: dict) -> None:
         event = data.get("event", "")
@@ -454,7 +475,7 @@ class GodotWebSocketServer:
                     logger.info(
                         "Session %s: custom tools -> %d registered", session_id[:8], len(tools)
                     )
-                    await self._custom_tool_service.notify_tools_change()
+                    self._schedule_tools_broadcast()
                 except ValidationError as e:
                     logger.error("Invalid custom tool definition: %s", e)
             elif event == "readiness_changed":

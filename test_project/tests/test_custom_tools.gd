@@ -163,6 +163,16 @@ func test_wrapper_stamps_deferred_timeout_on_a_copy() -> void:
 		"shared DEFERRED_RESPONSE const must stay unmodified")
 
 
+func test_wrapper_rejects_undeclared_deferral() -> void:
+	## spec.deferred=false is what batch_execute and the server's timeout
+	## budget trust — a handler deferring anyway must be an error, not a
+	## success whose real reply arrives uncorrelated later.
+	var wrapper := CustomToolWrapper.new(_make_spec("fixture_sneaky", &"go_deferred"), _make_locator())
+	var result: Dictionary = wrapper.invoke({})
+	assert_is_error(result, ErrorCodes.INTERNAL_ERROR)
+	assert_contains(result.error.message, "deferred=false")
+
+
 func test_wrapper_reports_missing_method() -> void:
 	var wrapper := CustomToolWrapper.new(_make_spec("fixture_bad", &"no_such_method"), _make_locator())
 	var result: Dictionary = wrapper.invoke({})
