@@ -90,6 +90,7 @@ class PromotedToolRegistrar:
         self._set_hidden_tools = set_hidden_tools or (lambda _names: None)
         self._registered: set[str] = set()
         self._capped_logged: frozenset[str] = frozenset()
+        self._conflict_logged: frozenset[str] = frozenset()
         service.on_catalog_changed = self.sync
 
     def sync(self) -> None:
@@ -107,6 +108,34 @@ class PromotedToolRegistrar:
         for definition in self._service.get_tools():
             if definition.promoted:
                 promoted.setdefault(definition.name, definition)
+
+        ## Fail closed on cross-session schema conflicts: when two editors
+        ## promote the SAME name with DIFFERENT params_schema, advertising
+        ## either schema misleads the MCP client whenever the other session
+        ## is active (dispatch resolves per active session). Such names stay
+        ## reachable via custom_manage, which is always session-correct.
+        ## Identical-schema duplicates promote normally.
+        schemas_by_name: dict[str, list] = {}
+        for _session_id, definition in self._service.iter_all_definitions():
+            if definition.promoted and definition.enabled:
+                schemas_by_name.setdefault(definition.name, []).append(
+                    definition.params_schema
+                )
+        conflicted = frozenset(
+            name
+            for name, schemas in schemas_by_name.items()
+            if any(schema != schemas[0] for schema in schemas[1:])
+        )
+        if conflicted and conflicted != self._conflict_logged:
+            logger.warning(
+                "Promoted name(s) with conflicting schemas across editor "
+                "sessions excluded from first-class registration "
+                "(use custom_manage): %s",
+                ", ".join(sorted(conflicted)),
+            )
+        self._conflict_logged = conflicted
+        for name in conflicted:
+            promoted.pop(name, None)
 
         ## Disabled definitions are intentionally absent from get_tools(),
         ## but remain in get_all_tools(). Keep them registered as hidden

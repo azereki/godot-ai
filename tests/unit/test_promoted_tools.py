@@ -43,13 +43,19 @@ class _FakeMcp:
 
 @pytest.fixture()
 def stack():
+    ## Save/restore the process singleton so this fixture's catalog and
+    ## registrar hook can't leak into later tests, even on failure.
+    previous = CustomToolService._instance
     CustomToolService._instance = None
     service = CustomToolService.get_instance()
     mcp = _FakeMcp()
     registrar = PromotedToolRegistrar(
         mcp, service, set_hidden_tools=mcp.set_hidden_tools
     )
-    return service, mcp, registrar
+    try:
+        yield service, mcp, registrar
+    finally:
+        CustomToolService._instance = previous
 
 
 def _tool(name: str, promoted: bool = True, **extra) -> CustomToolDefinition:
@@ -147,3 +153,48 @@ def test_registrar_ignores_cross_session_duplicate_names(stack) -> None:
     assert list(mcp.tools) == [PROMOTED_PREFIX + "dup"]
     service.remove_session("s2")
     assert mcp.tools == {}
+
+
+def test_cross_session_schema_conflict_excluded_from_promotion(stack) -> None:
+    service, mcp, _ = stack
+    schema_a = {"type": "object", "properties": {"a": {"type": "string"}}}
+    schema_b = {"type": "object", "properties": {"b": {"type": "integer"}}}
+    service.update_session_tools("s1", [_tool("clash", params_schema=schema_a)])
+    service.update_session_tools("s2", [_tool("clash", params_schema=schema_b)])
+    ## Advertising either schema misleads the client whenever the OTHER
+    ## session is active — fail closed, keep custom_manage as the path.
+    assert PROMOTED_PREFIX + "clash" not in mcp.tools
+    ## The conflict clears when one side leaves.
+    service.remove_session("s2")
+    assert PROMOTED_PREFIX + "clash" in mcp.tools
+    assert mcp.tools[PROMOTED_PREFIX + "clash"].parameters == schema_a
+
+
+def test_identical_schema_duplicates_still_promote(stack) -> None:
+    service, mcp, _ = stack
+    schema = {"type": "object", "properties": {"x": {"type": "string"}}}
+    service.update_session_tools("s1", [_tool("same", params_schema=schema)])
+    service.update_session_tools("s2", [_tool("same", params_schema=schema)])
+    assert PROMOTED_PREFIX + "same" in mcp.tools
+
+
+def test_sync_failure_is_contained_and_logged(stack, monkeypatch) -> None:
+    service, mcp, registrar = stack
+
+    def _boom():
+        raise RuntimeError("sync bug")
+
+    monkeypatch.setattr(service, "get_tools", _boom)
+    ## The WS receive loop triggers sync via catalog mutation — a
+    ## registrar bug must be swallowed (and logged), never raised.
+    registrar.sync()
+
+
+def test_get_all_tools_session_scope_includes_disabled(stack) -> None:
+    service, _, _ = stack
+    service.update_session_tools(
+        "s1", [_tool("off", promoted=False, enabled=False), _tool("on", promoted=False)]
+    )
+    names = {t.name for t in service.get_all_tools(session_id="s1")}
+    assert names == {"off", "on"}
+    assert {t.name for t in service.get_tools(session_id="s1")} == {"on"}

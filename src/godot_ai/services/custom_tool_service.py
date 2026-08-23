@@ -185,6 +185,17 @@ class CustomToolService:
                 merged.setdefault(name, definition)
         return list(merged.values())
 
+    def iter_all_definitions(self):
+        """Every (session_id, definition) pair, enabled or not.
+
+        Unlike the merged views above, this does NOT dedupe by name —
+        registry synchronization uses it to detect cross-session name
+        collisions with conflicting schemas.
+        """
+        for session_id, tools in self._tools_by_session.items():
+            for definition in tools.values():
+                yield session_id, definition
+
     def get_tool(
         self,
         tool_name: str,

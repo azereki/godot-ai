@@ -16,6 +16,7 @@ const SOURCE_CFG := "res://addons/godot_ai/plugin.cfg"
 
 var _saved_registry_instance: McpToolRegistry = null
 var _connection: McpConnection = null
+var _saved_disabled_meta: PackedStringArray = PackedStringArray()
 
 
 func suite_name() -> String:
@@ -28,10 +29,16 @@ func suite_setup(_ctx: Dictionary) -> void:
 	## the rest of the suite run sees the real one.
 	_saved_registry_instance = McpToolRegistry.get_instance()
 	_connection = McpConnection.new()
+	## Captured here and restored in suite_teardown so a mid-test assertion
+	## failure can't leave disabled_custom_tools polluted for later tests
+	## or the live dock.
+	_saved_disabled_meta = _project_meta_disabled()
 
 
 func suite_teardown() -> void:
 	McpToolRegistry._instance = _saved_registry_instance
+	EditorInterface.get_editor_settings().set_project_metadata(
+		"godot_ai", "disabled_custom_tools", _saved_disabled_meta)
 	if _connection != null:
 		_connection.free()
 		_connection = null
@@ -206,7 +213,6 @@ func _project_meta_disabled() -> PackedStringArray:
 
 
 func test_registry_disable_filters_catalog_and_persists() -> void:
-	var saved_meta := _project_meta_disabled()
 	var registry := _make_registry(McpDispatcher.new(McpLogBuffer.new()))
 	registry.register(_make_spec("tool_on"))
 	registry.register(_make_spec("tool_off"))
@@ -222,14 +228,11 @@ func test_registry_disable_filters_catalog_and_persists() -> void:
 	var reloaded := _make_registry(McpDispatcher.new(McpLogBuffer.new()))
 	assert_false(reloaded.is_tool_enabled("tool_off"), "disable must survive a registry reload")
 	assert_true(reloaded.is_tool_enabled("tool_on"))
-	## Cleanup: re-enable and restore prior metadata exactly.
+	## Metadata restore happens unconditionally in suite_teardown.
 	reloaded.set_tool_enabled("tool_off", true)
-	EditorInterface.get_editor_settings().set_project_metadata(
-		"godot_ai", "disabled_custom_tools", saved_meta)
 
 
 func test_wrapper_rejects_disabled_tool() -> void:
-	var saved_meta := _project_meta_disabled()
 	var registry := _make_registry(McpDispatcher.new(McpLogBuffer.new()))
 	var spec := _make_spec("fixture_gated")
 	registry.register(spec)
@@ -238,5 +241,3 @@ func test_wrapper_rejects_disabled_tool() -> void:
 	var result: Dictionary = wrapper.invoke({})
 	assert_is_error(result, ErrorCodes.CUSTOM_TOOL_DISABLED)
 	registry.set_tool_enabled("fixture_gated", true)
-	EditorInterface.get_editor_settings().set_project_metadata(
-		"godot_ai", "disabled_custom_tools", saved_meta)

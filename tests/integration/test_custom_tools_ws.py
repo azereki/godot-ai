@@ -373,3 +373,9 @@ class TestPromotedToolsEndToEnd:
         await plugin.send_event("custom_tools_changed", {"tools": []})
         await asyncio.sleep(0.1)
         assert not any(t.name == "custom_temp" for t in await client.list_tools())
+        ## list_tools() also filters HIDDEN tools, so additionally prove the
+        ## registration is gone (not a disabled tombstone): a call must fail
+        ## with the generic unknown-tool error. No structured-code assert —
+        ## FastMCP is version-ranged, not pinned.
+        result = await client.call_tool("custom_temp", {}, raise_on_error=False)
+        assert result.is_error
