@@ -68,6 +68,10 @@ class _RefreshCountingDock extends McpDockScript:
 class _ConnectionStub:
 	var is_connected := true
 	var server_version := ""
+	var transport_status: Dictionary = {"phase": "connected", "attempt": 0, "state_elapsed_sec": 0.0}
+
+	func get_transport_status() -> Dictionary:
+		return transport_status.duplicate(true)
 
 
 static func _finished_thread_noop() -> void:
@@ -216,6 +220,73 @@ func test_connected_status_stays_compact_across_client_readiness() -> void:
 		_dock._status_label.text,
 		"Server connected",
 		"Connected status should stay compact with multiple configured AI clients",
+	)
+
+
+func test_transport_status_text_distinguishes_each_reconnect_phase() -> void:
+	assert_eq(
+		McpDockScript._transport_status_text({"phase": "connecting", "attempt": 3}),
+		"Connecting — attempt 3",
+	)
+	assert_eq(
+		McpDockScript._transport_status_text(
+			{"phase": "retrying", "attempt": 4, "retry_in_sec": 2.1}
+		),
+		"Retrying in 3s — attempt 4",
+	)
+	assert_eq(
+		McpDockScript._transport_status_text({"phase": "closing", "attempt": 4}),
+		"Disconnecting…",
+	)
+	assert_eq(
+		McpDockScript._transport_status_text({"phase": "blocked", "attempt": 4}),
+		"Connection blocked",
+	)
+
+
+func test_update_status_renders_transport_phase_and_transient_reason() -> void:
+	_dock._build_ui()
+	var connection := _ConnectionStub.new()
+	connection.is_connected = false
+	connection.transport_status = {
+		"phase": "connecting",
+		"attempt": 2,
+		"state_elapsed_sec": 10.0,
+		"reason": "Server rejected the editor auth token.",
+	}
+	_dock._connection = connection
+	_dock._startup_grace_until_msec = 0
+
+	_dock._update_status()
+
+	assert_eq(_dock._status_label.text, "Connecting — attempt 2")
+	assert_eq(
+		_dock._status_label.tooltip_text,
+		"Server rejected the editor auth token.",
+		"the compact primary label should keep transient detail in its tooltip",
+	)
+
+
+func test_update_status_hides_stale_transient_reason_while_connected() -> void:
+	_dock._build_ui()
+	var connection := _ConnectionStub.new()
+	connection.is_connected = true
+	connection.transport_status = {
+		"phase": "connected",
+		"attempt": 0,
+		"state_elapsed_sec": 0.0,
+		"reason": "Previous peer rejected the editor auth token.",
+	}
+	_dock._connection = connection
+	_dock._startup_grace_until_msec = 0
+
+	_dock._update_status()
+
+	assert_eq(_dock._status_label.text, "Server connected")
+	assert_eq(
+		_dock._status_label.tooltip_text,
+		"",
+		"an OPEN connection must not show the previous peer's transient reason",
 	)
 
 
@@ -1836,3 +1907,29 @@ func test_tool_catalog_is_excludable_domain_filters_unknown_names() -> void:
 		"a name no longer in the catalog must be rejected")
 	assert_false(McpToolCatalog.is_excludable_domain(""),
 		"empty is not a domain")
+
+
+func test_server_ownership_tag_distinguishes_backend_flavor() -> void:
+	## #838/#816 step 11: the server line names which backend flavor the
+	## editor is riding. Display only — external adoption clears PID
+	## authority, so this text is never kill proof (#669).
+	assert_eq(McpDockScript._server_ownership_tag(McpServerState.READY, 12345), "plugin-managed backend")
+	assert_eq(McpDockScript._server_ownership_tag(McpServerState.READY, -1), "externally adopted backend")
+	assert_eq(McpDockScript._server_ownership_tag(McpServerState.UNINITIALIZED, 12345), "",
+		"no tag before the lifecycle reaches READY")
+	assert_eq(McpDockScript._server_ownership_tag(McpServerState.CRASHED, -1), "",
+		"terminal diagnoses keep the plain ports label")
+
+
+func test_client_transport_tag_tracks_descriptor_shape() -> void:
+	## #838: the row tag must always agree with what Configure writes, so it
+	## derives from descriptor command_shape — attach for every migrated
+	## client (any config_type), URL for the deliberate holdouts.
+	assert_eq(McpDockScript._client_transport_tag("cursor"), "attach")
+	assert_eq(McpDockScript._client_transport_tag("claude_code"), "attach", "CLI clients register attach too")
+	assert_eq(McpDockScript._client_transport_tag("hermes"), "attach", "YAML clients included")
+	assert_eq(McpDockScript._client_transport_tag("codex"), "attach",
+		"TOML COMMAND_ARRAY clients tag attach too")
+	assert_eq(McpDockScript._client_transport_tag("cherry_studio"), "URL",
+		"cherry_studio deliberately stays URL-mode (#838 follow-up)")
+	assert_eq(McpDockScript._client_transport_tag("__missing_client__"), "")

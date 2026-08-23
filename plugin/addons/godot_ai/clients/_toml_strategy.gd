@@ -16,13 +16,19 @@ static func configure(
 	server_url: String,
 	launch: Dictionary = {},
 ) -> Dictionary:
-	var path := client.resolved_config_path()
+	var resolution := client.resolved_config_path_details()
+	var path := str(resolution.get("path", ""))
+	var path_error := str(resolution.get("error", ""))
+	if not path_error.is_empty():
+		return {"status": "error", "message": path_error}
 	if path.is_empty():
 		return {"status": "error", "message": "Could not resolve config path for %s" % client.display_name}
 
-	var read := _read_or_init(path)
+	var seed_path := str(resolution.get("seed_path", ""))
+	var read_path := seed_path if not FileAccess.file_exists(path) and not seed_path.is_empty() else path
+	var read := _read_or_init(read_path)
 	if not read["ok"]:
-		return {"status": "error", "message": "Refusing to overwrite %s: %s. Fix or move the file, then re-run Configure." % [path, read["error"]]}
+		return {"status": "error", "message": "Refusing to overwrite %s: %s. Fix or move the file, then re-run Configure." % [read_path, read["error"]]}
 
 	var rendered := render_body(client, server_url, launch)
 	if not bool(rendered.get("ok", false)):
@@ -47,7 +53,7 @@ static func configure(
 		output_fresh.append_array(new_lines)
 		if not McpAtomicWrite.write(path, "\n".join(output_fresh)):
 			return {"status": "error", "message": "Cannot write to %s" % path}
-		return {"status": "ok", "message": "%s configured" % client.display_name}
+		return {"status": "ok", "message": McpClient.configured_message(client, server_url)}
 
 	var old_items := _value_items(lines, int(section["start"]) + 1, int(section["end"]))
 	var old_by_key := {}
@@ -93,7 +99,7 @@ static func configure(
 
 	if not McpAtomicWrite.write(path, "\n".join(output)):
 		return {"status": "error", "message": "Cannot write to %s" % path}
-	return {"status": "ok", "message": "%s configured" % client.display_name}
+	return {"status": "ok", "message": McpClient.configured_message(client, server_url)}
 
 
 static func check_status(
@@ -111,7 +117,11 @@ static func check_status_details(
 	server_url: String,
 	launch: Dictionary = {},
 ) -> Dictionary:
-	var path := client.resolved_config_path()
+	var resolution := client.resolved_config_path_details()
+	var path := str(resolution.get("path", ""))
+	var path_error := str(resolution.get("error", ""))
+	if not path_error.is_empty():
+		return {"status": McpClient.Status.ERROR, "error_msg": path_error}
 	if path.is_empty() or not FileAccess.file_exists(path):
 		return {"status": McpClient.Status.NOT_CONFIGURED, "error_msg": ""}
 	var read := _read_or_init(path)
@@ -166,7 +176,11 @@ static func check_status_details(
 
 
 static func remove(client: McpClient, _server_name: String) -> Dictionary:
-	var path := client.resolved_config_path()
+	var resolution := client.resolved_config_path_details()
+	var path := str(resolution.get("path", ""))
+	var path_error := str(resolution.get("error", ""))
+	if not path_error.is_empty():
+		return {"status": "error", "message": path_error}
 	if path.is_empty() or not FileAccess.file_exists(path):
 		return {"status": "ok", "message": "Not configured"}
 	var read := _read_or_init(path)
