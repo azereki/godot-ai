@@ -338,6 +338,30 @@ class TestPromotedToolsEndToEnd:
         ## GodotClient.send returns the response DATA (envelope unwrapped).
         assert result.structured_content["passed"] == 3
 
+    async def test_disabled_promotion_is_hidden_and_stale_call_is_specific(
+        self, mcp_stack
+    ):
+        client, plugin = mcp_stack
+        await plugin.send_event(
+            "custom_tools_changed", {"tools": [_tool_payload("temp", promoted=True)]}
+        )
+        await asyncio.sleep(0.1)
+        assert any(t.name == "custom_temp" for t in await client.list_tools())
+        ## Dock-disable keeps the definition server-side as a hidden
+        ## tombstone: fresh discovery omits it while a cached client gets the
+        ## domain-specific error promised by the dock contract.
+        await plugin.send_event(
+            "custom_tools_changed",
+            {"tools": [_tool_payload("temp", promoted=True, enabled=False)]},
+        )
+        await asyncio.sleep(0.1)
+        assert not any(t.name == "custom_temp" for t in await client.list_tools())
+        stale = await client.call_tool(
+            "custom_temp", {"msg": "stale"}, raise_on_error=False
+        )
+        assert stale.is_error
+        assert stale.structured_content["error"]["code"] == "CUSTOM_TOOL_DISABLED"
+
     async def test_promotion_unregisters_on_empty_snapshot(self, mcp_stack):
         client, plugin = mcp_stack
         await plugin.send_event(
@@ -345,8 +369,7 @@ class TestPromotedToolsEndToEnd:
         )
         await asyncio.sleep(0.1)
         assert any(t.name == "custom_temp" for t in await client.list_tools())
-        ## Dock-disable / addon unregister sends an empty snapshot — the
-        ## first-class tool must vanish from the client's list too.
+        ## Empty snapshot means addon unregister, not dock-disable.
         await plugin.send_event("custom_tools_changed", {"tools": []})
         await asyncio.sleep(0.1)
         assert not any(t.name == "custom_temp" for t in await client.list_tools())

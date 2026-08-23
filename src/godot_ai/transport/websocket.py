@@ -484,7 +484,10 @@ class GodotWebSocketServer:
                     tools = [CustomToolDefinition.model_validate(t) for t in payload.tools]
                     self._custom_tool_service.update_session_tools(session_id, tools)
                     logger.info(
-                        "Session %s: custom tools -> %d registered", session_id[:8], len(tools)
+                        "Session %s: custom tools -> %d registered (%d enabled)",
+                        session_id[:8],
+                        len(tools),
+                        sum(tool.enabled for tool in tools),
                     )
                     self._schedule_tools_broadcast()
                 except ValidationError as e:

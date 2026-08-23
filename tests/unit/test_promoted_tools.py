@@ -16,16 +16,29 @@ from godot_ai.services.promoted_tools import (
 )
 
 
+class _FakeLocalProvider:
+    def __init__(self, tools: dict[str, object]) -> None:
+        self.tools = tools
+
+    def remove_tool(self, name: str, version: str | None = None) -> None:
+        self.tools.pop(name, None)
+
+
 class _FakeMcp:
     def __init__(self) -> None:
         self.tools: dict[str, object] = {}
+        self.hidden: set[str] = set()
+        self.local_provider = _FakeLocalProvider(self.tools)
 
     def add_tool(self, tool):
         self.tools[tool.name] = tool
         return tool
 
     def remove_tool(self, name: str, version: str | None = None) -> None:
-        self.tools.pop(name, None)
+        raise AssertionError("deprecated FastMCP.remove_tool() must not be used")
+
+    def set_hidden_tools(self, names: set[str]) -> None:
+        self.hidden = set(names)
 
 
 @pytest.fixture()
@@ -33,7 +46,9 @@ def stack():
     CustomToolService._instance = None
     service = CustomToolService.get_instance()
     mcp = _FakeMcp()
-    registrar = PromotedToolRegistrar(mcp, service)
+    registrar = PromotedToolRegistrar(
+        mcp, service, set_hidden_tools=mcp.set_hidden_tools
+    )
     return service, mcp, registrar
 
 
@@ -59,14 +74,23 @@ def test_unpromoted_tools_stay_behind_custom_manage(stack) -> None:
     assert mcp.tools == {}
 
 
-def test_promotion_follows_catalog_removal(stack) -> None:
+def test_disabled_promotion_stays_callable_but_hidden(stack) -> None:
     service, mcp, _ = stack
     service.update_session_tools("s1", [_tool("a")])
     assert PROMOTED_PREFIX + "a" in mcp.tools
-    ## Empty snapshot (addon unregistered / tool disabled in the dock) —
-    ## the first-class registration must disappear with it.
+    service.update_session_tools("s1", [_tool("a", enabled=False)])
+    assert PROMOTED_PREFIX + "a" in mcp.tools
+    assert mcp.hidden == {PROMOTED_PREFIX + "a"}
+
+
+def test_promotion_follows_catalog_removal(stack) -> None:
+    service, mcp, _ = stack
+    service.update_session_tools("s1", [_tool("a")])
+    ## Empty snapshot means the addon unregistered the definition entirely,
+    ## so no stale-call tombstone remains.
     service.update_session_tools("s1", [])
     assert mcp.tools == {}
+    assert mcp.hidden == set()
 
 
 def test_promotion_follows_session_disconnect(stack) -> None:

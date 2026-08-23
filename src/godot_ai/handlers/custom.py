@@ -40,11 +40,18 @@ async def custom_invoke(
             code="UNKNOWN_COMMAND",
             message=f"Custom tool '{tool_name}': no active Godot session to dispatch to",
         )
-    definition = service.get_tool(tool_name, session_id=session_id)
+    definition = service.get_tool(
+        tool_name, session_id=session_id, include_disabled=True
+    )
     if definition is None:
         raise GodotCommandError(
             code="UNKNOWN_COMMAND",
             message=f"Custom tool '{tool_name}' not found in session {session_id}",
+        )
+    if not definition.enabled:
+        raise GodotCommandError(
+            code="CUSTOM_TOOL_DISABLED",
+            message=f"Custom tool '{tool_name}' is disabled",
         )
     ## Gate only write-flagged tools, mirroring the plugin-side wrapper —
     ## a read-only custom tool (requires_writable=false) must stay

@@ -22,6 +22,7 @@ inactive editor fails with the same clear error as ``custom_manage``.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from fastmcp.tools import Tool
@@ -72,12 +73,21 @@ class PromotedToolRegistrar:
     Attached to :class:`CustomToolService` via its ``on_catalog_changed``
     hook; every catalog mutation (WS push, disconnect) re-syncs. The
     subsequent ``tools/list_changed`` broadcast the service already
-    schedules tells MCP clients to re-fetch.
+    schedules tells MCP clients to re-fetch. Disabled definitions remain
+    callable for stale clients but are filtered from fresh discovery by
+    :class:`GodotAIFastMCP`.
     """
 
-    def __init__(self, mcp: FastMCP, service: CustomToolService) -> None:
+    def __init__(
+        self,
+        mcp: FastMCP,
+        service: CustomToolService,
+        *,
+        set_hidden_tools: Callable[[set[str]], None] | None = None,
+    ) -> None:
         self._mcp = mcp
         self._service = service
+        self._set_hidden_tools = set_hidden_tools or (lambda _names: None)
         self._registered: set[str] = set()
         self._capped_logged: frozenset[str] = frozenset()
         service.on_catalog_changed = self.sync
@@ -98,6 +108,15 @@ class PromotedToolRegistrar:
             if definition.promoted:
                 promoted.setdefault(definition.name, definition)
 
+        ## Disabled definitions are intentionally absent from get_tools(),
+        ## but remain in get_all_tools(). Keep them registered as hidden
+        ## tombstones so stale MCP clients get CUSTOM_TOOL_DISABLED instead
+        ## of FastMCP's generic "Unknown tool" response.
+        disabled: dict[str, CustomToolDefinition] = {}
+        for definition in self._service.get_all_tools():
+            if definition.promoted and not definition.enabled and definition.name not in promoted:
+                disabled.setdefault(definition.name, definition)
+
         chosen = sorted(promoted)[:MAX_PROMOTED_TOOLS]
         capped = frozenset(sorted(promoted)[MAX_PROMOTED_TOOLS:])
         if capped and capped != self._capped_logged:
@@ -109,16 +128,19 @@ class PromotedToolRegistrar:
         self._capped_logged = capped
 
         want = {PROMOTED_PREFIX + name: promoted[name] for name in chosen}
+        hidden = {PROMOTED_PREFIX + name: definition for name, definition in disabled.items()}
+        registered_want = want | hidden
+        self._set_hidden_tools(set(hidden))
 
-        for tool_name in self._registered - set(want):
-            self._mcp.remove_tool(tool_name)
+        for tool_name in self._registered - set(registered_want):
+            self._mcp.local_provider.remove_tool(tool_name)
             self._registered.discard(tool_name)
 
-        for tool_name, definition in want.items():
+        for tool_name, definition in registered_want.items():
             ## Re-add even when already present: a re-push may have changed
             ## the description or schema, and the addon's definition wins.
             if tool_name in self._registered:
-                self._mcp.remove_tool(tool_name)
+                self._mcp.local_provider.remove_tool(tool_name)
             tool = PromotedCustomTool(
                 name=tool_name,
                 description=_describe(definition),

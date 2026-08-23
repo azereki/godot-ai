@@ -2036,9 +2036,10 @@ func _on_custom_tools_changed() -> void:
 		push_warning("MCP | connection isn't established")
 		return
 	var tool_list: Array[Dictionary] = []
-	## enabled(), not all(): dock-disabled tools must never be advertised
-	## to agents (they're also rejected at dispatch as defense in depth).
-	for spec in _custom_tool_registry.enabled():
+	## Send all definitions plus their state: the server hides disabled tools
+	## from fresh tools/list responses but retains a callable tombstone so a
+	## client using a cached promoted name receives CUSTOM_TOOL_DISABLED.
+	for spec in _custom_tool_registry.all():
 		tool_list.append({
 			"name": spec.name,
 			"description": spec.description,
@@ -2048,7 +2049,8 @@ func _on_custom_tools_changed() -> void:
 			"timeout_ms": spec.timeout_ms,
 			"requires_writable": spec.requires_writable,
 			"undoable": spec.undoable,
-			"promoted": spec.promoted
+			"promoted": spec.promoted,
+			"enabled": _custom_tool_registry.is_tool_enabled(spec.name)
 		})
 	_connection.send_event("custom_tools_changed", {"tools": tool_list})
 

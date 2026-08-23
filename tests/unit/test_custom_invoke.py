@@ -79,6 +79,15 @@ def test_invoke_unknown_tool_raises(fresh_service) -> None:
     assert runtime.sent == []
 
 
+def test_invoke_disabled_tool_raises_specific_error(fresh_service) -> None:
+    _register(fresh_service, "s1", enabled=False)
+    runtime = _FakeRuntime("s1")
+    with pytest.raises(GodotCommandError) as exc_info:
+        asyncio.run(custom_mod.custom_invoke(runtime, "my_tool"))
+    assert exc_info.value.code == "CUSTOM_TOOL_DISABLED"
+    assert runtime.sent == []
+
+
 def test_invoke_no_active_session_raises_without_merged_fallback(fresh_service) -> None:
     ## The tool exists in SOME session, but with no active session the
     ## invoke must fail rather than validate against a session dispatch
@@ -159,6 +168,19 @@ def test_list_scoped_to_active_session(fresh_service) -> None:
     runtime = _FakeRuntime("s1")
     result = asyncio.run(custom_mod.custom_list(runtime))
     assert [t["name"] for t in result["tools"]] == ["my_tool"]
+
+
+def test_list_hides_disabled_but_service_retains_definition(fresh_service) -> None:
+    _register(fresh_service, "s1", enabled=False)
+    runtime = _FakeRuntime("s1")
+    result = asyncio.run(custom_mod.custom_list(runtime))
+    assert result["tool_count"] == 0
+    assert fresh_service.get_tool("my_tool", session_id="s1") is None
+    retained = fresh_service.get_tool(
+        "my_tool", session_id="s1", include_disabled=True
+    )
+    assert retained is not None
+    assert retained.enabled is False
 
 
 # --- server-side catalog budgets (WS trust boundary) ---

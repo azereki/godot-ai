@@ -1,9 +1,10 @@
 """Server-side catalog of plugin-registered custom tools.
 
 The Godot plugin pushes ``custom_tools_changed`` WS events (one full
-snapshot per editor session); this service caches them per session and
-broadcasts MCP ``notifications/tools/list_changed`` so connected AI
-clients re-fetch the tool list.
+snapshot per editor session, including disabled definitions). This service
+caches them per session and broadcasts MCP
+``notifications/tools/list_changed`` so connected AI clients re-fetch the
+tool list.
 
 Broadcast mechanism: FastMCP 3.4.2 has no out-of-request-context
 broadcast API — ``Context.send_notification`` requires an active request.
@@ -64,6 +65,7 @@ class CustomToolDefinition(BaseModel):
     requires_writable: bool | None = None
     undoable: bool | None = None
     promoted: bool | None = None
+    enabled: bool = True
 
     @field_validator("params_schema")
     @classmethod
@@ -143,7 +145,7 @@ class CustomToolService:
             logger.exception("on_catalog_changed hook failed")
 
     def get_tools(self, session_id: str | None = None) -> list[CustomToolDefinition]:
-        """Tools for one Godot editor session, or a merged fallback.
+        """Enabled tools for one Godot editor session, or a merged fallback.
 
         With ``session_id``: only that session's tools (empty if the
         session is unknown/disconnected). This is the active/pinned view
@@ -156,6 +158,26 @@ class CustomToolService:
         wins on collisions) for diagnostics/admin listings only.
         """
         if session_id is not None:
+            return [
+                definition
+                for definition in self._tools_by_session.get(session_id, {}).values()
+                if definition.enabled
+            ]
+        merged: dict[str, CustomToolDefinition] = {}
+        for tools in self._tools_by_session.values():
+            for name, definition in tools.items():
+                if definition.enabled:
+                    merged.setdefault(name, definition)
+        return list(merged.values())
+
+    def get_all_tools(self, session_id: str | None = None) -> list[CustomToolDefinition]:
+        """Enabled and disabled definitions for registry synchronization.
+
+        Disabled definitions stay server-side so a client using a cached
+        promoted name can receive ``CUSTOM_TOOL_DISABLED`` even though the
+        tool has disappeared from fresh ``tools/list`` responses.
+        """
+        if session_id is not None:
             return list(self._tools_by_session.get(session_id, {}).values())
         merged: dict[str, CustomToolDefinition] = {}
         for tools in self._tools_by_session.values():
@@ -164,7 +186,11 @@ class CustomToolService:
         return list(merged.values())
 
     def get_tool(
-        self, tool_name: str, session_id: str | None = None
+        self,
+        tool_name: str,
+        session_id: str | None = None,
+        *,
+        include_disabled: bool = False,
     ) -> CustomToolDefinition | None:
         """Tool lookup by name, optionally scoped to a specific session.
 
@@ -174,10 +200,15 @@ class CustomToolService:
         """
 
         if session_id is not None:
-            return self._tools_by_session.get(session_id, {}).get(tool_name)
+            definition = self._tools_by_session.get(session_id, {}).get(tool_name)
+            if definition is not None and (include_disabled or definition.enabled):
+                return definition
+            return None
         for tools in self._tools_by_session.values():
             if tool_name in tools:
-                return tools[tool_name]
+                definition = tools[tool_name]
+                if include_disabled or definition.enabled:
+                    return definition
         return None
 
     # --- Notification broadcast ---

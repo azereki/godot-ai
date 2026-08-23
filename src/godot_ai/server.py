@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.tools import Tool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -123,6 +124,15 @@ class AppContext:
 
 class GodotAIFastMCP(FastMCP):
     """FastMCP server with Godot AI's ASGI diagnostics for HTTP transports."""
+
+    def set_hidden_promoted_tools(self, names: set[str]) -> None:
+        """Keep stale promoted names callable while omitting them from discovery."""
+        self._hidden_promoted_tools = set(names)
+
+    async def list_tools(self, *, run_middleware: bool = True) -> Sequence[Tool]:
+        tools = await super().list_tools(run_middleware=run_middleware)
+        hidden = getattr(self, "_hidden_promoted_tools", set())
+        return [tool for tool in tools if tool.name not in hidden]
 
     def http_app(self, *args: Any, **kwargs: Any):
         app = super().http_app(*args, **kwargs)
@@ -397,7 +407,11 @@ def create_server(
             ## First-class registration for promoted specs — hooks the
             ## catalog so every WS push/disconnect re-syncs the FastMCP
             ## tool list before the list_changed broadcast fires.
-            PromotedToolRegistrar(mcp, custom_tool_service)
+            PromotedToolRegistrar(
+                mcp,
+                custom_tool_service,
+                set_hidden_tools=mcp.set_hidden_promoted_tools,
+            )
         ## The WS server is intentionally loopback-only even under --allow-host
         ## (#421): it's the local editor↔server bridge, not a remote surface.
         ## See GodotWebSocketServer.start for the rationale (LAN exposure +
