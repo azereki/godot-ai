@@ -126,11 +126,14 @@ class GodotWebSocketServer:
         ## in depth on top of loopback-only binding (see AGENTS.md's WS
         ## trust-boundary note), not an authentication boundary.
         self._auth_token = auth_token or None
-        ## Live tools/list_changed broadcast tasks. Broadcasts run OFF the
+        ## Coalesced tools/list_changed broadcast. Broadcasts run OFF the
         ## per-editor receive loop (a stalled MCP transport must not delay
-        ## queued command responses behind its notify_timeout_s cap); the
-        ## set keeps strong refs so tasks aren't GC'd mid-flight.
-        self._broadcast_tasks: set[asyncio.Task] = set()
+        ## queued command responses behind its notify_timeout_s cap), and at
+        ## most ONE task is ever in flight: list_changed is a contentless
+        ## poke, so N catalog changes during a stalled send need only one
+        ## trailing re-notification, not N queued tasks.
+        self._broadcast_task: asyncio.Task | None = None
+        self._broadcast_rerun: bool = False
         ## request_id -> (owner session_id, future). The session id is part
         ## of the entry (#690) so (a) a disconnect can immediately fail that
         ## session's in-flight futures instead of leaving callers to wait
@@ -406,26 +409,34 @@ class GodotWebSocketServer:
                         )
 
     def _schedule_tools_broadcast(self) -> None:
-        """Fire a tools/list_changed broadcast without blocking the caller.
+        """Fire a coalesced tools/list_changed broadcast, non-blocking.
 
         Called from the per-editor receive loop and disconnect cleanup —
         awaiting the broadcast inline would let one stalled MCP transport
         (bounded, but up to ``notify_timeout_s`` per session) delay queued
-        command responses behind it. ``notify_tools_change`` already
-        isolates and times out per-session sends internally; the done
-        callback catches anything that still escapes (e.g. test doubles).
+        command responses behind it. At most one broadcast task is in
+        flight: a change arriving mid-broadcast sets a rerun flag consumed
+        when the current send finishes, so an event burst against a stalled
+        client costs one trailing notification instead of one queued task
+        per event. Single-threaded event loop — the flag needs no lock.
         """
-        task = asyncio.create_task(self._custom_tool_service.notify_tools_change())
-        self._broadcast_tasks.add(task)
+        if self._broadcast_task is not None and not self._broadcast_task.done():
+            self._broadcast_rerun = True
+            return
+        self._broadcast_rerun = False
+        self._broadcast_task = asyncio.create_task(self._run_tools_broadcast())
 
-        def _done(t: asyncio.Task) -> None:
-            self._broadcast_tasks.discard(t)
-            if not t.cancelled() and t.exception() is not None:
-                logger.debug(
-                    "tools/list_changed broadcast failed", exc_info=t.exception()
-                )
-
-        task.add_done_callback(_done)
+    async def _run_tools_broadcast(self) -> None:
+        while True:
+            try:
+                await self._custom_tool_service.notify_tools_change()
+            except Exception:
+                ## notify_tools_change isolates per-session failures itself;
+                ## this catches anything that still escapes (test doubles).
+                logger.debug("tools/list_changed broadcast failed", exc_info=True)
+            if not self._broadcast_rerun:
+                return
+            self._broadcast_rerun = False
 
     async def _handle_event(self, session_id: str, data: dict) -> None:
         event = data.get("event", "")

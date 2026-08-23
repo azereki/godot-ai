@@ -270,3 +270,46 @@ def test_resource_data_empty_without_active_session(fresh_service) -> None:
     result = asyncio.run(_resource_data(_FakeRuntime(None)))
     assert result["tool_count"] == 0
     assert result["tools"] == []
+
+
+# --- coalesced tools/list_changed broadcast ---
+
+
+def test_broadcast_burst_coalesces_against_stalled_client(fresh_service) -> None:
+    """An event burst while an MCP client stalls must keep at most ONE
+    broadcast task in flight, then send exactly one trailing notification
+    — never one queued task per event."""
+    from godot_ai.sessions.registry import SessionRegistry
+    from godot_ai.transport.websocket import GodotWebSocketServer
+
+    class _StallingSession:
+        def __init__(self) -> None:
+            self.send_calls = 0
+            self.gate = asyncio.Event()
+
+        async def send_tool_list_changed(self) -> None:
+            self.send_calls += 1
+            await self.gate.wait()
+
+    async def _run() -> None:
+        server = GodotWebSocketServer(SessionRegistry(), port=0)
+        stalled = _StallingSession()
+        fresh_service.track_mcp_session(stalled)
+        fresh_service.notify_timeout_s = 5.0
+
+        for _ in range(5):
+            server._schedule_tools_broadcast()
+        await asyncio.sleep(0.05)
+        ## One task in flight, one send started, the burst collapsed into
+        ## a pending rerun flag.
+        assert stalled.send_calls == 1
+        assert server._broadcast_task is not None and not server._broadcast_task.done()
+        assert server._broadcast_rerun is True
+
+        stalled.gate.set()
+        await asyncio.wait_for(server._broadcast_task, timeout=2.0)
+        ## The five coalesced changes produced exactly one trailing
+        ## notification after the stall cleared.
+        assert stalled.send_calls == 2
+
+    asyncio.run(_run())
