@@ -60,6 +60,7 @@ from godot_ai.resources.scenes import register_scene_resources
 from godot_ai.resources.scripts import register_script_resources
 from godot_ai.resources.sessions import register_session_resources
 from godot_ai.services.custom_tool_service import CustomToolService
+from godot_ai.services.promoted_tools import PromotedToolRegistrar
 from godot_ai.sessions.registry import SessionRegistry
 from godot_ai.telemetry import (
     MilestoneType,
@@ -391,7 +392,12 @@ def create_server(
         ## singleton via get_instance(), which raises if nothing built it.
         ## Custom-tool catalog + tools/list_changed broadcast (fed by the
         ## TrackMcpSessions middleware registered below).
-        CustomToolService()
+        custom_tool_service = CustomToolService()
+        if "custom" not in exclude:
+            ## First-class registration for promoted specs — hooks the
+            ## catalog so every WS push/disconnect re-syncs the FastMCP
+            ## tool list before the list_changed broadcast fires.
+            PromotedToolRegistrar(mcp, custom_tool_service)
         ## The WS server is intentionally loopback-only even under --allow-host
         ## (#421): it's the local editor↔server bridge, not a remote surface.
         ## See GodotWebSocketServer.start for the rationale (LAN exposure +

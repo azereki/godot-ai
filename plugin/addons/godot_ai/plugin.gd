@@ -2036,7 +2036,9 @@ func _on_custom_tools_changed() -> void:
 		push_warning("MCP | connection isn't established")
 		return
 	var tool_list: Array[Dictionary] = []
-	for spec in _custom_tool_registry.all():
+	## enabled(), not all(): dock-disabled tools must never be advertised
+	## to agents (they're also rejected at dispatch as defense in depth).
+	for spec in _custom_tool_registry.enabled():
 		tool_list.append({
 			"name": spec.name,
 			"description": spec.description,
@@ -2045,7 +2047,8 @@ func _on_custom_tools_changed() -> void:
 			"deferred": spec.deferred,
 			"timeout_ms": spec.timeout_ms,
 			"requires_writable": spec.requires_writable,
-			"undoable": spec.undoable
+			"undoable": spec.undoable,
+			"promoted": spec.promoted
 		})
 	_connection.send_event("custom_tools_changed", {"tools": tool_list})
 

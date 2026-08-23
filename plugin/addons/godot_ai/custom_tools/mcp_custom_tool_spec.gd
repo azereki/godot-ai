@@ -26,6 +26,9 @@ var method: StringName = &""             ## method on the handler; signature: (p
 var source_path: String = ""             ## "plugin.cfg" path: "res://addons/gdunit4_mcp/plugin.cfg". Same path = same addon (replace allowed); different path colliding = reject + dock warning. NOTE: self-declared — a collision/ownership policy for cooperating addons, NOT a security boundary (any in-editor code can claim any path).
 var source: String = ""                  ## display: "gdunit4_mcp". If empty, registry reads [plugin] name from source_path.
 
+# --- exposure ---
+var promoted: bool = false               ## opt-in: ask the server to ALSO register this tool as a first-class MCP tool ("custom_<name>") with params_schema attached, so agents get native schemas/validation instead of the custom_manage indirection. The server caps promoted count; overflow stays reachable via custom_manage.
+
 # --- execution contract ---
 var timeout_ms: int = 4500               ## deferred timeout → DEFERRED_TIMEOUT_MS_BY_COMMAND["custom:<name>"]
 var deferred: bool = false               ## true → handler may return DEFERRED_RESPONSE, push later via ctx.send_deferred(payload)

@@ -63,6 +63,7 @@ class CustomToolDefinition(BaseModel):
     timeout_ms: int | None = Field(default=None, ge=0, le=120_000)
     requires_writable: bool | None = None
     undoable: bool | None = None
+    promoted: bool | None = None
 
     @field_validator("params_schema")
     @classmethod
@@ -87,6 +88,10 @@ class CustomToolService:
         self._mcp_sessions: weakref.WeakSet[ServerSession] = weakref.WeakSet()
         ## Per-send timeout for notify_tools_change (tests shrink it).
         self.notify_timeout_s: float = _NOTIFY_TIMEOUT_S
+        ## Synchronous hook fired after every catalog mutation, BEFORE the
+        ## caller's tools/list_changed broadcast. PromotedToolRegistrar
+        ## attaches here to sync first-class promoted tools; must not raise.
+        self.on_catalog_changed: object | None = None
 
     @classmethod
     def get_instance(cls):
@@ -113,6 +118,7 @@ class CustomToolService:
             self._tools_by_session[session_id] = {t.name: t for t in tools}
         else:
             self._tools_by_session.pop(session_id, None)
+        self._fire_catalog_changed()
 
     def remove_session(self, session_id: str) -> bool:
         """Drop all tools of a disconnected editor session.
@@ -120,7 +126,21 @@ class CustomToolService:
         Returns True if the session had tools (caller should broadcast
         list_changed), False otherwise.
         """
-        return self._tools_by_session.pop(session_id, None) is not None
+        removed = self._tools_by_session.pop(session_id, None) is not None
+        if removed:
+            self._fire_catalog_changed()
+        return removed
+
+    def _fire_catalog_changed(self) -> None:
+        hook = self.on_catalog_changed
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception:
+            ## The hook owner (PromotedToolRegistrar) already guards, but a
+            ## misbehaving replacement must not break catalog mutation.
+            logger.exception("on_catalog_changed hook failed")
 
     def get_tools(self, session_id: str | None = None) -> list[CustomToolDefinition]:
         """Tools for one Godot editor session, or a merged fallback.

@@ -222,6 +222,14 @@ Calls take the form:
 | `csg_manage` | `csg_create`, `csg_set_operation` |
 | `custom_manage` | `list`, `invoke` |
 
+Third-party addons register custom tools in-editor (see
+`docs/plugin-architecture.md` → "Custom Tools"). All enabled custom tools are
+reachable via `custom_manage`; specs with `promoted = true` additionally
+register as first-class MCP tools named `custom_<name>` with the addon's own
+schema (capped; overflow stays behind `custom_manage`). The dock's Tools tab
+lists registered custom tools with per-tool enable/disable that applies
+immediately.
+
 `filesystem_manage.reimport` is intended for imported assets such as textures,
 models, and audio. Godot scripts (`.gd`) are not imported resources: a successful
 `.gd` entry only refreshes its editor filesystem cache entry and does not prove the

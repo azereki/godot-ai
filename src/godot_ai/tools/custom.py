@@ -8,6 +8,8 @@ op="invoke" requires params: tool_name (string); optional: params (dict,
 forwarded to the addon handler unvalidated — shape per the tool's
 params_schema from op="list"). Inside batch_execute, address a custom tool
 as "custom_tool:<name>" (deferred tools cannot run in batches).
+Some custom tools are also registered first-class as "custom_<name>" with
+their own schema — prefer those when present.
 """
 
 

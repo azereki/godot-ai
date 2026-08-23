@@ -42,6 +42,7 @@ signal registry_ready                            # https://github.com/hi-godot/g
 func setup(dispatcher: McpDispatcher, locator: McpServiceLocator) -> void:
 	_dispatcher = dispatcher
 	_locator = locator
+	_load_disabled_tools()
 	_instance = self
 
 
@@ -156,6 +157,72 @@ func all() -> Array[McpCustomToolSpec]:
 	return out
 
 
+## Enabled specs only — the catalog-push source. Disabled tools stay
+## registered (the dock still lists them for re-enabling) but are never
+## advertised to the server and are rejected at dispatch.
+func enabled() -> Array[McpCustomToolSpec]:
+	var out: Array[McpCustomToolSpec] = []
+	for spec in _specs.values():
+		if is_tool_enabled(spec.name):
+			out.append(spec)
+	return out
+
+
+# --- per-tool enable state (dock UI) ---
+## Persisted per-project via EditorSettings project metadata (the same
+## store the editor uses for per-project UI state — no project.godot
+## churn, no cross-project bleed). Applies LIVE: toggling re-emits
+## tools_changed, which re-pushes the filtered catalog to the server.
+
+const _META_SECTION := "godot_ai"
+const _META_KEY_DISABLED := "disabled_custom_tools"
+
+var _disabled_tools: Dictionary = {}  # name -> true
+
+
+func is_tool_enabled(name: String) -> bool:
+	return not _disabled_tools.has(name)
+
+
+func set_tool_enabled(name: String, tool_enabled: bool) -> void:
+	if tool_enabled:
+		if not _disabled_tools.has(name):
+			return
+		_disabled_tools.erase(name)
+	else:
+		if _disabled_tools.has(name):
+			return
+		_disabled_tools[name] = true
+	_save_disabled_tools()
+	tools_changed.emit()
+
+
+func _load_disabled_tools() -> void:
+	_disabled_tools.clear()
+	var es := _editor_settings()
+	if es == null:
+		return
+	var stored: Variant = es.get_project_metadata(_META_SECTION, _META_KEY_DISABLED, PackedStringArray())
+	for name in PackedStringArray(stored):
+		_disabled_tools[String(name)] = true
+
+
+func _save_disabled_tools() -> void:
+	var es := _editor_settings()
+	if es == null:
+		return
+	var names := PackedStringArray()
+	for name in _disabled_tools.keys():
+		names.append(String(name))
+	es.set_project_metadata(_META_SECTION, _META_KEY_DISABLED, names)
+
+
+static func _editor_settings() -> EditorSettings:
+	if not Engine.is_editor_hint():
+		return null
+	return EditorInterface.get_editor_settings()
+
+
 func get_spec(name: String) -> McpCustomToolSpec:
 	var out: McpCustomToolSpec = _specs.get(name)
 	return out
@@ -171,6 +238,7 @@ func is_ready() -> bool:
 func clear() -> void:
 	_specs.clear()
 	_by_source_path.clear()
+	_disabled_tools.clear()  # in-memory only; persistence reloads on next setup()
 	_ready = false
 	_dispatcher = null
 	_locator = null

@@ -196,3 +196,47 @@ func test_unregister_keeps_shared_lazy_handler_for_siblings() -> void:
 	var second: Dictionary = dispatcher.dispatch_direct("cmd_b", {"value": "y"})
 	assert_eq(second["data"]["echo"], "p:y",
 		"sibling command must survive a shared-key unregister")
+
+
+# ----- dock enable/disable -----
+
+func _project_meta_disabled() -> PackedStringArray:
+	var es := EditorInterface.get_editor_settings()
+	return PackedStringArray(es.get_project_metadata("godot_ai", "disabled_custom_tools", PackedStringArray()))
+
+
+func test_registry_disable_filters_catalog_and_persists() -> void:
+	var saved_meta := _project_meta_disabled()
+	var registry := _make_registry(McpDispatcher.new(McpLogBuffer.new()))
+	registry.register(_make_spec("tool_on"))
+	registry.register(_make_spec("tool_off"))
+	registry.set_tool_enabled("tool_off", false)
+	var enabled_names: Array = []
+	for spec in registry.enabled():
+		enabled_names.append(spec.name)
+	assert_true(enabled_names.has("tool_on"))
+	assert_false(enabled_names.has("tool_off"), "disabled tool must leave the catalog push")
+	assert_eq(registry.all().size(), 2, "disabled tool stays registered for the dock list")
+	## Persistence: a FRESH registry (plugin reload) re-reads the choice
+	## from per-project metadata.
+	var reloaded := _make_registry(McpDispatcher.new(McpLogBuffer.new()))
+	assert_false(reloaded.is_tool_enabled("tool_off"), "disable must survive a registry reload")
+	assert_true(reloaded.is_tool_enabled("tool_on"))
+	## Cleanup: re-enable and restore prior metadata exactly.
+	reloaded.set_tool_enabled("tool_off", true)
+	EditorInterface.get_editor_settings().set_project_metadata(
+		"godot_ai", "disabled_custom_tools", saved_meta)
+
+
+func test_wrapper_rejects_disabled_tool() -> void:
+	var saved_meta := _project_meta_disabled()
+	var registry := _make_registry(McpDispatcher.new(McpLogBuffer.new()))
+	var spec := _make_spec("fixture_gated")
+	registry.register(spec)
+	registry.set_tool_enabled("fixture_gated", false)
+	var wrapper := CustomToolWrapper.new(spec, _make_locator())
+	var result: Dictionary = wrapper.invoke({})
+	assert_is_error(result, ErrorCodes.CUSTOM_TOOL_DISABLED)
+	registry.set_tool_enabled("fixture_gated", true)
+	EditorInterface.get_editor_settings().set_project_metadata(
+		"godot_ai", "disabled_custom_tools", saved_meta)
