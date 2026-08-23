@@ -246,3 +246,24 @@ def test_tokenless_launch_accepts_catalog_push(fresh_service) -> None:
     stub = _event_stub(None, token_authenticated=False, service=fresh_service)
     _push_tools(stub)
     assert [t.name for t in fresh_service.get_tools(session_id="demo@a3f2")] == ["t"]
+
+
+# --- godot://custom-tools resource payload ---
+
+
+def test_resource_data_scoped_to_active_session(fresh_service) -> None:
+    from godot_ai.resources.custom import _resource_data
+
+    _register(fresh_service, "s1")
+    result = asyncio.run(_resource_data(_FakeRuntime("s1")))
+    assert result["tool_count"] == 1
+    assert result["tools"][0]["name"] == "my_tool"
+
+
+def test_resource_data_empty_without_active_session(fresh_service) -> None:
+    from godot_ai.resources.custom import _resource_data
+
+    _register(fresh_service, "s1")
+    result = asyncio.run(_resource_data(_FakeRuntime(None)))
+    assert result["tool_count"] == 0
+    assert result["tools"] == []

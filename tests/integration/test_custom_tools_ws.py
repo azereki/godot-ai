@@ -197,3 +197,96 @@ class TestCustomManageEndToEnd:
         data = result.structured_content
         assert data["tool_count"] == 0
         assert data["tools"] == []
+
+
+class TestCustomToolsResource:
+    """godot://custom-tools resource content, not just URI registration."""
+
+    async def test_resource_serves_session_tools(self, mcp_stack):
+        import json as _json
+
+        client, plugin = mcp_stack
+        await plugin.send_event(
+            "custom_tools_changed", {"tools": [_tool_payload("res_tool")]}
+        )
+        await asyncio.sleep(0.1)
+        contents = await client.read_resource("godot://custom-tools")
+        payload = _json.loads(contents[0].text)
+        assert payload["tool_count"] == 1
+        assert payload["tools"][0]["name"] == "res_tool"
+
+
+class TestDisconnectBroadcastFailure:
+    """A stalled/broken MCP transport must not break editor disconnect cleanup."""
+
+    async def test_disconnect_cleanup_survives_broadcast_failure(
+        self, harness, monkeypatch
+    ):
+        svc = harness.server._custom_tool_service
+
+        async def _boom():
+            raise RuntimeError("transport torn down")
+
+        plugin = await harness.connect_plugin(session_id="s-ct-fail")
+        await plugin.send_event(
+            "custom_tools_changed", {"tools": [_tool_payload("doomed")]}
+        )
+        await asyncio.sleep(0.05)
+        assert svc.get_tool("doomed") is not None
+        ## monkeypatch, not direct assignment: the service is a process
+        ## singleton, so a leaked sabotage would poison later tests.
+        monkeypatch.setattr(svc, "notify_tools_change", _boom)
+        await plugin.close()
+        await asyncio.sleep(0.15)
+        ## The raise inside the disconnect finally-block must be swallowed:
+        ## tools dropped, server still accepting connections.
+        assert svc.get_tool("doomed") is None
+        probe = await harness.connect_plugin(session_id="s-ct-after")
+        await probe.close()
+
+
+class TestCustomToolsTokenGate:
+    """On a token-configured launch, only token-authenticated sessions may
+    mutate the agent-visible custom-tool catalog (#690 / #820 review)."""
+
+    async def _tokened_harness(self):
+        import asyncio as _asyncio
+
+        from godot_ai.sessions.registry import SessionRegistry
+        from godot_ai.transport.websocket import GodotWebSocketServer
+        from tests.conftest import ServerHarness, allocate_free_port
+
+        registry = SessionRegistry()
+        port = allocate_free_port()
+        server = GodotWebSocketServer(registry, port=port, auth_token="s3cret")
+        task = _asyncio.create_task(server.start())
+        await _asyncio.sleep(0.1)
+        return ServerHarness(registry=registry, server=server, port=port, _task=task), task
+
+    async def test_tokened_launch_gates_catalog_by_handshake_token(self):
+        h, task = await self._tokened_harness()
+        try:
+            svc = h.server._custom_tool_service
+            ## Tokenless handshake still connects (compat) but its catalog
+            ## push is dropped.
+            anon = await h.connect_plugin(session_id="s-anon")
+            await anon.send_event(
+                "custom_tools_changed", {"tools": [_tool_payload("smuggled")]}
+            )
+            await asyncio.sleep(0.05)
+            assert svc.get_tool("smuggled", session_id="s-anon") is None
+            await anon.close()
+            ## A session that proved the token may publish.
+            authed = await h.connect_plugin(session_id="s-auth", auth_token="s3cret")
+            await authed.send_event(
+                "custom_tools_changed", {"tools": [_tool_payload("legit")]}
+            )
+            await asyncio.sleep(0.05)
+            assert svc.get_tool("legit", session_id="s-auth") is not None
+            await authed.close()
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, OSError):
+                pass
