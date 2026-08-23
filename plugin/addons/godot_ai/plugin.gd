@@ -2044,7 +2044,8 @@ func _on_custom_tools_changed() -> void:
 			"source": spec.source,
 			"deferred": spec.deferred,
 			"timeout_ms": spec.timeout_ms,
-			"requires_writable": spec.requires_writable
+			"requires_writable": spec.requires_writable,
+			"undoable": spec.undoable
 		})
 	_connection.send_event("custom_tools_changed", {"tools": tool_list})
 

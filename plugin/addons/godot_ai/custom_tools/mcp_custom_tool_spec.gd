@@ -16,14 +16,14 @@ extends RefCounted
 # --- identity ---
 var name: String = ""                    ## tool name, e.g. "gdunit_run". Must not shadow a built-in.
 var description: String = ""             ## shown to the agent by the MCP server
-var params_schema: Dictionary = {}       ## JSON Schema; server validates params against this
+var params_schema: Dictionary = {}       ## JSON Schema; advertised to the agent for shaping calls. Params are forwarded UNVALIDATED — the handler must validate its own input.
 
 # --- handler resolution (lazy materialization by dispatcher) ---
 var script_path: String = ""             ## "res://addons/.../handler.gd"; load()ed on first call
 var method: StringName = &""             ## method on the handler; signature: (params: Dictionary, ctx: McpCallContext) -> Dictionary
 
 # --- source identity (https://github.com/hi-godot/godot-ai/issues/781#issuecomment-5036376599 #8) ---
-var source_path: String = ""             ## "plugin.cfg" path: "res://addons/gdunit4_mcp/plugin.cfg". Same path = same addon (replace allowed); different path colliding = reject + dock warning.
+var source_path: String = ""             ## "plugin.cfg" path: "res://addons/gdunit4_mcp/plugin.cfg". Same path = same addon (replace allowed); different path colliding = reject + dock warning. NOTE: self-declared — a collision/ownership policy for cooperating addons, NOT a security boundary (any in-editor code can claim any path).
 var source: String = ""                  ## display: "gdunit4_mcp". If empty, registry reads [plugin] name from source_path.
 
 # --- execution contract ---
@@ -50,7 +50,7 @@ func validate() -> Array[String]:
 		errors.append("name '%s' is not a valid identifier\n" % name)
 	if description.length() > MAX_DESCRIPTION_CHARS:
 		errors.append("description exceeds %d chars\n" % MAX_DESCRIPTION_CHARS)
-	if JSON.stringify(params_schema).length() > MAX_SCHEMA_BYTES:
+	if JSON.stringify(params_schema).to_utf8_buffer().size() > MAX_SCHEMA_BYTES:
 		errors.append("params_schema exceeds %d bytes\n" % MAX_SCHEMA_BYTES)
 	if script_path.is_empty() or not ResourceLoader.exists(script_path):
 		errors.append("script_path '%s' does not exist" % script_path)

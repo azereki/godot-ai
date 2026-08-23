@@ -225,6 +225,9 @@ class GodotWebSocketServer:
                 readiness=handshake.readiness,
                 editor_pid=handshake.editor_pid,
                 server_launch_mode=handshake.server_launch_mode,
+                ## Mismatches were rejected above, so a present token here is
+                ## the matching one.
+                token_authenticated=bool(self._auth_token is not None and handshake.auth_token),
             )
             self.registry.register(session)
             self._connections[session_id] = ws
@@ -427,6 +430,20 @@ class GodotWebSocketServer:
                 session.play_state = payload.play_state
                 logger.info("Session %s: play state -> %s", session_id[:8], session.play_state)
             elif event == "custom_tools_changed":
+                ## Catalog text (names/descriptions) is served into the AI
+                ## agent's context, so on a token-configured launch (#690)
+                ## only a session that proved the token may mutate it — an
+                ## unauthenticated local peer must not be able to plant
+                ## agent-visible instructions. Tokenless launches keep the
+                ## compat identity model (any local session accepted); the
+                ## budget caps on CustomToolsChangedEvent/CustomToolDefinition
+                ## bound what such a peer can park either way.
+                if self._auth_token is not None and not session.token_authenticated:
+                    logger.warning(
+                        "Dropping custom_tools_changed from unauthenticated session %s",
+                        session_id[:8],
+                    )
+                    return
                 ## Plugin payload shape: {"tools": [ {...}, ... ]} — see
                 ## plugin.gd::_on_custom_tools_changed. Iterating event_data
                 ## itself would walk dict KEYS, not tool dicts.
@@ -439,7 +456,7 @@ class GodotWebSocketServer:
                     )
                     await self._custom_tool_service.notify_tools_change()
                 except ValidationError as e:
-                    logger.error(f"Invalid custom tool definition: {e}")
+                    logger.error("Invalid custom tool definition: %s", e)
             elif event == "readiness_changed":
                 payload = ReadinessChangedEvent.model_validate(event_data)
                 session.readiness = payload.readiness

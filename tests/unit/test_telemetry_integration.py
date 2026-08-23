@@ -55,6 +55,27 @@ def _wait_for(records: list, count: int, timeout: float = 2.0) -> None:
         time.sleep(0.02)
 
 
+def _wait_for_plugin_events(records: list, count: int, timeout: float = 2.0) -> None:
+    """Wait until ``count`` PLUGIN_EVENT records are visible.
+
+    The plain ``_wait_for`` counts ALL records, so a late-flushing connect
+    record from a previous test's registry can satisfy it before the
+    plugin event drains from the background telemetry worker — the
+    type-filtered assertion then sees zero (flaky under the full suite).
+    Wait on the filtered condition instead.
+    """
+    import time
+
+    from godot_ai import telemetry as tel
+
+    deadline = time.monotonic() + timeout
+    while (
+        sum(1 for r in records if r.record_type is tel.RecordType.PLUGIN_EVENT) < count
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.02)
+
+
 # --- session registry telemetry ------------------------------------------
 
 
@@ -219,7 +240,6 @@ def _run_handle_event(stub, session_id: str, data: dict) -> None:
 
 class TestPluginEventAllowlist:
     def test_known_event_recorded(self, captured) -> None:
-        from godot_ai.transport import websocket as ws_mod
 
         ## Hand-drive _handle_event with a stub server: we only need its
         ## ``registry`` attribute. The dispatcher in the real code path
@@ -246,7 +266,7 @@ class TestPluginEventAllowlist:
                 "data": {"name": "dock_startup", "data": {"developer_mode": True}},
             },
         )
-        _wait_for(captured, 1)
+        _wait_for_plugin_events(captured, 1)
 
         plugin_events = [r for r in captured if r.record_type is tel.RecordType.PLUGIN_EVENT]
         assert len(plugin_events) == 1
@@ -263,7 +283,6 @@ class TestPluginEventAllowlist:
         name past the allowlist. The canonical name is ``payload.name``;
         ``data`` is merged first so the canonical name always wins.
         """
-        from godot_ai.transport import websocket as ws_mod
 
         reg = SessionRegistry()
         session = Session(
@@ -288,7 +307,7 @@ class TestPluginEventAllowlist:
                 },
             },
         )
-        _wait_for(captured, 1)
+        _wait_for_plugin_events(captured, 1)
 
         plugin_events = [r for r in captured if r.record_type is tel.RecordType.PLUGIN_EVENT]
         assert len(plugin_events) == 1
@@ -296,7 +315,6 @@ class TestPluginEventAllowlist:
         assert "other" not in plugin_events[0].data
 
     def test_payload_unknown_fields_are_dropped(self, captured) -> None:
-        from godot_ai.transport import websocket as ws_mod
 
         reg = SessionRegistry()
         session = Session(
@@ -326,7 +344,7 @@ class TestPluginEventAllowlist:
                 },
             },
         )
-        _wait_for(captured, 1)
+        _wait_for_plugin_events(captured, 1)
 
         plugin_events = [r for r in captured if r.record_type is tel.RecordType.PLUGIN_EVENT]
         assert len(plugin_events) == 1
@@ -337,7 +355,6 @@ class TestPluginEventAllowlist:
         }
 
     def test_malformed_payload_values_are_replaced_safely(self, captured) -> None:
-        from godot_ai.transport import websocket as ws_mod
 
         reg = SessionRegistry()
         session = Session(
@@ -368,7 +385,7 @@ class TestPluginEventAllowlist:
                 },
             },
         )
-        _wait_for(captured, 1)
+        _wait_for_plugin_events(captured, 1)
 
         plugin_events = [r for r in captured if r.record_type is tel.RecordType.PLUGIN_EVENT]
         assert len(plugin_events) == 1
@@ -382,7 +399,6 @@ class TestPluginEventAllowlist:
         assert "logs" not in rec.data
 
     def test_plugin_reload_error_message_is_replaced(self, captured) -> None:
-        from godot_ai.transport import websocket as ws_mod
 
         reg = SessionRegistry()
         session = Session(
@@ -411,7 +427,7 @@ class TestPluginEventAllowlist:
                 },
             },
         )
-        _wait_for(captured, 1)
+        _wait_for_plugin_events(captured, 1)
 
         plugin_events = [r for r in captured if r.record_type is tel.RecordType.PLUGIN_EVENT]
         assert len(plugin_events) == 1
@@ -423,7 +439,6 @@ class TestPluginEventAllowlist:
         }
 
     def test_plugin_reload_and_dev_server_enums_default_unknown(self, captured) -> None:
-        from godot_ai.transport import websocket as ws_mod
 
         reg = SessionRegistry()
         session = Session(
@@ -449,7 +464,7 @@ class TestPluginEventAllowlist:
                     "data": {"name": name, "data": data},
                 },
             )
-        _wait_for(captured, 2)
+        _wait_for_plugin_events(captured, 2)
 
         plugin_events = [r for r in captured if r.record_type is tel.RecordType.PLUGIN_EVENT]
         assert plugin_events[0].data == {
@@ -462,7 +477,6 @@ class TestPluginEventAllowlist:
         }
 
     def test_unknown_event_dropped(self, captured) -> None:
-        from godot_ai.transport import websocket as ws_mod
 
         reg = SessionRegistry()
         session = Session(

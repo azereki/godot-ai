@@ -23,16 +23,28 @@ MCP client never sees it.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import weakref
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 if TYPE_CHECKING:
     from mcp.server.session import ServerSession
 
 logger = logging.getLogger(__name__)
+
+## Server-side mirrors of the plugin's register-time budgets
+## (mcp_custom_tool_spec.gd MAX_DESCRIPTION_CHARS / MAX_SCHEMA_BYTES).
+## The plugin enforces them at register time, but the WS event is the
+## trust boundary here: a peer speaking the protocol directly must not be
+## able to park megabytes of agent-visible text in the catalog or hold
+## memory up to the 4 MB message cap per push.
+MAX_TOOLS_PER_SESSION = 128
+MAX_NAME_CHARS = 128
+MAX_DESCRIPTION_CHARS = 600
+MAX_SCHEMA_BYTES = 8192
 
 ## Per-session cap on a tools/list_changed send. notify_tools_change is
 ## awaited inline from the editor WebSocket receive loop and disconnect
@@ -43,13 +55,21 @@ _NOTIFY_TIMEOUT_S = 5.0
 
 
 class CustomToolDefinition(BaseModel):
-    name: str
-    description: str
+    name: str = Field(min_length=1, max_length=MAX_NAME_CHARS)
+    description: str = Field(max_length=MAX_DESCRIPTION_CHARS)
     params_schema: dict | None = None
-    source: str | None = None
+    source: str | None = Field(default=None, max_length=256)
     deferred: bool | None = None
-    timeout_ms: int | None = None
+    timeout_ms: int | None = Field(default=None, ge=0, le=120_000)
     requires_writable: bool | None = None
+    undoable: bool | None = None
+
+    @field_validator("params_schema")
+    @classmethod
+    def _schema_within_budget(cls, value: dict | None) -> dict | None:
+        if value is not None and len(json.dumps(value).encode("utf-8")) > MAX_SCHEMA_BYTES:
+            raise ValueError(f"params_schema exceeds {MAX_SCHEMA_BYTES} UTF-8 bytes")
+        return value
 
 
 class CustomToolService:

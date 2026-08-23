@@ -132,4 +132,8 @@ class PluginTelemetryEvent(BaseModel):
 
 
 class CustomToolsChangedEvent(BaseModel):
-    tools: list # without default value
+    ## Required (no default): a snapshot event without a tools list is
+    ## malformed, not "empty". Bounded per the server-side catalog budgets
+    ## in services/custom_tool_service.py — the 4 MB WS message cap alone
+    ## must not size the per-session catalog.
+    tools: list[dict[str, Any]] = Field(max_length=128)

@@ -140,7 +140,8 @@ func unregister_source(source_path: String) -> int:
 	var specs: Array = _by_source_path.get(source_path, [])
 	var count := specs.size()
 	for spec in specs.duplicate():
-		_dispatcher.unregister("custom_tool:" + spec.name, "custom:" + spec.name)
+		if _dispatcher != null:
+			_dispatcher.unregister("custom_tool:" + spec.name, "custom:" + spec.name)
 		_specs.erase(spec.name)
 	_by_source_path.erase(source_path)
 	if count > 0:
