@@ -1540,6 +1540,13 @@ func _make_scope_cli_client(path: String) -> McpClient:
 	)
 	c.cli_unregister_template = PackedStringArray(["mcp", "remove", "--scope", "{scope}", "{name}"])
 	c.cli_status_args = PackedStringArray(["mcp", "list"])
+	## #878: without this the dispatch gate in client_configurator.gd is
+	## unreachable from any test, so `check_scope_status_details` never runs —
+	## a full suite spawned `mcp list` three times and `mcp get` zero times.
+	## Mirrors claude_code.gd so the fixture routes the way the real descriptor
+	## does; `mcp get` also renders differently from `cli_status_args`, which is
+	## what lets a test notice if the two are ever swapped.
+	c.cli_scope_status_template = PackedStringArray(["mcp", "get", "{name}"])
 	c.path_template = {"darwin": path, "windows": path, "linux": path, "unix": path}
 	c.server_key_path = PackedStringArray(["mcpServers"])
 	c.command_shape = McpClient.CommandShape.FLAT
@@ -1726,6 +1733,56 @@ func test_project_scope_status_leaves_the_user_scope_file() -> void:
 	)
 	assert_eq(at_project_no_cli.get("status"), McpClient.Status.CONFIGURED,
 		"without a CLI the JSON fallback owns both the write and the read-back")
+	_restore_client_scope()
+	_remove_if_exists(path)
+
+
+func test_scope_probe_dispatch_uses_its_own_template_and_the_selected_scope() -> void:
+	## #878: the probe's dispatch had no coverage — the suite exercised only the
+	## pure verdict helpers, so two mutations survived a full run: routing the
+	## probe through `cli_status_args` instead of `cli_scope_status_template`,
+	## and comparing against DEFAULT_CLIENT_SCOPE instead of the live setting.
+	## Both silently disable scope detection for the one client that has it.
+	var es := EditorInterface.get_editor_settings()
+	if es == null:
+		skip("EditorSettings unavailable in test environment")
+		return
+	var path := _scratch_dir.path_join("scope_probe_dispatch.json")
+	_remove_if_exists(path)
+	var client := _make_scope_cli_client(path)
+	assert_false(
+		client.cli_scope_status_template.is_empty(),
+		"the scope fixture must declare a probe or the dispatch gate is unreachable",
+	)
+
+	## Kills the "probe runs cli_status_args" mutation: the two templates render
+	## different subcommands, so swapping them changes this argv.
+	var probe_args := McpCliStrategy.format_args(client.cli_scope_status_template, "godot-ai", "")
+	var plain_args := McpCliStrategy.format_args(client.cli_status_args, "godot-ai", "")
+	assert_eq(probe_args, ["mcp", "get", "godot-ai"] as Array[String])
+	assert_ne(probe_args, plain_args, "scope probe must not render the plain status args")
+
+	## Kills the "compare against DEFAULT_CLIENT_SCOPE" mutation: `{scope}` has
+	## to resolve from the live setting, and `local` is neither the default nor
+	## the value the other scope tests use.
+	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, "local")
+	assert_eq(McpSettings.client_scope(), "local")
+	var unregister := McpCliStrategy.format_args(client.cli_unregister_template, "godot-ai", "")
+	assert_true(unregister.has("local"), "{scope} must resolve from the live setting")
+
+	## And the routed path itself: a probe whose binary cannot spawn fails
+	## closed to NOT_CONFIGURED rather than inventing a verdict. Reached through
+	## the real gate in _dispatch_check_status_with_cli_path_details, not by
+	## calling check_scope_status_details directly.
+	var launch := {"ok": true, "command": "uvx", "args": ["godot-ai", "attach"]}
+	var routed := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
+		client, "", "godot-ai-nonexistent-cli-xyz", {}, launch
+	)
+	assert_eq(
+		routed.get("status"),
+		McpClient.Status.NOT_CONFIGURED,
+		"an unspawnable scope probe must fail closed, not report CONFIGURED",
+	)
 	_restore_client_scope()
 	_remove_if_exists(path)
 
