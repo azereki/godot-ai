@@ -672,7 +672,7 @@ static func _dispatch_check_status_with_cli_path_details(
 			if (
 				client.command_shape != Client.CommandShape.NONE
 				and client.has_json_fallback()
-				and not _scope_diverges_from_json_fallback(client, cli_path)
+				and not _scope_diverges_from_json_fallback(client)
 			):
 				var command_launch := _resolved_or_discovered_launch(client, resolved_launch, launch_context)
 				return JsonStrategy.check_status_details(client, SERVER_NAME, url, command_launch)
@@ -754,18 +754,20 @@ static func _note_unhonoured_scope(client: Client, result: Dictionary) -> Dictio
 ## detection — a stdout scan sees the command, not the full argv — which is the
 ## documented trade for a status that is merely coarse instead of wrong.
 ##
-## Ordering matters: the token check and the scope compare both short-circuit
-## for every non-`{scope}` descriptor and for the default user scope, so the
-## PATH walk only runs when the answer can actually be true. An unresolvable
-## CLI means configure took the #463 JSON fallback, which writes user scope
-## whatever the setting says — so the file is the right thing to read again.
-static func _scope_diverges_from_json_fallback(client: Client, cli_path: String) -> bool:
+## Deliberately says nothing about whether the CLI resolves (#879). An earlier
+## version walked PATH here and returned false for an unresolvable binary, on
+## the reasoning that configure would then have taken the #463 JSON fallback —
+## which writes user scope whatever the setting says — so the file was the
+## right thing to read again. That extra clause could not change any outcome:
+## this is only consulted from the one call site below, already guarded on
+## `has_json_fallback()`, and when the CLI does not resolve the very next
+## branch (`resolved_cli.is_empty() and client.has_json_fallback()`) takes the
+## fallback read anyway. All it bought was a second full `McpCliFinder.find`
+## sweep per status check, on top of the one that immediately follows.
+static func _scope_diverges_from_json_fallback(client: Client) -> bool:
 	if not CliStrategy.uses_scope_token(client):
 		return false
-	if McpSettings.client_scope() == McpSettings.DEFAULT_CLIENT_SCOPE:
-		return false
-	var resolved := cli_path if not cli_path.is_empty() else CliStrategy.resolve_cli_path(client)
-	return not resolved.is_empty()
+	return McpSettings.client_scope() != McpSettings.DEFAULT_CLIENT_SCOPE
 
 
 static func _resolved_or_discovered_launch(
@@ -793,13 +795,25 @@ static func _verify_post_state(
 ) -> Dictionary:
 	if result.get("status") != "ok":
 		return result
-	var actual := _dispatch_check_status_with_cli_path_details(
+	var details := _dispatch_check_status_with_cli_path_details(
 		client, url, "", {}, resolved_launch
-	).get("status", Client.Status.NOT_CONFIGURED)
+	)
+	var actual := details.get("status", Client.Status.NOT_CONFIGURED)
 	if actual == expected:
 		return result
+	## #879: prefer whatever the probe actually learned. `resolved_config_path()`
+	## is always `path_template` (~/.claude.json for Claude Code), which is the
+	## wrong place to send the user when the entry that survived lives in
+	## another scope — a project-scope survivor is in <cwd>/.mcp.json, and the
+	## scope probe already put "registered at user scope, not project" in
+	## error_msg. Naming a file with nothing in it is worse than naming none.
+	var probe_note := str(details.get("error_msg", "")).strip_edges()
 	var path := client.resolved_config_path()
-	var path_hint := "" if path.is_empty() else " Inspect %s and remove the godot-ai entry by hand if needed." % path
+	var path_hint := ""
+	if not probe_note.is_empty():
+		path_hint = " Probe reports: %s — remove the godot-ai entry from that scope by hand if needed." % probe_note
+	elif not path.is_empty():
+		path_hint = " Inspect %s and remove the godot-ai entry by hand if needed." % path
 	return {
 		"status": "error",
 		"message": "%s reported %s ok but verification still reads %s (expected %s).%s" % [
