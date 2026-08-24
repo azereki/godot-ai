@@ -600,6 +600,8 @@ func test_successful_configure_discloses_the_scope_sweep_on_the_row() -> void:
 	## scope, including a .mcp.json in whatever directory the editor happened to
 	## be launched from, and told the user nothing. The green row carries that.
 	_dock._build_ui()
+	assert_true(_dock._client_rows.has("claude_code"),
+		"claude_code is a static registry entry and must have a row")
 	if not _dock._client_rows.has("claude_code"):
 		return
 	var row: Dictionary = _dock._client_rows["claude_code"]
@@ -608,7 +610,7 @@ func test_successful_configure_discloses_the_scope_sweep_on_the_row() -> void:
 
 	_dock._apply_row_status("claude_code", McpClient.Status.CONFIGURED, note)
 	var label := (row["name_label"] as Label).text
-	assert_contains(label, "cleared",
+	assert_contains(label, note,
 		"a successful configure must disclose the sweep it just performed")
 	assert_contains(label, "project",
 		"the destructive pass is the project one — the row has to name it")

@@ -852,13 +852,21 @@ static func _post_state_path_hint(client: Client, resolved_scope: String) -> Str
 ## disclosure. Empty for descriptors without a scope token: their single
 ## implicit pass removes exactly the entry the register is about to rewrite,
 ## which needs no warning (the same rule `_sweep_caveat` applies).
+##
+## "attempted", not "cleared": `CliStrategy.configure` discards every
+## pre-cleanup result, and `mcp remove` exits non-zero for an absent entry as
+## well as for a real failure, so a timed-out or failed remove leaves the scope
+## untouched while the register still returns ok. The note names what ran,
+## not what it can prove.
 static func configure_sweep_note(id: String) -> String:
 	var client := ClientRegistry.get_by_id(id)
 	if client == null or client.config_type != "cli":
 		return ""
 	if client.cli_unregister_template.is_empty() or not CliStrategy.uses_scope_token(client):
 		return ""
-	return "cleared %s from %s" % [SERVER_NAME, ", ".join(CliStrategy.cleanup_scopes(client))]
+	return "attempted to clear %s from %s" % [
+		SERVER_NAME, ", ".join(CliStrategy.cleanup_scopes(client)),
+	]
 
 
 static func manual_command(id: String) -> String:

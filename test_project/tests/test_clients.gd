@@ -2699,6 +2699,8 @@ func test_configure_sweep_note_names_every_cleared_scope() -> void:
 	assert_true(client != null, "claude_code must be registered")
 	var note := McpClientConfigurator.configure_sweep_note("claude_code")
 	assert_contains(note, "godot-ai", "the note must name the key Configure deletes")
+	assert_contains(note, "attempted to clear",
+		"configure() discards every remove result, so the note must not claim the scopes were cleared")
 	for scope in McpCliStrategy.cleanup_scopes(client):
 		assert_contains(note, String(scope),
 			"the note must name every scope Configure clears, including %s" % scope)
