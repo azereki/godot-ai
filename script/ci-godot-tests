@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Run Godot handler tests via MCP in CI.
-# Expects: Python server running on port 8000, Godot editor launched with plugin.
+# Expects: Python server reachable at $MCP_SERVER_URL (default :8000, set in
+# _ci_env.sh), Godot editor launched with plugin.
 # This script waits for the plugin to connect before running tests.
 set -euo pipefail
 source "$(dirname "$0")/_ci_env.sh"
 
-SERVER_URL="http://127.0.0.1:8000/mcp"
+SERVER_URL="$MCP_SERVER_URL"
 HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
 
 # Wait for Godot plugin to connect (session_manage(op="list") returns count > 0)
-echo "Waiting for Godot plugin to connect..."
+echo "Waiting for Godot plugin to connect (server: $SERVER_URL)..."
 for i in $(seq 1 60); do
   # `|| true` neutralizes the pipeline status under `set -euo pipefail`:
   # a down server (curl exit 7) or a missing header (grep exit 1) must fall
@@ -56,7 +57,7 @@ for line in raw.split('\n'):
 done
 
 if [ -z "${SESSION_ID:-}" ]; then
-  echo "ERROR: Could not connect to MCP server"
+  echo "ERROR: Could not connect to MCP server at $SERVER_URL"
   exit 1
 fi
 
@@ -82,7 +83,9 @@ for line in raw.split('\n'):
 # silently pass the [ -eq ] test failure through (audit backlog).
 case "$FINAL_COUNT" in (""|*[!0-9]*) FINAL_COUNT=0;; esac
 if [ "$FINAL_COUNT" -eq 0 ] 2>/dev/null; then
-  echo "ERROR: No Godot session connected after 60 attempts. Plugin may not have loaded."
+  echo "ERROR: No Godot session connected after 60 attempts at $SERVER_URL."
+  echo "  Either the plugin did not load, or the editor's server is on another port:"
+  echo "  check the editor log's 'MCP | started server ... --port N' line and set MCP_SERVER_URL."
   exit 1
 fi
 
