@@ -1932,10 +1932,26 @@ func test_scope_probe_verdict_absent_entry_and_drift() -> void:
 		McpClient.Status.NOT_CONFIGURED,
 	)
 	## Right scope, wrong launcher — still drift, same as the JSON path.
-	assert_eq(
-		McpCliStrategy._scope_probe_verdict(0, _PROBE_PROJECT, "project", "/somewhere/else/uvx").get("status"),
-		McpClient.Status.CONFIGURED_MISMATCH,
+	var drifted := McpCliStrategy._scope_probe_verdict(
+		0, _PROBE_PROJECT, "project", "/somewhere/else/uvx"
 	)
+	assert_eq(drifted.get("status"), McpClient.Status.CONFIGURED_MISMATCH)
+	## #879 regression guard: a launcher drift sends the user to the wrong file
+	## just as readily as a scope drift does. The `Scope:` label is right there
+	## in the probe output, so the verdict must carry it — without it
+	## `_post_state_path_hint` falls back to `resolved_config_path()` and names
+	## ~/.claude.json for an entry that actually lives in .mcp.json.
+	assert_eq(drifted.get("resolved_scope"), "project",
+		"a target drift must still report the scope the entry resolved from")
+
+	## ...but only when the label actually parsed. A drift with no readable
+	## scope must not fabricate one; the hint degrades to the historical path.
+	var drift_no_label := McpCliStrategy._scope_probe_verdict(
+		0, "godot-ai:\n  Command: /somewhere/else/uvx\n", "project", _PROBE_TARGET
+	)
+	assert_eq(drift_no_label.get("status"), McpClient.Status.CONFIGURED_MISMATCH)
+	assert_false(drift_no_label.has("resolved_scope"),
+		"an unparseable Scope line must not invent a scope for the path hint")
 	## A future CLI that stops printing a Scope line must degrade to the
 	## target check, not invent a red dot on a working install.
 	var no_label := "godot-ai:\n  Command: %s\n" % _PROBE_TARGET
@@ -2652,9 +2668,52 @@ func test_post_state_path_hint_follows_resolved_scope() -> void:
 	var local_hint := McpClientConfigurator._post_state_path_hint(client, "local")
 	assert_contains(local_hint, ".claude.json",
 		"local scope lives in a per-project block of the user-scope file")
+	## Which block, though: `local` is keyed by the CLI's working directory, the
+	## same cwd distinction the project branch spells out. "this project's
+	## block" sends a user who launched the editor from elsewhere to a key that
+	## does not exist while the entry sits under the launch directory.
+	assert_contains(local_hint, "launched from",
+		"the local hint must name the launch directory, not this project")
+
+	## Every other branch guards an unresolvable path; this one used to render
+	## " ... in  and remove ..." with a hole where the path belongs. Uses a
+	## scratch descriptor rather than clearing `path_template` on the registered
+	## claude_code, which the registry hands out by reference (#878).
+	var unresolvable := _make_scope_cli_client(_scratch_dir.path_join("hint_no_path.json"))
+	unresolvable.path_template = {}
+	assert_eq(McpClientConfigurator._post_state_path_hint(unresolvable, "local"), "",
+		"an unresolvable path yields no hint rather than a sentence with a hole")
+
 	var default_hint := McpClientConfigurator._post_state_path_hint(client, "")
 	assert_contains(default_hint, client.resolved_config_path(),
 		"no probe scope keeps the historical resolved-path hint")
+
+
+func test_configure_sweep_note_names_every_cleared_scope() -> void:
+	## #877: the manual-command panel listing the pre-cleanup removes is only
+	## shown when Configure FAILS, which left the success path — the one where
+	## the sweep actually deleted `godot-ai` from a .mcp.json that may belong to
+	## an unrelated repository — with no disclosure at all. The row note is that
+	## disclosure, so it must name the same scopes the sweep actually walks.
+	var client := McpClientRegistry.get_by_id("claude_code")
+	assert_true(client != null, "claude_code must be registered")
+	var note := McpClientConfigurator.configure_sweep_note("claude_code")
+	assert_contains(note, "godot-ai", "the note must name the key Configure deletes")
+	for scope in McpCliStrategy.cleanup_scopes(client):
+		assert_contains(note, String(scope),
+			"the note must name every scope Configure clears, including %s" % scope)
+
+	## Only `{scope}` CLI descriptors sweep beyond the entry they rewrite. A
+	## single implicit pass removes exactly what the register puts back, so
+	## everything else stays silent — the same rule `_sweep_caveat` applies.
+	for id in McpClientConfigurator.client_ids():
+		var other := McpClientRegistry.get_by_id(id)
+		if other != null and other.config_type != "cli":
+			assert_eq(McpClientConfigurator.configure_sweep_note(id), "",
+				"%s is not a CLI client and must not claim a scope sweep" % id)
+
+	assert_eq(McpClientConfigurator.configure_sweep_note("no_such_client_xyz"), "",
+		"an unknown id yields no note rather than an error string")
 
 
 func test_verify_post_state_errors_when_remove_left_entry_behind() -> void:

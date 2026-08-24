@@ -131,8 +131,9 @@ currently selected, so switch back before removing if you changed the setting.
 > a repository keeps a hand-maintained `godot-ai` entry in a checked-in
 > `.mcp.json`, pressing **Configure** deletes that entry and leaves the file
 > dirty. Only a key named `godot-ai` is touched; other servers are left in
-> place. The dock's "Run this manually" text lists these removes alongside the
-> register line so you can see exactly what Configure will run.
+> place. After a successful **Configure** the client's row names the scopes it
+> cleared; if Configure fails, the dock's "Run this manually" text lists these
+> removes alongside the register line so you can run them yourself.
 
 Two caveats for `project` scope:
 

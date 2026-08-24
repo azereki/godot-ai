@@ -314,16 +314,21 @@ static func _scope_probe_verdict(
 ) -> Dictionary:
 	if exit_code != 0:
 		return _status_details(McpClient.Status.NOT_CONFIGURED)
-	if not expected_target.is_empty() and text.find(expected_target) < 0:
-		return _status_details(McpClient.Status.CONFIGURED_MISMATCH)
+	## `resolved_scope` rides along as structured data so callers can act on it
+	## — `_verify_post_state`'s path hint needs to know WHICH scope survived to
+	## name the right file, and parsing it back out of the human-facing message
+	## would couple that hint to this wording (#879). Parsed BEFORE the target
+	## check so both mismatch paths carry it: an entry whose launcher drifted
+	## sends the user to the wrong file just as readily as one whose scope did.
 	var resolved := _scope_from_probe_output(text)
+	if not expected_target.is_empty() and text.find(expected_target) < 0:
+		var drifted := _status_details(McpClient.Status.CONFIGURED_MISMATCH)
+		if not resolved.is_empty():
+			drifted["resolved_scope"] = resolved
+		return drifted
 	if resolved.is_empty():
 		return _status_details(McpClient.Status.CONFIGURED)
 	if resolved != expected_scope:
-		## `resolved_scope` rides along as structured data so callers can act
-		## on it — `_verify_post_state`'s path hint needs to know WHICH scope
-		## survived to name the right file, and parsing it back out of the
-		## human-facing message would couple that hint to this wording (#879).
 		var details := _status_details(
 			McpClient.Status.CONFIGURED_MISMATCH,
 			"registered at %s scope, not %s" % [resolved, expected_scope],

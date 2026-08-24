@@ -828,15 +828,37 @@ static func _post_state_path_hint(client: Client, resolved_scope: String) -> Str
 				+ " by hand if needed."
 			)
 		"local":
+			var local_path := client.resolved_config_path()
+			if local_path.is_empty():
+				return ""
 			return (
-				" The surviving entry is local-scoped: inspect this project's block in %s"
-				+ " and remove the godot-ai entry by hand if needed."
-			) % client.resolved_config_path()
+				" The surviving entry is local-scoped: inspect the block for the"
+				+ " directory the editor was launched from in %s and remove the"
+				+ " godot-ai entry by hand if needed."
+			) % local_path
 		_:
 			var path := client.resolved_config_path()
 			if path.is_empty():
 				return ""
 			return " Inspect %s and remove the godot-ai entry by hand if needed." % path
+
+
+## #877: Configure's first act is the all-scope pre-cleanup — it deletes the
+## `godot-ai` entry from every scope the descriptor can write to, including a
+## `.mcp.json` resolved against the CLI's working directory, which need not be
+## this project's folder. The manual-command panel that spells those removes
+## out is only shown when Configure FAILS (`mcp_dock.gd`), so on the success
+## path — the one where the sweep actually ran — this note is its only
+## disclosure. Empty for descriptors without a scope token: their single
+## implicit pass removes exactly the entry the register is about to rewrite,
+## which needs no warning (the same rule `_sweep_caveat` applies).
+static func configure_sweep_note(id: String) -> String:
+	var client := ClientRegistry.get_by_id(id)
+	if client == null or client.config_type != "cli":
+		return ""
+	if client.cli_unregister_template.is_empty() or not CliStrategy.uses_scope_token(client):
+		return ""
+	return "cleared %s from %s" % [SERVER_NAME, ", ".join(CliStrategy.cleanup_scopes(client))]
 
 
 static func manual_command(id: String) -> String:
