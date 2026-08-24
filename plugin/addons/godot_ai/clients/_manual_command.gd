@@ -66,23 +66,17 @@ static func _build_cli(
 			var parts: Array[String] = [short_name]
 			for arg in args:
 				parts.append(String(arg))
-			cmd = _format_shell_command(parts, shell_kind)
+			var lines := _sweep_lines(client, server_name, server_url, short_name, shell_kind)
+			lines.append(_render_command_line(parts, shell_kind))
+			cmd = _format_shell_block(lines, shell_kind) + _sweep_caveat(client)
 	else:
 		var args := McpCliStrategy.format_args(client.cli_register_template, server_name, server_url)
 		var parts: Array[String] = [short_name]
 		for arg in args:
 			parts.append(String(arg))
-		cmd = _format_shell_command(parts, shell_kind)
-	## #877: Configure runs more than the line above. For a `{scope}` descriptor
-	## it first runs the unregister template once per scope in CLIENT_SCOPES, so
-	## pressing Configure at ANY setting — the default `user` included — deletes
-	## a `godot-ai` entry from every scope, including one a team keeps by hand in
-	## a checked-in `.mcp.json`. Rendering only the register line made this hint
-	## disagree with what the button actually does, which is the worst property a
-	## "run this manually" string can have.
-	var sweep := _scope_sweep_note(client, server_name, server_url, short_name, shell_kind)
-	if not sweep.is_empty():
-		cmd = "%s\n\n%s" % [cmd, sweep]
+		var lines := _sweep_lines(client, server_name, server_url, short_name, shell_kind)
+		lines.append(_render_command_line(parts, shell_kind))
+		cmd = _format_shell_block(lines, shell_kind) + _sweep_caveat(client)
 	# #463: a CLI client with a JSON fallback (Claude Code) may have no `claude`
 	# binary at all — e.g. installed only as a VS Code/Cursor extension. The CLI
 	# line above is useless to that user, so also show the config-file edit that
@@ -94,43 +88,48 @@ static func _build_cli(
 	return cmd
 
 
-## Render the pre-cleanup removes Configure runs before registering a `{scope}`
-## descriptor. Shares `_shell_display_arg` with `_format_shell_command` but not
-## its label — these lines belong under the caller's own heading, and repeating
-## "Run in PowerShell:" four times would bury the one line that registers.
-##
-## Returns "" for descriptors without the token: those keep the single
-## implicit-scope pass they always had, which removes exactly the entry the
-## register is about to rewrite and so has no side effect worth surfacing.
-static func _scope_sweep_note(
+## #877: Configure's first act is the pre-cleanup — it runs the unregister
+## template once per scope the descriptor can write to (`_cli_strategy.gd`
+## `configure`) before registering. Rendering only the register line made this
+## hint disagree with what the button does, which is the worst property a
+## "run this manually" string can have. The removes go in the SAME shell block
+## as the register, in the order Configure runs them, so the whole thing stays
+## one copy-paste rather than a labelled command plus loose prose.
+static func _sweep_lines(
 	client: McpClient,
 	server_name: String,
 	server_url: String,
 	short_name: String,
 	shell_kind: String,
-) -> String:
-	if client.cli_unregister_template.is_empty():
-		return ""
-	if not McpCliStrategy.uses_scope_token(client):
-		return ""
+) -> Array[String]:
 	var lines: Array[String] = []
-	for scope in McpSettings.CLIENT_SCOPES:
+	if client.cli_unregister_template.is_empty():
+		return lines
+	for pre_scope in McpCliStrategy.cleanup_scopes(client):
 		var args := McpCliStrategy.format_args(
-			client.cli_unregister_template, server_name, server_url, {}, String(scope)
+			client.cli_unregister_template, server_name, server_url, {}, pre_scope
 		)
-		var rendered: Array[String] = [_shell_display_arg(short_name, shell_kind)]
+		var parts: Array[String] = [short_name]
 		for arg in args:
-			rendered.append(_shell_display_arg(String(arg), shell_kind))
-		lines.append(" ".join(rendered))
-	if lines.is_empty():
+			parts.append(String(arg))
+		lines.append(_render_command_line(parts, shell_kind))
+	return lines
+
+
+## The one thing the commands themselves cannot show: that the project pass
+## resolves `.mcp.json` against the CLI's cwd, so it can delete an entry from a
+## repository that has nothing to do with this project. Only for `{scope}`
+## descriptors — a single implicit-scope pass removes exactly the entry the
+## register is about to rewrite, which needs no warning. Kept outside the shell
+## block so pasting the block never picks up prose.
+static func _sweep_caveat(client: McpClient) -> String:
+	if client.cli_unregister_template.is_empty() or not McpCliStrategy.uses_scope_token(client):
 		return ""
 	return (
-		"Configure also runs these first, clearing %s out of every scope. "
-		% server_name
-		+ "The project-scope line rewrites the .mcp.json in the editor's working "
-		+ "directory — which is wherever the editor was launched from, not "
-		+ "necessarily this project — so it will drop a hand-maintained %s entry there:\n%s"
-		% [server_name, "\n".join(lines)]
+		"\n\nThe project-scope remove rewrites the .mcp.json in the directory the"
+		+ " editor was launched from — not necessarily this project — so it drops a"
+		+ " hand-maintained godot-ai entry there. Other servers in that file are left"
+		+ " alone."
 	)
 
 
@@ -142,11 +141,22 @@ static func _shell_kind_for_platform() -> String:
 ## POSIX and PowerShell use different escaping for embedded single quotes, so
 ## presenting the command without its target shell invites a bad copy/paste.
 static func _format_shell_command(parts: Array[String], shell_kind: String) -> String:
+	return _format_shell_block([_render_command_line(parts, shell_kind)], shell_kind)
+
+
+## One label over N command lines. The label is per-block, not per-line:
+## repeating "Run in PowerShell:" four times would bury the single line that
+## actually registers.
+static func _format_shell_block(lines: Array[String], shell_kind: String) -> String:
+	var label := "Run in PowerShell:" if shell_kind == SHELL_POWERSHELL else "Run in a POSIX shell:"
+	return "%s\n%s" % [label, "\n".join(lines)]
+
+
+static func _render_command_line(parts: Array[String], shell_kind: String) -> String:
 	var rendered: Array[String] = []
 	for part in parts:
 		rendered.append(_shell_display_arg(part, shell_kind))
-	var label := "Run in PowerShell:" if shell_kind == SHELL_POWERSHELL else "Run in a POSIX shell:"
-	return "%s\n%s" % [label, " ".join(rendered)]
+	return " ".join(rendered)
 
 
 ## Quote one argv element for the paste-into-terminal hint. Single-quoted
