@@ -16,11 +16,19 @@ var _scratch_dir: String
 ## Snapshot the user's live port overrides at suite entry so our
 ## per-test set/clear dance doesn't leave the editor pointing at the wrong
 ## port if a test fails mid-flight.
+##
+## Presence is tracked alongside value for each key: a `null` snapshot means
+## "no such setting", and writing the default back into it would leave the
+## suite having *created* an EditorSetting it found absent. Same idiom as
+## test_allow_hosts.gd and test_dock.gd's `_restore_mcp_logging_setting`.
+var _had_http_port_setting := false
 var _saved_http_port: Variant = null
+var _had_ws_port_setting := false
 var _saved_ws_port: Variant = null
 ## Same reason as the ports: these tests drive godot_ai/mcp_client_scope
 ## through its valid and invalid values and must not leave the editor
 ## registering at a scope the user never chose.
+var _had_client_scope_setting := false
 var _saved_client_scope: Variant = null
 
 
@@ -34,11 +42,14 @@ func suite_setup(_ctx: Dictionary) -> void:
 	DirAccess.make_dir_recursive_absolute(_scratch_dir)
 	var es := EditorInterface.get_editor_settings()
 	if es != null:
-		if es.has_setting(McpSettings.SETTING_HTTP_PORT):
+		_had_http_port_setting = es.has_setting(McpSettings.SETTING_HTTP_PORT)
+		if _had_http_port_setting:
 			_saved_http_port = es.get_setting(McpSettings.SETTING_HTTP_PORT)
-		if es.has_setting(McpClientConfigurator.SETTING_WS_PORT):
+		_had_ws_port_setting = es.has_setting(McpClientConfigurator.SETTING_WS_PORT)
+		if _had_ws_port_setting:
 			_saved_ws_port = es.get_setting(McpClientConfigurator.SETTING_WS_PORT)
-		if es.has_setting(McpSettings.SETTING_CLIENT_SCOPE):
+		_had_client_scope_setting = es.has_setting(McpSettings.SETTING_CLIENT_SCOPE)
+		if _had_client_scope_setting:
 			_saved_client_scope = es.get_setting(McpSettings.SETTING_CLIENT_SCOPE)
 
 
@@ -3996,14 +4007,14 @@ func _restore_port_settings() -> void:
 	var es := EditorInterface.get_editor_settings()
 	if es == null:
 		return
-	if _saved_http_port == null:
-		es.set_setting(McpSettings.SETTING_HTTP_PORT, McpClientConfigurator.DEFAULT_HTTP_PORT)
-	else:
+	if _had_http_port_setting:
 		es.set_setting(McpSettings.SETTING_HTTP_PORT, _saved_http_port)
-	if _saved_ws_port == null:
-		es.set_setting(McpClientConfigurator.SETTING_WS_PORT, McpClientConfigurator.DEFAULT_WS_PORT)
-	else:
+	elif es.has_setting(McpSettings.SETTING_HTTP_PORT):
+		es.erase(McpSettings.SETTING_HTTP_PORT)
+	if _had_ws_port_setting:
 		es.set_setting(McpClientConfigurator.SETTING_WS_PORT, _saved_ws_port)
+	elif es.has_setting(McpClientConfigurator.SETTING_WS_PORT):
+		es.erase(McpClientConfigurator.SETTING_WS_PORT)
 	_restore_client_scope()
 
 
@@ -4014,7 +4025,7 @@ func _restore_client_scope() -> void:
 	var es := EditorInterface.get_editor_settings()
 	if es == null:
 		return
-	if _saved_client_scope == null:
-		es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, McpSettings.DEFAULT_CLIENT_SCOPE)
-	else:
+	if _had_client_scope_setting:
 		es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, _saved_client_scope)
+	elif es.has_setting(McpSettings.SETTING_CLIENT_SCOPE):
+		es.erase(McpSettings.SETTING_CLIENT_SCOPE)
