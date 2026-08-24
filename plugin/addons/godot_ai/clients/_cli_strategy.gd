@@ -320,10 +320,16 @@ static func _scope_probe_verdict(
 	if resolved.is_empty():
 		return _status_details(McpClient.Status.CONFIGURED)
 	if resolved != expected_scope:
-		return _status_details(
+		## `resolved_scope` rides along as structured data so callers can act
+		## on it — `_verify_post_state`'s path hint needs to know WHICH scope
+		## survived to name the right file, and parsing it back out of the
+		## human-facing message would couple that hint to this wording (#879).
+		var details := _status_details(
 			McpClient.Status.CONFIGURED_MISMATCH,
 			"registered at %s scope, not %s" % [resolved, expected_scope],
 		)
+		details["resolved_scope"] = resolved
+		return details
 	return _status_details(McpClient.Status.CONFIGURED)
 
 
@@ -333,6 +339,12 @@ static func _scope_probe_verdict(
 ## the JSON-fallback file is still a valid place to read status back from.
 static func uses_scope_token(client: McpClient) -> bool:
 	return client.cli_register_template.has(SCOPE_TOKEN)
+
+
+## Public view of the pre-cleanup sweep, for the manual-command text: what the
+## dock tells the user to run has to match what Configure actually runs (#877).
+static func cleanup_scopes(client: McpClient) -> Array[String]:
+	return _cleanup_scopes(client)
 
 
 ## Scopes the configure pre-cleanup removes from. A descriptor without the

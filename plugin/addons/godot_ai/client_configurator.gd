@@ -801,19 +801,7 @@ static func _verify_post_state(
 	var actual := details.get("status", Client.Status.NOT_CONFIGURED)
 	if actual == expected:
 		return result
-	## #879: prefer whatever the probe actually learned. `resolved_config_path()`
-	## is always `path_template` (~/.claude.json for Claude Code), which is the
-	## wrong place to send the user when the entry that survived lives in
-	## another scope — a project-scope survivor is in <cwd>/.mcp.json, and the
-	## scope probe already put "registered at user scope, not project" in
-	## error_msg. Naming a file with nothing in it is worse than naming none.
-	var probe_note := str(details.get("error_msg", "")).strip_edges()
-	var path := client.resolved_config_path()
-	var path_hint := ""
-	if not probe_note.is_empty():
-		path_hint = " Probe reports: %s — remove the godot-ai entry from that scope by hand if needed." % probe_note
-	elif not path.is_empty():
-		path_hint = " Inspect %s and remove the godot-ai entry by hand if needed." % path
+	var path_hint := _post_state_path_hint(client, str(details.get("resolved_scope", "")))
 	return {
 		"status": "error",
 		"message": "%s reported %s ok but verification still reads %s (expected %s).%s" % [
@@ -822,6 +810,33 @@ static func _verify_post_state(
 			path_hint,
 		],
 	}
+
+
+## Where to send the user when verification finds an entry that should not be
+## there. `resolved_config_path()` is `path_template` — right only for the
+## default user scope. Naming ~/.claude.json for a project-scope survivor sends
+## them to a file with nothing in it, which is worse than naming no file at all
+## (#879). The scope probe supplies `resolved_scope`; `path_template` has no
+## project-relative token (see `_note_unhonoured_scope`), so the project case is
+## described rather than resolved to a path.
+static func _post_state_path_hint(client: Client, resolved_scope: String) -> String:
+	match resolved_scope:
+		"project":
+			return (
+				" The surviving entry is project-scoped: inspect the .mcp.json in the"
+				+ " directory the editor was launched from and remove the godot-ai entry"
+				+ " by hand if needed."
+			)
+		"local":
+			return (
+				" The surviving entry is local-scoped: inspect this project's block in %s"
+				+ " and remove the godot-ai entry by hand if needed."
+			) % client.resolved_config_path()
+		_:
+			var path := client.resolved_config_path()
+			if path.is_empty():
+				return ""
+			return " Inspect %s and remove the godot-ai entry by hand if needed." % path
 
 
 static func manual_command(id: String) -> String:
