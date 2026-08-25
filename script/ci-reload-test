@@ -5,11 +5,12 @@
 # 3. Checks the log buffer is fresh (proves handlers were rebuilt)
 # 4. Finds the cube via the NEW plugin (proves scene tree continuity)
 #
-# Expects: Python server running on port 8000, Godot editor with plugin connected.
+# Expects: Python server reachable at $MCP_SERVER_URL (default :8000, set in
+# _ci_env.sh), Godot editor with plugin connected.
 set -euo pipefail
 source "$(dirname "$0")/_ci_env.sh"
 
-SERVER_URL="http://127.0.0.1:8000/mcp"
+SERVER_URL="$MCP_SERVER_URL"
 HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
 REQ_ID=0
 

@@ -9,7 +9,7 @@
 # run, the server fails the in-flight future, and the tool call returns a
 # disconnect error — which this script reports as the reproduced bug.
 #
-# Expects (same contract as ci-godot-tests): Python server on :8000, Godot
+# Expects (same contract as ci-godot-tests): Python server at $MCP_SERVER_URL, Godot
 # editor running with the plugin connected. The fixture is removed on exit
 # via trap, pass or fail.
 #
@@ -27,7 +27,7 @@ FIXTURE_DST="$REPO_ROOT/test_project/tests/test_mcp_slow_smoke.gd"
 SUITE_NAME="mcp_slow_smoke"
 EXPECTED_TESTS=25
 
-SERVER_URL="http://127.0.0.1:8000/mcp"
+SERVER_URL="$MCP_SERVER_URL"
 HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
 
 cleanup() {

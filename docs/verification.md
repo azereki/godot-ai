@@ -31,6 +31,19 @@ script/ci-godot-tests    # waits for the plugin, opens main.tscn, runs test_run,
                          # prints {suite}.{test}: {message} for each failure
 ```
 
+The probe above and every `script/ci-*` runner assume the server is on
+`:8000`, the plugin's default. If the connected editor's `godot_ai/http_port`
+is something else — the editor log names it in its
+`MCP | started server ... --port N` line — point them at it:
+
+```bash
+MCP_SERVER_URL=http://127.0.0.1:8123/mcp script/ci-godot-tests
+```
+
+The symptom of forgetting is a healthy editor log next to
+`No Godot session connected after 60 attempts`: the runner was polling a
+different server the whole time.
+
 **With several editors connected, pin the one you mean.** Multiple editors
 sharing port 8000 is a supported setup (see [worktrees](worktrees.md)), and
 `scene_open` would otherwise land in whichever session is active — yanking
@@ -59,8 +72,14 @@ editor to *look at* — the step 6 smoke test — or when nothing is running yet
    # macOS GUI
    /Applications/Godot_mono.app/Contents/MacOS/Godot --editor --path test_project/ &
    # headless (CI, containers, no display)
-   godot --headless --path test_project --editor >/tmp/godot-editor.log 2>&1 &
+   GODOT_AI_ALLOW_HEADLESS=1 GODOT_AI_DISABLE_TELEMETRY=true \
+     godot --headless --path test_project --editor >/tmp/godot-editor.log 2>&1 &
    ```
+   The headless form needs `GODOT_AI_ALLOW_HEADLESS=1`: without it the plugin
+   logs `MCP | plugin disabled in headless mode`, starts no server, and nothing
+   ever connects (see [server lifecycle](server-lifecycle.md)).
+   `GODOT_AI_DISABLE_TELEMETRY=true` keeps a local headless run out of
+   production telemetry, as `script/_ci_env.sh` does for the CI runners.
    Note the job's PID; `kill` it when you're done, and check `/tmp/godot-editor.log` if the plugin never connects.
 4. `session_activate` the test_project session if multiple editors are connected
 5. `test_run` via MCP — all GDScript tests pass (0 failures). `script/ci-godot-tests` does 3–5 in one command.
