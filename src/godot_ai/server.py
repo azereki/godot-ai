@@ -302,6 +302,11 @@ _INSTRUCTIONS_FOOTER = (
     "  godot://script/{path}, godot://project/info, godot://project/settings,\n"
     "  godot://materials, godot://input_map, godot://performance,\n"
     "  godot://test/results, godot://custom-tools\n\n"
+    "Code-mode adapters keep server and member names separate: "
+    "call('godot-ai', 'editor_state', {}) and "
+    "readResource('godot-ai', 'godot://scene/current'). Never prefix the "
+    "second argument with 'godot-ai/' and do not invent legacy names such as "
+    "get_editor_state or get_current_scene.\n\n"
     "Always connect to an editor session first (session_activate or "
     'session_manage(op="list")). Write operations require session readiness; '
     "check editor_state if a call is rejected as 'not writable'. After driving a "
@@ -314,7 +319,7 @@ def build_instructions(exclude: set[str]) -> str:
     """Build the MCP ``instructions`` string for one exclusion set.
 
     Pure function of ``exclude`` so tests can pin both outputs: with no
-    exclusions the result is byte-identical to the historical static text;
+    exclusions the result matches the frozen current capability guidance;
     with exclusions, the excluded domains' named verbs and rollup lines are
     omitted, the named-verb count reflects what is actually registered, and
     a trailing section names the exclusions (#772).

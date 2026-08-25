@@ -47,6 +47,12 @@ const SUGGEST_PORT_MAX_PROBES := 64
 const SETTING_WS_PORT := "godot_ai/ws_port"
 const SETTING_STARTUP_TRACE := "godot_ai/log_startup_timing"
 const SETTING_KEEP_SERVER_ON_EXIT := "godot_ai/keep_server_on_exit"
+## External cwd the user can set when an MCP client (Pi, code-server, …) reads
+## project-tier config files from a directory this editor can't see. The
+## merge-tier strategies include it as an extra `_project_candidate_paths` root
+## so project overrides there are detected instead of silently shadowed by a
+## global-tier write. Codex-review finding F1.
+const SETTING_EXTERNAL_CLIENT_CWD := "godot_ai/external_client_cwd"
 const _DISCOVERY_TIMEOUT_MS := 3000
 ## Codex launches Windows console-subsystem MCP commands in a visible terminal.
 ## A GUI-subsystem Python keeps the bridge attached to Codex's redirected MCP
@@ -112,6 +118,7 @@ static func ensure_settings_registered() -> void:
 	_register_bool_setting(es, SETTING_STARTUP_TRACE, false)
 	_register_bool_setting(es, SETTING_KEEP_SERVER_ON_EXIT, false)
 	_register_client_scope_setting(es)
+	_register_string_setting(es, SETTING_EXTERNAL_CLIENT_CWD, "")
 
 
 static func _register_port_setting(es: EditorSettings, key: String, default_port: int) -> void:
@@ -149,6 +156,21 @@ static func _register_bool_setting(es: EditorSettings, key: String, default_valu
 	es.add_property_info({
 		"name": key,
 		"type": TYPE_BOOL,
+	})
+
+
+static func _register_string_setting(es: EditorSettings, key: String, default_value: String) -> void:
+	## Same idempotent set-then-hint dance as the bool helper; `PROPERTY_HINT_NONE`
+	## leaves the editor's plain text-input widget in place (the cwd string is
+	## freeform). The hint-string slot is required by the API even when empty.
+	if not es.has_setting(key):
+		es.set_setting(key, default_value)
+	es.set_initial_value(key, default_value, false)
+	es.add_property_info({
+		"name": key,
+		"type": TYPE_STRING,
+		"hint": PROPERTY_HINT_NONE,
+		"hint_string": "",
 	})
 
 
@@ -266,6 +288,7 @@ static func capture_launch_context() -> Dictionary:
 		"allow_dev_venv": mode_override() != "user",
 		"platform": OS.get_name(),
 		"server_url": "http://127.0.0.1:%d/mcp" % captured_http_port,
+		"project_roots": capture_project_roots(),
 		## The opt-out must ride the attach argv: the client spawns the bridge
 		## (and the bridge its backend) with no editor in the loop, so the
 		## env-injection path in server_lifecycle.gd never runs for them.
@@ -275,6 +298,51 @@ static func capture_launch_context() -> Dictionary:
 	_launch_context_snapshot = context.duplicate(true)
 	_launch_context_snapshot_mutex.unlock()
 	return context
+
+
+## Resolve roots used by cwd-relative client project config tiers while the
+## engine singletons are safe to access. Workers receive this immutable snapshot.
+static func capture_project_roots() -> PackedStringArray:
+	var current_access := DirAccess.open(".")
+	var current_root := "" if current_access == null else current_access.get_current_dir().simplify_path()
+	var project_root := ProjectSettings.globalize_path("res://").simplify_path()
+	# Codex F1: when the user sets `godot_ai/external_client_cwd` we probe that
+	# directory in addition to the two guessed roots. The setter / setter-snapshot
+	# pathway is the same as the existing EditorSettings (warm_env_snapshot
+	# pre-warms this key so worker-thread callers see the snapshot, not the live
+	# EditorInterface). Empty string is filtered out by `_canonicalize_roots_for_test`.
+	var external_cwd := str(_editor_setting_lookup(SETTING_EXTERNAL_CLIENT_CWD))
+	return _canonicalize_roots_for_test(PackedStringArray([current_root, project_root, external_cwd]))
+
+
+## Canonicalize a list of root paths to one filesystem representation per
+## directory and deduplicate. `ProjectSettings.globalize_path` maps any
+## `res://` / `user://` form to the absolute path and is idempotent on an
+## already-absolute path, so a `res://`-form candidate and its absolute twin
+## collapse to the same entry. Without this pass, `_project_candidate_paths`
+## would probe `<root>/.pi/mcp.json` against both representations of the same
+## directory and `manual_target_details` would mis-report a single project
+## override as multiple tiers (codex-review finding F4). Public-ish seam
+## (named `_..._for_test`) so the clients suite can pin the behaviour without
+## having to mock `DirAccess.open(".")`.
+static func _canonicalize_roots_for_test(raws: PackedStringArray) -> PackedStringArray:
+	var seen := {}
+	var roots := PackedStringArray()
+	for raw in raws:
+		var s := str(raw).strip_edges()
+		if s.is_empty():
+			continue
+		var canon := ProjectSettings.globalize_path(s).simplify_path()
+		if canon.is_empty() or seen.has(canon):
+			continue
+		seen[canon] = true
+		roots.append(canon)
+	return roots
+
+
+static func _project_roots_from_context(context: Dictionary) -> PackedStringArray:
+	var roots = context.get("project_roots", PackedStringArray())
+	return roots if roots is PackedStringArray else PackedStringArray()
 
 
 ## Read the `godot_ai/allow_remote_hosts` EditorSetting as a canonicalized
@@ -371,13 +439,13 @@ static func configure(id: String, url: String = "", launch_context: Dictionary =
 		if client.command_shape != Client.CommandShape.NONE
 		else {}
 	)
-	var result := _dispatch_configure(client, url, launch)
+	var result := _dispatch_configure(client, url, launch, context)
 	## Trust-but-verify: a strategy may report ok and have actually written the
 	## file, yet the entry is missing/stale on the read-back path — most often
 	## because the user's installed client is reading a different file than
 	## `path_template` resolves to (issue #201). Re-read the live state and
 	## surface a clear error before the dock reports a bogus green dot.
-	return _verify_post_state(client, result, Client.Status.CONFIGURED, url, "configure", launch)
+	return _verify_post_state(client, result, Client.Status.CONFIGURED, url, "configure", launch, context)
 
 
 static func check_status(id: String) -> Client.Status:
@@ -458,6 +526,7 @@ static func warm_env_snapshot() -> void:
 	_editor_setting_lookup(MODE_OVERRIDE_SETTING)
 	_editor_setting_lookup(SETTING_STARTUP_TRACE)
 	_editor_setting_lookup(SETTING_KEEP_SERVER_ON_EXIT)
+	_editor_setting_lookup(SETTING_EXTERNAL_CLIENT_CWD)
 	McpSettings.warm_client_scope()
 	# Publish the complete launch context while EditorInterface access is safe;
 	# worker callers of capture_launch_context() read this snapshot only.
@@ -572,8 +641,8 @@ static func remove(id: String, url: String = "", launch_context: Dictionary = {}
 		if client.command_shape != Client.CommandShape.NONE
 		else {}
 	)
-	var result := _dispatch_remove(client)
-	return _verify_post_state(client, result, Client.Status.NOT_CONFIGURED, url, "remove", launch)
+	var result := _dispatch_remove(client, context)
+	return _verify_post_state(client, result, Client.Status.NOT_CONFIGURED, url, "remove", launch, context)
 
 
 ## Resolve config-backed path errors before attach-launch discovery. This both
@@ -588,11 +657,13 @@ static func _config_path_resolution_error(client: Client) -> String:
 
 # --- Strategy dispatch + verify (testable seam) --------------------------
 
-static func _dispatch_configure(client: Client, url: String, launch: Dictionary = {}) -> Dictionary:
+static func _dispatch_configure(
+	client: Client, url: String, launch: Dictionary = {}, launch_context: Dictionary = {}
+) -> Dictionary:
 	launch = launch_for_client(client, launch)
 	match client.config_type:
 		"json":
-			return JsonStrategy.configure(client, SERVER_NAME, url, launch)
+			return JsonStrategy.configure(client, SERVER_NAME, url, launch, _project_roots_from_context(launch_context))
 		"toml":
 			return TomlStrategy.configure(client, SERVER_NAME, url, launch)
 		"yaml":
@@ -602,16 +673,16 @@ static func _dispatch_configure(client: Client, url: String, launch: Dictionary 
 			# binary isn't on PATH (Claude Code as a VS Code/Cursor extension).
 			if client.has_json_fallback() and CliStrategy.resolve_cli_path(client).is_empty():
 				return _note_unhonoured_scope(
-					client, JsonStrategy.configure(client, SERVER_NAME, url, launch)
+					client, JsonStrategy.configure(client, SERVER_NAME, url, launch, _project_roots_from_context(launch_context))
 				)
 			return CliStrategy.configure(client, SERVER_NAME, url, launch)
 	return {"status": "error", "message": "Unknown config_type for %s: %s" % [client.id, client.config_type]}
 
 
-static func _dispatch_remove(client: Client) -> Dictionary:
+static func _dispatch_remove(client: Client, launch_context: Dictionary = {}) -> Dictionary:
 	match client.config_type:
 		"json":
-			return JsonStrategy.remove(client, SERVER_NAME)
+			return JsonStrategy.remove(client, SERVER_NAME, _project_roots_from_context(launch_context))
 		"toml":
 			return TomlStrategy.remove(client, SERVER_NAME)
 		"yaml":
@@ -620,7 +691,7 @@ static func _dispatch_remove(client: Client) -> Dictionary:
 			# #463: mirror the configure fallback so Remove also works without
 			# the CLI binary — otherwise a fallback-written entry is unremovable.
 			if client.has_json_fallback() and CliStrategy.resolve_cli_path(client).is_empty():
-				return JsonStrategy.remove(client, SERVER_NAME)
+				return JsonStrategy.remove(client, SERVER_NAME, _project_roots_from_context(launch_context))
 			return CliStrategy.remove(client, SERVER_NAME)
 	return {"status": "error", "message": "Unknown config_type for %s: %s" % [client.id, client.config_type]}
 
@@ -649,7 +720,7 @@ static func _dispatch_check_status_with_cli_path_details(
 			var launch := {}
 			if client.command_shape != Client.CommandShape.NONE:
 				launch = _resolved_or_discovered_launch(client, resolved_launch, launch_context)
-			return JsonStrategy.check_status_details(client, SERVER_NAME, url, launch)
+			return JsonStrategy.check_status_details(client, SERVER_NAME, url, launch, _project_roots_from_context(launch_context))
 		"toml":
 			var launch := {}
 			if client.command_shape != Client.CommandShape.NONE:
@@ -675,7 +746,7 @@ static func _dispatch_check_status_with_cli_path_details(
 				and not _scope_diverges_from_json_fallback(client)
 			):
 				var command_launch := _resolved_or_discovered_launch(client, resolved_launch, launch_context)
-				return JsonStrategy.check_status_details(client, SERVER_NAME, url, command_launch)
+				return JsonStrategy.check_status_details(client, SERVER_NAME, url, command_launch, _project_roots_from_context(launch_context))
 			var resolved_cli := cli_path if not cli_path.is_empty() else CliStrategy.resolve_cli_path(client)
 			# #463: with no CLI binary, read the JSON fallback config so a
 			# fallback-configured entry reports CONFIGURED instead of red.
@@ -683,7 +754,7 @@ static func _dispatch_check_status_with_cli_path_details(
 				var fallback_launch := {}
 				if client.command_shape != Client.CommandShape.NONE:
 					fallback_launch = _resolved_or_discovered_launch(client, resolved_launch, launch_context)
-				return JsonStrategy.check_status_details(client, SERVER_NAME, url, fallback_launch)
+				return JsonStrategy.check_status_details(client, SERVER_NAME, url, fallback_launch, _project_roots_from_context(launch_context))
 			var cli_launch := {}
 			if client.command_shape != Client.CommandShape.NONE:
 				cli_launch = _resolved_or_discovered_launch(client, resolved_launch, launch_context)
@@ -792,11 +863,12 @@ static func _verify_post_state(
 	url: String,
 	action: String,
 	resolved_launch: Dictionary = {},
+	launch_context: Dictionary = {},
 ) -> Dictionary:
 	if result.get("status") != "ok":
 		return result
 	var details := _dispatch_check_status_with_cli_path_details(
-		client, url, "", {}, resolved_launch
+		client, url, "", launch_context, resolved_launch
 	)
 	var actual := details.get("status", Client.Status.NOT_CONFIGURED)
 	if actual == expected:
@@ -889,6 +961,7 @@ static func manual_command(id: String) -> String:
 		server_url_from(context),
 		str(path_resolution.get("path", "")),
 		launch,
+		_project_roots_from_context(context),
 	)
 	if cmd.is_empty():
 		return cmd
@@ -905,6 +978,58 @@ static func manual_command(id: String) -> String:
 static func config_path(id: String) -> String:
 	var client := ClientRegistry.get_by_id(id)
 	return client.resolved_config_path() if client != null else ""
+
+
+## Resolve the highest-precedence config tier that actually contains the server
+## entry. For Pi-style merge clients, returns the tier path the entry lives in
+## (e.g. `~/.pi/agent/.mcp.json`) instead of the lowest-tier `path_template`
+## `config_path()` returns. Falls back to `path_template` when no entry is
+## found anywhere. Empty `launch_context` is allowed; command-shape clients
+## synthesize one via `capture_launch_context()` so dock row construction can
+## call this without first capturing launch state.
+static func effective_config_path(id: String, launch_context: Dictionary = {}) -> String:
+	var client := ClientRegistry.get_by_id(id)
+	if client == null:
+		return ""
+	var resolution := client.resolved_config_path_details()
+	var fallback := str(resolution.get("path", ""))
+	var context := launch_context
+	if context.is_empty() and client.command_shape != Client.CommandShape.NONE:
+		context = capture_launch_context()
+	var roots := _project_roots_from_context(context)
+	var target := JsonStrategy.manual_target_details(client, SERVER_NAME, fallback, roots)
+	if bool(target.get("ok", false)):
+		return str(target.get("path", fallback))
+	return fallback
+
+
+## Path that `_check_status_merged` would consider authoritative for the
+## server entry, or `path_template` when no entry is found anywhere.
+## For Pi-style merge clients this is the latest project tier when one
+## exists (matching the F2 last-wins status logic), falling back to the
+## latest global tier, then to `path_template`.
+##
+## The dock uses this for Open/Reveal so the file the user inspects is
+## the same file that drives the status check — `effective_config_path`
+## fails closed (returns `path_template`) when there are multiple project
+## tiers, which historically sent users to the wrong file (codex round 3,
+## F-3-4). Splitting this from `effective_config_path` keeps the manual
+## instructions fail-closed while letting the dock follow the
+## authoritative tier.
+static func effective_authoritative_path(id: String, launch_context: Dictionary = {}) -> String:
+	var client := ClientRegistry.get_by_id(id)
+	if client == null:
+		return ""
+	var resolution := client.resolved_config_path_details()
+	var fallback := str(resolution.get("path", ""))
+	var context := launch_context
+	if context.is_empty() and client.command_shape != Client.CommandShape.NONE:
+		context = capture_launch_context()
+	var roots := _project_roots_from_context(context)
+	var authoritative: String = JsonStrategy.authoritative_tier_path(client, SERVER_NAME, roots)
+	if not authoritative.is_empty():
+		return authoritative
+	return fallback
 
 
 static func is_installed(id: String) -> bool:

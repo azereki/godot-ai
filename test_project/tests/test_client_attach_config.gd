@@ -672,6 +672,7 @@ func test_registry_wide_attach_shape_declarations() -> void:
 		"opencode": [McpClient.CommandShape.COMMAND_ARRAY, "local", ["url", "headers"]],
 		"grok": [McpClient.CommandShape.COMMAND_ARRAY, null, ["url", "headers"]],
 		"hermes": [McpClient.CommandShape.FLAT, null, ["url", "headers"]],
+		"pi": [McpClient.CommandShape.FLAT, null, ["url", "headers", "type"]],
 		## cherry_studio deliberately stays URL-mode: its mcp_servers.json is
 		## not read by the app at all (SQLite-backed) — see #838 follow-up.
 		"cherry_studio": [McpClient.CommandShape.NONE, null, []],
@@ -840,6 +841,295 @@ func test_grok_renders_attach_toml_and_preserves_undocumented_enabled() -> void:
 	_write(path, _read(path).replace("startup_timeout_sec = 60", "startup_timeout_sec = 90"))
 	assert_eq(McpTomlStrategy.configure(client, "godot-ai", "http://unused", launch).get("status"), "ok")
 	assert_contains(_read(path), "startup_timeout_sec = 90")
+
+
+func test_pi_json_strategy_preserves_legacy_server_map_aliases() -> void:
+	var launch := _uvx_launch()
+	for alias in ["mcp-servers", "servers"]:
+		var path := _scratch_dir.path_join("pi_%s.json" % alias.replace("-", "_"))
+		var initial := {}
+		initial[alias] = {
+			"existing-server": {"command": "existing-command", "args": []},
+		}
+		_write(path, JSON.stringify(initial))
+		var client := _pi_clone(path)
+		var manual := McpManualCommand.build(client, "godot-ai", "http://unused", path, launch)
+		assert_contains(manual, "under \"%s\"" % alias, "%s manual instructions must reuse the existing map" % alias)
+		assert_false(manual.contains("under \"mcpServers\""), "%s manual instructions must not shadow the legacy map" % alias)
+		var result := McpJsonStrategy.configure(client, "godot-ai", "http://unused", launch)
+		assert_eq(result.get("status"), "ok", "%s configure: %s" % [alias, result.get("message", "")])
+
+		var written: Dictionary = JSON.parse_string(_read(path))
+		assert_false(
+			written.has("mcpServers"),
+			"Configure must not create mcpServers and shadow the existing %s map" % alias,
+		)
+		var holder: Dictionary = written.get(alias, {})
+		assert_true(holder.has("existing-server"), "%s must preserve unrelated servers" % alias)
+		assert_true(holder.has("godot-ai"), "%s must receive the configured server" % alias)
+		assert_eq(
+			McpJsonStrategy.check_status(client, "godot-ai", "http://unused", launch),
+			McpClient.Status.CONFIGURED,
+			"status must resolve the same %s map" % alias,
+		)
+
+		var removed := McpJsonStrategy.remove(client, "godot-ai")
+		assert_eq(removed.get("status"), "ok", "%s remove: %s" % [alias, removed.get("message", "")])
+		var after_remove: Dictionary = JSON.parse_string(_read(path))
+		var remaining: Dictionary = after_remove.get(alias, {})
+		assert_true(remaining.has("existing-server"), "%s remove must preserve unrelated servers" % alias)
+		assert_false(remaining.has("godot-ai"), "%s remove must target the configured map" % alias)
+		assert_false(after_remove.has("mcpServers"), "%s remove must not create the canonical map" % alias)
+
+
+func test_pi_json_strategy_honors_merged_config_tier_precedence() -> void:
+	var low_path := _scratch_dir.path_join("pi_global_low.json")
+	var high_path := _scratch_dir.path_join("pi_global_high.json")
+	var stale_low := {"command": "stale-low", "args": []}
+	var stale_high := {"command": "stale-high", "args": []}
+	_write(low_path, JSON.stringify({"mcpServers": {"godot-ai": stale_low, "low-other": stale_low}}))
+	_write(high_path, JSON.stringify({"servers": {"godot-ai": stale_high, "high-other": stale_high}}))
+	var client := _pi_clone(low_path)
+	var tier_paths := PackedStringArray([low_path, high_path])
+	client.config_merge_path_templates = {
+		"darwin": tier_paths,
+		"linux": tier_paths,
+		"windows": tier_paths,
+	}
+	client.config_merge_project_paths = PackedStringArray()
+	var launch := _uvx_launch()
+
+	# A fully absent fresh install targets the first merge tier and does not
+	# create or touch any later tier.
+	var fresh_low_path := _scratch_dir.path_join("pi_global_fresh_low.json")
+	var fresh_high_path := _scratch_dir.path_join("pi_global_fresh_high.json")
+	assert_false(FileAccess.file_exists(fresh_low_path), "fresh first tier must start absent")
+	assert_false(FileAccess.file_exists(fresh_high_path), "fresh second tier must start absent")
+	var fresh_client := _pi_clone(fresh_low_path)
+	var fresh_tier_paths := PackedStringArray([fresh_low_path, fresh_high_path])
+	fresh_client.config_merge_path_templates = {
+		"darwin": fresh_tier_paths,
+		"linux": fresh_tier_paths,
+		"windows": fresh_tier_paths,
+	}
+	fresh_client.config_merge_project_paths = PackedStringArray()
+	var fresh_configured := McpJsonStrategy.configure(fresh_client, "godot-ai", "http://unused", launch)
+	assert_eq(fresh_configured.get("status"), "ok", fresh_configured.get("message", "fresh configure failed"))
+	assert_true(FileAccess.file_exists(fresh_low_path), "fresh Configure must create the first tier")
+	var fresh_low_written: Dictionary = JSON.parse_string(_read(fresh_low_path))
+	assert_true(fresh_low_written["mcpServers"].has("godot-ai"), "fresh Configure must create the entry in the first tier")
+	assert_false(FileAccess.file_exists(fresh_high_path), "fresh Configure must leave the absent second tier untouched")
+
+	var configured := McpJsonStrategy.configure(client, "godot-ai", "http://unused", launch)
+	assert_eq(configured.get("status"), "ok", configured.get("message", "configure failed"))
+	var low_written: Dictionary = JSON.parse_string(_read(low_path))
+	var high_written: Dictionary = JSON.parse_string(_read(high_path))
+	assert_eq(low_written["mcpServers"]["godot-ai"]["command"], "stale-low", "Configure need not rewrite an overridden lower tier")
+	assert_eq(high_written["servers"]["godot-ai"]["command"], launch.get("command"), "Configure must update the effective higher tier")
+	assert_eq(
+		McpJsonStrategy.check_status(client, "godot-ai", "http://unused", launch),
+		McpClient.Status.CONFIGURED,
+		"status must verify the effective highest-precedence definition",
+	)
+
+	var high_config: Dictionary = JSON.parse_string(_read(high_path))
+	high_config["servers"]["godot-ai"]["command"] = "stale-again"
+	_write(high_path, JSON.stringify(high_config))
+	assert_eq(
+		McpJsonStrategy.check_status(client, "godot-ai", "http://unused", launch),
+		McpClient.Status.CONFIGURED_MISMATCH,
+		"a stale higher tier must not produce a false configured status",
+	)
+	var manual := McpManualCommand.build(client, "godot-ai", "http://unused", low_path, launch)
+	assert_contains(manual, high_path, "manual instructions must name the effective higher tier")
+	assert_contains(manual, "under \"servers\"", "manual instructions must honor the effective tier's alias")
+
+	var removed := McpJsonStrategy.remove(client, "godot-ai")
+	assert_eq(removed.get("status"), "ok", removed.get("message", "remove failed"))
+	var low_after: Dictionary = JSON.parse_string(_read(low_path))
+	var high_after: Dictionary = JSON.parse_string(_read(high_path))
+	assert_false(low_after["mcpServers"].has("godot-ai"), "Remove must clear the low tier")
+	assert_false(high_after["servers"].has("godot-ai"), "Remove must clear the high tier")
+	assert_true(low_after["mcpServers"].has("low-other"), "Remove must preserve low-tier peers")
+	assert_true(high_after["servers"].has("high-other"), "Remove must preserve high-tier peers")
+
+
+func test_json_merge_transaction_rolls_back_earlier_write_failure() -> void:
+	var first_path := _scratch_dir.path_join("merge_transaction_first.json")
+	_write(first_path, "original")
+	var result := McpJsonStrategy._write_transaction([
+		{"path": first_path, "text": "changed", "original_text": "original"},
+		{"path": "", "text": "cannot-write", "original_text": ""},
+	])
+	assert_false(result.get("ok", true), "a later write failure must fail the transaction")
+	assert_eq(_read(first_path), "original", "an earlier tier must be restored after a later failure")
+
+
+func test_pi_manual_json_falls_back_after_target_inspection_failure() -> void:
+	var malformed_path := _scratch_dir.path_join("pi_manual_malformed.json")
+	_write(malformed_path, "{not valid json")
+	var client := _pi_clone(malformed_path)
+	var tier_paths := PackedStringArray([malformed_path])
+	client.config_merge_path_templates = {
+		"darwin": tier_paths,
+		"linux": tier_paths,
+		"windows": tier_paths,
+	}
+	client.config_merge_project_paths = PackedStringArray()
+	var manual := McpManualCommand.build(
+		client, "custom-server", "http://unused", malformed_path, _uvx_launch()
+	)
+	assert_contains(manual, "under \"mcpServers\"", "manual fallback must use the descriptor's canonical server key")
+	assert_contains(manual, "\"custom-server\"", "manual fallback must still render the requested server entry")
+	assert_contains(manual, "Target inspection failed:", "manual fallback must retain the parse failure as a note")
+
+
+func test_pi_json_strategy_fails_closed_on_malformed_merge_tier() -> void:
+	var malformed_path := _scratch_dir.path_join("pi_malformed_merge.json")
+	var malformed_text := "{not valid json"
+	_write(malformed_path, malformed_text)
+	var client := _pi_clone(malformed_path)
+	var tier_paths := PackedStringArray([malformed_path])
+	client.config_merge_path_templates = {
+		"darwin": tier_paths,
+		"linux": tier_paths,
+		"windows": tier_paths,
+	}
+	client.config_merge_project_paths = PackedStringArray()
+	var launch := _uvx_launch()
+
+	var configured := McpJsonStrategy.configure(client, "godot-ai", "http://unused", launch)
+	assert_eq(configured.get("status"), "error", configured.get("message", "configure must refuse a malformed tier"))
+	assert_contains(str(configured.get("message", "")), malformed_path, "configure error must identify the malformed file")
+	assert_eq(_read(malformed_path), malformed_text, "configure must leave the malformed source untouched")
+
+	var details := McpJsonStrategy.check_status_details(client, "godot-ai", "http://unused", launch)
+	assert_eq(details.get("status"), McpClient.Status.ERROR, "status must report ERROR for a malformed merge tier")
+	assert_ne(str(details.get("error_msg", "")), "", "status error_msg must include actionable detail")
+	assert_eq(_read(malformed_path), malformed_text, "status must not touch the malformed source")
+
+	var removed := McpJsonStrategy.remove(client, "godot-ai")
+	assert_eq(removed.get("status"), "error", removed.get("message", "remove must refuse a malformed tier"))
+	assert_contains(str(removed.get("message", "")), malformed_path, "remove error must identify the malformed file")
+	assert_eq(_read(malformed_path), malformed_text, "remove must not touch the malformed source")
+
+
+func test_pi_remove_merged_returns_not_configured_when_no_match() -> void:
+	var low_path := _scratch_dir.path_join("pi_no_match_low.json")
+	var high_path := _scratch_dir.path_join("pi_no_match_high.json")
+	var stale_low := {"command": "stale-low", "args": []}
+	var stale_high := {"command": "stale-high", "args": []}
+	var low_text := JSON.stringify({"mcpServers": {"low-other": stale_low}})
+	var high_text := JSON.stringify({"servers": {"high-other": stale_high}})
+	_write(low_path, low_text)
+	_write(high_path, high_text)
+	var client := _pi_clone(low_path)
+	client.config_merge_path_templates = {
+		"darwin": PackedStringArray([low_path, high_path]),
+		"linux": PackedStringArray([low_path, high_path]),
+		"windows": PackedStringArray([low_path, high_path]),
+	}
+	client.config_merge_project_paths = PackedStringArray()
+	var launch := _uvx_launch()
+
+	var removed := McpJsonStrategy.remove(client, "godot-ai")
+	assert_eq(removed.get("status"), "ok", removed.get("message", "no-op remove must succeed"))
+	assert_eq(removed.get("message"), "Not configured", "no-op remove must report honest 'Not configured'")
+	assert_eq(_read(low_path), low_text, "no-op remove must leave the low tier byte-for-byte unchanged")
+	assert_eq(_read(high_path), high_text, "no-op remove must leave the high tier byte-for-byte unchanged")
+
+
+func test_pi_load_merge_tiers_accepts_bom_prefixed_valid_object() -> void:
+	var bom_path := _scratch_dir.path_join("pi_bom_merge.json")
+	# A leading U+FEFF must not break the parse path. The captured text is what
+	# rollback would restore; whether Godot's text read surfaces that byte
+	# verbatim or silently strips it is implementation-dependent, so this
+	# assertion concentrates on the strategy contract: parse success plus
+	# non-empty original_text for rollback.
+	var bom_text := "\ufeff" + JSON.stringify({"mcpServers": {"unrelated": {"command": "untouched", "args": []}}})
+	var file := FileAccess.open(bom_path, FileAccess.WRITE)
+	assert_true(file != null, "could not write BOM-prefixed fixture: %s" % bom_path)
+	file.store_string(bom_text)
+	file.close()
+
+	var client := _pi_clone(bom_path)
+	client.config_merge_path_templates = {
+		"darwin": PackedStringArray([bom_path]),
+		"linux": PackedStringArray([bom_path]),
+		"windows": PackedStringArray([bom_path]),
+	}
+	client.config_merge_project_paths = PackedStringArray()
+
+	var loaded := McpJsonStrategy._load_merge_tiers(client)
+	assert_true(loaded.get("ok", false), "BOM-prefixed valid JSON must parse cleanly via the captured text")
+	var tiers: Array = loaded.get("tiers", [])
+	assert_eq(tiers.size(), 1, "BOM-prefixed valid object must produce one tier")
+	assert_true(tiers[0].get("exists", false), "an existing BOM-prefixed file must be flagged as a real tier")
+	var parsed: Dictionary = tiers[0].get("data", {})
+	assert_true(parsed.has("mcpServers"), "parsed data must surface the canonical map")
+	var original_text: String = tiers[0].get("original_text", "")
+	assert_ne(original_text, "", "original_text must capture non-empty source for rollback")
+
+
+func test_pi_json_strategy_fails_closed_on_project_override() -> void:
+	var global_path := _scratch_dir.path_join("pi_global.json")
+	var project_path := _scratch_dir.path_join("pi_project.json")
+	var stale := {"command": "stale-project", "args": []}
+	_write(global_path, JSON.stringify({"mcpServers": {}}))
+	_write(project_path, JSON.stringify({"servers": {"godot-ai": stale, "project-other": stale}}))
+	var client := _pi_clone(global_path)
+	var global_paths := PackedStringArray([global_path])
+	client.config_merge_path_templates = {
+		"darwin": global_paths,
+		"linux": global_paths,
+		"windows": global_paths,
+	}
+	# An absolute path isolates the test while exercising the same project-tier
+	# detection used for Pi's cwd-relative `.pi/mcp.json` and `.mcp.json` files.
+	client.config_merge_project_paths = PackedStringArray([project_path])
+	var launch := _uvx_launch()
+
+	var configured := McpJsonStrategy.configure(client, "godot-ai", "http://unused", launch)
+	assert_eq(configured.get("status"), "error", "Configure must not guess which project root Pi uses")
+	assert_contains(configured.get("message", ""), project_path, "Configure must identify the overriding file")
+	assert_eq(
+		McpJsonStrategy.check_status(client, "godot-ai", "http://unused", launch),
+		McpClient.Status.CONFIGURED_MISMATCH,
+		"a stale project override must not report configured",
+	)
+	var manual := McpManualCommand.build(client, "godot-ai", "http://unused", global_path, launch)
+	assert_contains(manual, project_path, "manual instructions must point to the sole project override")
+	assert_contains(manual, "under \"servers\"", "manual instructions must preserve the project alias")
+	var removed := McpJsonStrategy.remove(client, "godot-ai")
+	assert_eq(removed.get("status"), "error", "Remove must not mutate an inferred project root")
+	assert_contains(removed.get("message", ""), project_path, "Remove must identify the file requiring manual action")
+	var unchanged: Dictionary = JSON.parse_string(_read(project_path))
+	assert_true(unchanged["servers"].has("godot-ai"), "fail-closed Remove must leave the project file untouched")
+	assert_true(unchanged["servers"].has("project-other"), "fail-closed Remove must preserve peers")
+
+
+func _pi_clone(path: String) -> McpClient:
+	var registered := McpClientRegistry.get_by_id("pi")
+	var client := McpClient.new()
+	client.id = "pi_test"
+	client.display_name = "Pi Test"
+	client.config_type = "json"
+	client.path_template = {"darwin": path, "windows": path, "linux": path, "unix": path}
+	client.server_key_path = registered.server_key_path
+	client.set("server_key_path_aliases", registered.get("server_key_path_aliases"))
+	client.entry_url_field = registered.entry_url_field
+	client.entry_extra_fields = registered.entry_extra_fields.duplicate(true)
+	client.entry_initial_fields = registered.entry_initial_fields.duplicate(true)
+	client.command_shape = registered.command_shape
+	client.command_transport_key = registered.command_transport_key
+	client.command_transport_value = registered.command_transport_value
+	client.command_initial_fields = registered.command_initial_fields.duplicate(true)
+	client.command_legacy_keys = registered.command_legacy_keys
+	client.command_user_fields = registered.command_user_fields
+	client.command_timeout_fields = registered.command_timeout_fields
+	client.command_env_legacy_keys = registered.command_env_legacy_keys
+	client.command_supports_url_fallback = registered.command_supports_url_fallback
+	return client
 
 
 func _claude_cli_clone(path: String) -> McpClient:

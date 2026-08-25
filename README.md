@@ -90,9 +90,14 @@ covers:
 
 Codex, **Grok Build**, Cursor, Devin Desktop (formerly Windsurf), VS Code, VS Code Insiders, Zed, Gemini CLI, Cline,
 Kilo Code, Roo Code, Zoo Code, Kiro, Trae, Cherry Studio, OpenCode, Qwen Code,
-Kimi Code.
+Kimi Code, Pi Agent.
 
 </details>
+
+> **Pi Coding Agent:** Pi has no built-in MCP support. Choose a Pi MCP
+> extension that reads `~/.pi/agent/mcp.json`; see the
+> [Pi package gallery](https://pi.dev/packages) and follow your chosen
+> extension's installation instructions.
 
 Nearly every client is configured with the client-owned `godot-ai attach`
 stdio bridge: the client launches a local command that starts or adopts the
