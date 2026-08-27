@@ -78,12 +78,13 @@ def test_recovery_kill_workers_prewarm_the_current_version() -> None:
     lifecycle = _read("utils/server_lifecycle.gd")
 
     stale_block = get_func_block(
-        lifecycle, "func recover_stale_port_occupant(port: int, wait_s: float) -> bool:"
+        lifecycle, "func _recover_stale_port_occupant_impl(port: int, wait_s: float) -> bool:"
     )
     assert "_host._prewarm_server_package(expected_version)" in stale_block
 
     recover_block = get_func_block(
-        lifecycle, "func recover_incompatible_server() -> bool:"
+        lifecycle,
+        'func _recover_incompatible_server_impl(stale_version: String = "") -> bool:',
     )
     assert "_host._prewarm_server_package(recovery_expected_version)" in recover_block
 
@@ -98,7 +99,7 @@ def test_stale_recovery_reverifies_version_inside_the_worker() -> None:
     unverifiable) occupant before evaluating any kill proof."""
     lifecycle = _read("utils/server_lifecycle.gd")
     block = get_func_block(
-        lifecycle, "func recover_stale_port_occupant(port: int, wait_s: float) -> bool:"
+        lifecycle, "func _recover_stale_port_occupant_impl(port: int, wait_s: float) -> bool:"
     )
     assert "_verified_status_version(live)" in block
     assert "live_version.is_empty() or live_version == expected_version" in block
@@ -255,7 +256,7 @@ def test_auto_triggers_spend_but_never_arm_the_stale_budget() -> None:
     lifecycle = _read("utils/server_lifecycle.gd")
 
     manager_recover = get_func_block(
-        lifecycle, "func recover_incompatible_server() -> bool:"
+        lifecycle, 'func recover_incompatible_server(stale_version: String = "") -> bool:'
     )
     assert "authorize_stale_recovery" not in manager_recover, (
         "arming inside the manager flow would let the automatic trigger "
@@ -266,12 +267,14 @@ def test_auto_triggers_spend_but_never_arm_the_stale_budget() -> None:
         lifecycle,
         "func handle_server_version_verified(expected_version: String, version: String) -> void:",
     )
-    assert "_host.recover_incompatible_server(false)" in verified
+    assert "_host.recover_incompatible_server(false, version)" in verified
     assert "_stale_recovery_budget -= 1" in verified
 
     plugin = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
     wrapper = get_func_block(
-        plugin, "func recover_incompatible_server(user_initiated: bool = true) -> bool:"
+        plugin,
+        "func recover_incompatible_server(user_initiated: bool = true, "
+        'stale_version: String = "") -> bool:',
     )
     assert "if user_initiated:" in wrapper
     assert "_lifecycle.authorize_stale_recovery()" in wrapper

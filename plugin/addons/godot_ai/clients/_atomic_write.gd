@@ -51,15 +51,9 @@ static func write(path: String, content: String) -> bool:
 	# bytes on a shared fixed ".tmp" path (#534). Each process stages its own
 	# temp file; the final rename remains the atomic commit point.
 	var tmp_path := "%s.tmp.%d" % [path, OS.get_process_id()]
-	var file := FileAccess.open(tmp_path, FileAccess.WRITE)
+	var file := _open_restricted_temp(tmp_path, target_mode)
 	if file == null:
 		return false
-	# Lock the temp inode down BEFORE writing any bytes. FileAccess.open creates
-	# it at the umask default (often 0644); chmod'ing the still-empty file first
-	# means the config contents are never on disk under a world-readable mode in
-	# the create->chmod gap. rename preserves the inode mode, so the swapped-in
-	# file lands correct and is never briefly world-readable under the target name.
-	_apply_mode(tmp_path, target_mode)
 	file.store_string(content)
 	# Push Godot's internal buffer out to the OS before the rename. Godot
 	# exposes no fsync, so the bytes aren't guaranteed durable on the physical
@@ -68,12 +62,12 @@ static func write(path: String, content: String) -> bool:
 	# of the write at the application layer, which is the failure this guards.
 	file.flush()
 	file.close()
-	# Re-assert the mode on the closed inode. The pre-write chmod above closes
-	# the world-readable window; this second apply is the authoritative one
-	# (a chmod issued while the FileAccess handle is still open doesn't reliably
-	# stick inside the editor) and guarantees the final mode before the rename,
-	# which preserves it.
-	_apply_mode(tmp_path, target_mode)
+	# Re-assert the mode on the closed inode before rename. The temp was already
+	# restricted before this handle opened, so this is defence in depth rather
+	# than the first point at which secrets become owner-only.
+	if not _apply_mode(tmp_path, target_mode):
+		DirAccess.remove_absolute(tmp_path)
+		return false
 
 	# Verify the staged temp landed intact before committing it anywhere. The
 	# copy-fallback path below already guards this (`_written_size_matches` at
@@ -190,18 +184,38 @@ static func _resolve_target_mode(path: String, had_original: bool) -> int:
 	return FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER
 
 
-static func _apply_mode(path: String, mode: int) -> void:
+## Create/truncate an EMPTY temp file, close it, restrict its mode, then reopen
+## it without truncation for the payload write. Godot 4.6 on macOS returns
+## FAILED when set_unix_permissions targets a path whose FileAccess is still
+## open; the old create -> chmod-while-open -> write sequence therefore emitted
+## one warning per configured client and briefly wrote secrets under the umask
+## mode. Closing the empty inode first makes the security ordering real and
+## removes that platform-specific warning without suppressing genuine errors.
+static func _open_restricted_temp(path: String, mode: int) -> FileAccess:
+	var created := FileAccess.open(path, FileAccess.WRITE)
+	if created == null:
+		return null
+	created.close()
+	if not _apply_mode(path, mode):
+		DirAccess.remove_absolute(path)
+		return null
+	return FileAccess.open(path, FileAccess.READ_WRITE)
+
+
+static func _apply_mode(path: String, mode: int) -> bool:
 	# Best-effort. set_unix_permissions returns ERR_UNAVAILABLE on platforms
 	# without POSIX permissions (Windows); that's expected and ignored so the
 	# write still works there. mode <= 0 should never happen (resolve always
 	# returns >0) but is guarded so a future caller can't chmod a file to nothing.
 	if mode <= 0:
-		return
+		return true
 	var err := FileAccess.set_unix_permissions(path, mode)
+	if err == OK or err == ERR_UNAVAILABLE:
+		return true
 	# Surface a real chmod failure (not the Windows no-op) so permission
 	# hardening on a sensitive config doesn't fail completely silently.
-	if err != OK and err != ERR_UNAVAILABLE:
-		push_warning("MCP | could not set permissions on %s (error %d)" % [path, err])
+	push_warning("MCP | could not set permissions on %s (error %d)" % [path, err])
+	return false
 
 
 static func _written_size_matches(path: String, content: String) -> bool:

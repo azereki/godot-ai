@@ -39,7 +39,9 @@ class _RestartDispatchPlugin extends GodotAiPlugin:
 	func force_restart_server() -> void:
 		force_restart_calls += 1
 
-	func recover_incompatible_server(_user_initiated: bool = true) -> bool:
+	func recover_incompatible_server(
+		_user_initiated: bool = true, _stale_version: String = ""
+	) -> bool:
 		recover_calls += 1
 		return true
 

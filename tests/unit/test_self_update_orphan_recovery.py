@@ -21,7 +21,9 @@ def test_recover_incompatible_success_unblocks_existing_connection() -> None:
 
     source = PLUGIN_GD.read_text(encoding="utf-8")
     recover_block = get_func_block(
-        source, "func recover_incompatible_server(user_initiated: bool = true) -> bool:"
+        source,
+        "func recover_incompatible_server(user_initiated: bool = true, "
+        'stale_version: String = "") -> bool:',
     )
     resume_block = get_func_block(source, "func _resume_connection_after_recovery() -> void:")
     lifecycle_source = (
@@ -33,17 +35,22 @@ def test_recover_incompatible_success_unblocks_existing_connection() -> None:
         / "server_lifecycle.gd"
     ).read_text(encoding="utf-8")
     lifecycle_recover_block = get_func_block(
-        lifecycle_source, "func recover_incompatible_server() -> bool:"
+        lifecycle_source, 'func recover_incompatible_server(stale_version: String = "") -> bool:'
     )
 
-    assert "_lifecycle.recover_incompatible_server()" in recover_block
+    assert "_lifecycle.recover_incompatible_server(stale_version)" in recover_block
     assert "_resume_connection_after_recovery()" in recover_block
-    assert recover_block.index("_lifecycle.recover_incompatible_server()") < recover_block.index(
-        "_resume_connection_after_recovery()"
-    )
+    assert recover_block.index(
+        "_lifecycle.recover_incompatible_server(stale_version)"
+    ) < recover_block.index("_resume_connection_after_recovery()")
 
     # Manager-side: respawn happens here, after the kill drains.
-    assert "start_server()" in lifecycle_recover_block
+    lifecycle_recover_impl = get_func_block(
+        lifecycle_source,
+        'func _recover_incompatible_server_impl(stale_version: String = "") -> bool:',
+    )
+    assert "_recover_incompatible_server_impl(stale_version)" in lifecycle_recover_block
+    assert "start_server()" in lifecycle_recover_impl
 
     assert "state != ServerStateScript.SPAWNING" in resume_block
     assert "state != ServerStateScript.READY" in resume_block

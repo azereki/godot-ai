@@ -1311,18 +1311,27 @@ class TestReloadPluginTool:
     async def test_plugin_managed_returns_preflight_ack(self, mcp_stack, monkeypatch, tmp_path):
         """Issue #393: when the server is plugin-managed, the structured
         ack must come back to the caller AND the WS reload command must
-        only fire afterward, from the background task. Use a small but
-        observable delay so the ordering assertion has room for FastMCP
-        round-trip variance — peeking the WS immediately after `call_tool()`
-        returns must time out, then the command lands once the delay elapses."""
+        only fire afterward, from the background task. Gate that task on an
+        event so the ordering proof depends on causality, not CI scheduling."""
         from godot_ai import runtime_info
         from godot_ai.handlers import editor as editor_handlers
 
         monkeypatch.setattr(runtime_info, "_PID_FILE_PATH", tmp_path / "fake.pid")
-        monkeypatch.setattr(editor_handlers, "PLUGIN_MANAGED_RELOAD_DELAY_SEC", 0.25)
+        monkeypatch.setattr(editor_handlers, "PLUGIN_MANAGED_RELOAD_DELAY_SEC", 0)
+        dispatch_started = asyncio.Event()
+        release_dispatch = asyncio.Event()
+        original_dispatch = editor_handlers._dispatch_reload_async
+
+        async def gated_dispatch(runtime, old_id):
+            dispatch_started.set()
+            await release_dispatch.wait()
+            await original_dispatch(runtime, old_id)
+
+        monkeypatch.setattr(editor_handlers, "_dispatch_reload_async", gated_dispatch)
 
         client, plugin = mcp_stack
         result = await client.call_tool("editor_reload_plugin", {})
+        await asyncio.wait_for(dispatch_started.wait(), timeout=2.0)
 
         assert result.data["status"] == "reload_initiated"
         assert result.data["transport_will_drop"] is True
@@ -1335,13 +1344,10 @@ class TestReloadPluginTool:
         ## process can never observe.
         assert "new_session_id" not in result.data
 
-        ## Ordering check: the background task is still inside its
-        ## PLUGIN_MANAGED_RELOAD_DELAY_SEC sleep, so no command should be
-        ## visible on the WS yet. A short-timeout peek must error.
-        with pytest.raises(asyncio.TimeoutError):
-            await plugin.recv_command(timeout=0.005)
-
-        ## After the delay elapses, the reload command lands on the WS.
+        ## The call returned while the background dispatcher was held at a
+        ## deterministic gate. Releasing it now proves the command is sent by
+        ## the retained background task after the pre-flight response exists.
+        release_dispatch.set()
         cmd = await plugin.recv_command(timeout=2.0)
         assert cmd["command"] == "reload_plugin"
         await plugin.send_response(

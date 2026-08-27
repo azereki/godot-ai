@@ -1047,6 +1047,29 @@ func test_recover_stale_port_occupant_aborts_on_same_version_occupant() -> void:
 		"an aborted recovery must not reach the kill worker's pre-warm")
 
 
+func test_automatic_incompatible_recovery_does_not_kill_replacement_version() -> void:
+	## A delayed handshake from the old server may arm automatic recovery after
+	## another path has already installed the current listener. Re-probe against
+	## the exact stale version that authorized the action before accepting even a
+	## strong pid-file proof for the now-current server.
+	var host := _stale_occupant_host()
+	host.live_status = {
+		"name": "godot-ai",
+		"version": McpClientConfigurator.get_plugin_version(),
+		"ws_port": 9500,
+		"status_code": 200,
+	}
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager.transition_state(McpServerState.INCOMPATIBLE)
+
+	var recovered: bool = await manager.recover_incompatible_server("0.0.1")
+	var killed := host.killed_targets.duplicate()
+	host.free()
+
+	assert_false(recovered, "the old-version authorization no longer matches the live server")
+	assert_true(killed.is_empty(), "automatic recovery must not kill the replacement server")
+
+
 func test_recover_stale_port_occupant_refuses_foreign_occupant() -> void:
 	## No godot-ai /status answer -> no weak proof -> nothing killed, even
 	## with a branded-looking listener list.
@@ -1125,8 +1148,10 @@ func test_spawn_fast_exit_same_version_occupant_with_budget_still_latches() -> v
 class _RecoveryRecordingHostStub extends _ManagerHostStub:
 	var recovery_calls: Array = []
 
-	func recover_incompatible_server(user_initiated: bool = true) -> bool:
-		recovery_calls.append(user_initiated)
+	func recover_incompatible_server(
+		user_initiated: bool = true, stale_version: String = ""
+	) -> bool:
+		recovery_calls.append({"user_initiated": user_initiated, "stale_version": stale_version})
 		return true
 
 
@@ -1150,9 +1175,32 @@ func test_handshake_mismatch_with_budget_triggers_spend_only_recovery() -> void:
 
 	assert_eq(state, McpServerState.INCOMPATIBLE,
 		"the verdict must still latch INCOMPATIBLE before the recovery fires")
-	assert_eq(calls, [false],
-		"the trigger must dispatch exactly one non-user-initiated recovery")
+	assert_eq(calls, [{"user_initiated": false, "stale_version": "0.0.1"}],
+		"the trigger must dispatch one spend-only recovery pinned to the observed stale version")
 	assert_eq(budget, 1, "the trigger must spend one round")
+
+
+func test_handshake_mismatch_coalesces_into_active_recovery() -> void:
+	## The startup walk and WS version check can observe the same old backend
+	## while the kill worker is suspended. Only the existing transaction may
+	## act; the handshake must neither cancel it nor spend another retry round.
+	var host := _RecoveryRecordingHostStub.new()
+	host._log_buffer = McpLogBuffer.new()
+	host._connection = null
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager.authorize_stale_recovery()
+	manager._recovery_in_flight = true
+
+	manager.handle_server_version_verified("", "0.0.1")
+	var state := manager.get_state()
+	var calls := host.recovery_calls.duplicate()
+	var budget := int(manager.get_status_dict().get("stale_recovery_budget", -1))
+	host.free()
+
+	assert_eq(state, McpServerState.UNINITIALIZED,
+		"coalesced stale handshake must not supersede the active recovery state")
+	assert_true(calls.is_empty(), "coalesced handshake must not start a second recovery")
+	assert_eq(budget, 2, "coalesced handshake must not spend another retry round")
 
 
 func test_handshake_mismatch_without_budget_latches_without_recovery() -> void:
