@@ -1161,11 +1161,12 @@ func _on_server_version_unverified() -> void:
 	_update_process_enabled()
 
 
-## Start a 1s-tick timer that watches the spawned server for up to
-## SERVER_WATCH_MS. If the process dies inside the window we drain the
-## captured pipes and mark the server as crashed so the dock can surface
-## what went wrong. After the window expires we close the pipes so they
-## don't pin file descriptors or fill their kernel buffers. See #146.
+## Start a 1s-tick timer that watches the spawned server through its cold-start
+## window, then for SERVER_WATCH_MS after pid-file publication. If the process
+## dies inside the active window we drain the captured pipes and mark the server
+## as crashed so the dock can surface what went wrong. After the window expires
+## we close the pipes so they don't pin file descriptors or fill their kernel
+## buffers. See #146 and #896.
 func _start_server_watch() -> void:
 	_stop_server_watch()
 	_server_watch_timer = Timer.new()

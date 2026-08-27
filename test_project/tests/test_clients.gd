@@ -1217,6 +1217,44 @@ func test_ordered_config_candidates_fail_closed_for_ambiguous_store_roots() -> v
 	_remove_dir_recursive(root)
 
 
+func test_ordered_config_candidates_fail_closed_for_unresolvable_root() -> void:
+	## An unresolved candidate expands to an empty wildcard group, which used to
+	## look identical to an absent package and fall through to the later path.
+	## We cannot conclude that the higher-priority config is absent when its
+	## root could not be resolved, so the entire resolution must fail closed.
+	var fallback := _scratch_dir.path_join("candidate_unresolved/fallback.json")
+	_remove_if_exists(fallback)
+	var client := _make_test_json_client(fallback)
+	client.display_name = "Unresolved Candidate Test"
+	var candidates := [
+		"$USERPROFILE/godot_ai_unresolved/config.json",
+		fallback,
+	]
+	client.config_path_candidates = {
+		"darwin": candidates,
+		"windows": candidates,
+		"linux": candidates,
+		"unix": candidates,
+	}
+	var saved := OS.get_environment("USERPROFILE")
+	OS.unset_environment("USERPROFILE")
+
+	var resolution := client.resolved_config_path_details()
+	var configured := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+
+	if not saved.is_empty():
+		OS.set_environment("USERPROFILE", saved)
+
+	assert_eq(resolution.get("path"), "",
+		"an unresolvable higher-priority candidate must not fall through")
+	assert_contains(str(resolution.get("error", "")), "$USERPROFILE")
+	assert_eq(configured.get("status"), "error")
+	assert_eq(configured.get("message"), resolution.get("error"))
+	assert_false(FileAccess.file_exists(fallback),
+		"Configure must not write the later candidate when the first cannot be inspected")
+	_remove_if_exists(fallback)
+
+
 func test_candidate_detect_path_marks_store_package_installed_without_config() -> void:
 	var root := _scratch_dir.path_join("candidate_detect")
 	_remove_dir_recursive(root)

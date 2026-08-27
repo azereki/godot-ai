@@ -1521,6 +1521,28 @@ func test_watch_budget_extends_until_the_pid_file_appears() -> void:
 		"an unreadable pid-file must be treated as not-yet-published")
 
 
+func test_warm_watch_window_starts_when_the_pid_file_appears() -> void:
+	## A cold download may already be older than SERVER_WATCH_MS when Python
+	## finally publishes its pid-file. Comparing total spawn age to the warm
+	## budget would stop watching on that same tick, leaving no post-start
+	## coverage at all.
+	assert_eq(
+		McpServerLifecycleManagerScript.watch_window_elapsed_ms(45_000, 4242, 45_000),
+		0,
+		"pid-file publication must begin a fresh warm watch window",
+	)
+	assert_eq(
+		McpServerLifecycleManagerScript.watch_window_elapsed_ms(74_999, 4242, 45_000),
+		29_999,
+		"the warm window must be measured from startup proof, not process creation",
+	)
+	assert_eq(
+		McpServerLifecycleManagerScript.watch_window_elapsed_ms(45_000, 0, 0),
+		45_000,
+		"before publication the cold window still begins at process creation",
+	)
+
+
 func test_cold_start_watch_outlasts_a_package_build() -> void:
 	## The extended window exists to cover a cold environment build, so it must
 	## be at least as long as the budget allowed for that same download

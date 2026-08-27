@@ -217,6 +217,23 @@ static func _manual_update_label(version: String) -> String:
 		+ "Upgrade to Godot 4.5+ to keep receiving updates."
 	)
 
+
+## PID of the detached package pre-warm started alongside the zip download,
+## or <= 0 when none is running (no uvx tier, unusable version pin, or it has
+## already been waited out). See `_wait_for_prewarm_before_install`.
+var _prewarm_pid := -1
+## When the install first found the pre-warm still running, so the wait below
+## is bounded from the first check rather than re-armed on every poll.
+var _prewarm_wait_started_ms := 0
+## Ceiling on how long install will wait for the pre-warm. Matches the budget
+## the Configure-time pre-warm allows for the same download.
+const PREWARM_WAIT_BUDGET_MS := 180 * 1000
+## Poll interval while waiting. Deliberately not sub-second: `pid_alive` shells
+## out to `tasklist` on Windows via a blocking `OS.execute` on the main thread,
+## so a tight poll would make the editor sluggish for the whole wait.
+const PREWARM_POLL_SECONDS := 2.0
+
+
 ## Driven by the dock's Update button. On Godot < 4.5 (see _can_self_update)
 ## the in-editor install is disabled so users cannot install an incompatible
 ## latest release. With no resolved download URL, falls back to opening the
@@ -294,22 +311,6 @@ func start_install() -> void:
 ## deferred initial refresh) — true while plugin scripts are being
 ## overwritten. A worker mid-`GDScriptFunction::call` into a half-
 ## overwritten script SIGABRTs the editor.
-## PID of the detached package pre-warm started alongside the zip download,
-## or <= 0 when none is running (no uvx tier, unusable version pin, or it has
-## already been waited out). See `_wait_for_prewarm_before_install`.
-var _prewarm_pid := -1
-## When the install first found the pre-warm still running, so the wait below
-## is bounded from the first check rather than re-armed on every poll.
-var _prewarm_wait_started_ms := 0
-## Ceiling on how long install will wait for the pre-warm. Matches the budget
-## the Configure-time pre-warm allows for the same download.
-const PREWARM_WAIT_BUDGET_MS := 180 * 1000
-## Poll interval while waiting. Deliberately not sub-second: `pid_alive` shells
-## out to `tasklist` on Windows via a blocking `OS.execute` on the main thread,
-## so a tight poll would make the editor sluggish for the whole wait.
-const PREWARM_POLL_SECONDS := 2.0
-
-
 func is_install_in_flight() -> bool:
 	return _install_in_flight
 

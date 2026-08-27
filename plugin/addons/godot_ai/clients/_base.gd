@@ -363,6 +363,17 @@ func _resolve_ordered_config_path_candidates(templates: Variant) -> Dictionary:
 	var fallback_create_path := ""
 	for index in range(ordered_templates.size()):
 		var template := str(ordered_templates[index])
+		var expanded_template := McpPathTemplate.expand(template)
+		# An empty wildcard group ordinarily means "this package is not
+		# installed", but an unresolved root token produces the same empty
+		# group. Do not silently treat "could not inspect" as "not present" and
+		# fall through to a later writable candidate.
+		if not expanded_template.is_absolute_path():
+			_clear_config_path_warning()
+			return {
+				"path": "",
+				"error": unresolved_config_path_error(display_name, expanded_template),
+			}
 		var group := McpPathTemplate.expand_path_candidates(template)
 		if group.size() > 1:
 			var message := (
