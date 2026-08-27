@@ -1521,6 +1521,34 @@ func test_drain_cancels_active_and_orphaned_action_workers_before_join() -> void
 		"Drain must clear cancellation state after every worker has joined")
 
 
+func test_watchdog_cancels_live_worker_before_orphaning() -> void:
+	## A worker can cross the 30s base budget just before setting PREWARM. Once
+	## orphaned it is no longer checked by the watchdog, so it must carry a
+	## cancellation request into any uvx poll loop it reaches afterward.
+	var client_id := "cancel-watchdog"
+	_dock._set_client_action_cancel_requested(client_id, false)
+	var worker := Thread.new()
+	var start_err := worker.start(func() -> void:
+		var deadline := Time.get_ticks_msec() + 2000
+		while not _dock._is_client_action_cancel_requested(client_id) \
+			and Time.get_ticks_msec() < deadline:
+			OS.delay_msec(10)
+	)
+	assert_eq(start_err, OK)
+	_dock._client_action_threads[client_id] = worker
+	_dock._client_action_started_msec[client_id] = Time.get_ticks_msec() - 100
+	_dock._client_action_names[client_id] = "configure"
+
+	_dock._abandon_client_action_thread(client_id)
+
+	assert_true(_dock._is_client_action_cancel_requested(client_id),
+		"A live watchdog orphan must be cancelled before it can enter prewarm")
+	worker.wait_to_finish()
+	_dock._prune_orphaned_client_action_threads()
+	_dock._set_client_action_cancel_requested(client_id, false)
+	assert_false(McpDockScript._has_live_orphan(client_id))
+
+
 func test_drain_client_action_workers_restores_in_flight_row_buttons() -> void:
 	## Issue #239 follow-up: `McpUpdateManager._install_zip` has a bail-out
 	## branch (zip extract failure) that clears `_install_in_flight` on the

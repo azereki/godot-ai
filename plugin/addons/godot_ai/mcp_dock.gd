@@ -487,6 +487,10 @@ func _abandon_client_action_thread(client_id: String) -> void:
 	if thread != null:
 		_orphaned_client_action_threads.append(thread)
 		if worker_alive:
+			## The worker can cross the base watchdog immediately before it
+			## announces PREWARM. Cancel now so it cannot become an orphan and
+			## then begin a fresh 180s uvx operation outside timeout tracking.
+			_set_client_action_cancel_requested(client_id, true)
 			var owned: Array = _orphaned_client_action_owners.get(client_id, [])
 			owned.append(thread)
 			_orphaned_client_action_owners[client_id] = owned
