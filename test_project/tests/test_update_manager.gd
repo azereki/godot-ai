@@ -1156,3 +1156,49 @@ func test_mode_override_dropdown_wins_over_env() -> void:
 	_restore_mode_override(prior)
 	assert_eq(resolved, "user",
 		"Dropdown override must resolve to 'user' regardless of env")
+
+
+## ----- install gate on the package pre-warm (#896) -----
+
+func test_install_proceeds_immediately_when_no_prewarm_is_running() -> void:
+	## The gate must be completely inert on the normal path — no pre-warm
+	## started (no uvx tier, unusable pin), or one that already finished.
+	var mgr := McpUpdateManager.new()
+	mgr._prewarm_pid = -1
+	assert_true(mgr._wait_for_prewarm_before_install(),
+		"install must not be delayed when no pre-warm is running")
+
+	## A PID that is not alive must also fall straight through.
+	mgr._prewarm_pid = 999999999
+	assert_true(mgr._wait_for_prewarm_before_install(),
+		"a finished pre-warm must not delay install")
+	assert_eq(mgr._prewarm_pid, -1, "a settled pre-warm must clear its pid")
+	mgr.free()
+
+
+func test_install_gate_gives_up_rather_than_stranding_the_update() -> void:
+	## #896: waiting is an optimisation, not a precondition. A wedged pre-warm
+	## must never strand a self-update — past the budget the install proceeds
+	## and the (now longer) startup watch covers a cold spawn.
+	var mgr := McpUpdateManager.new()
+	## OS.get_process_id() is this editor: reliably alive, so the gate sees a
+	## live pre-warm without spawning anything.
+	mgr._prewarm_pid = OS.get_process_id()
+	mgr._prewarm_wait_started_ms = (
+		Time.get_ticks_msec() - McpUpdateManager.PREWARM_WAIT_BUDGET_MS - 1
+	)
+	assert_true(mgr._wait_for_prewarm_before_install(),
+		"an over-budget wait must let the install proceed")
+	assert_eq(mgr._prewarm_pid, -1, "giving up must clear the pid so it is not re-waited")
+	mgr.free()
+
+
+func test_install_gate_budget_covers_a_cold_package_build() -> void:
+	## Too short a budget defeats the point: the install would resume while the
+	## environment is still downloading, which is the case #896 is about.
+	assert_true(McpUpdateManager.PREWARM_WAIT_BUDGET_MS >= 180 * 1000,
+		"the wait must cover a cold ~67-package environment build")
+	## The poll must not be sub-second: pid_alive shells out to tasklist on
+	## Windows from the main thread, so a tight poll stalls the editor.
+	assert_true(McpUpdateManager.PREWARM_POLL_SECONDS >= 1.0,
+		"polling faster than 1s would make the editor sluggish on Windows")

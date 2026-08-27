@@ -967,6 +967,86 @@ func test_path_template_xdg_fallback() -> void:
 	assert_true(resolved.ends_with("/foo"))
 
 
+func test_path_template_leaves_unresolvable_token_in_place() -> void:
+	## Substituting "" for a token that resolves to nothing turned
+	## `$USERPROFILE/godot` into `/godot` — root-relative, which
+	## `is_absolute_path()` ACCEPTS, so every fail-closed guard in this layer
+	## waved it through and the caller read (or wrote) a directory the user
+	## never named. `$USERPROFILE` is the cheap repro: unset off Windows, and
+	## the only one of these vars with no home-derived fallback.
+	var saved := OS.get_environment("USERPROFILE")
+	OS.unset_environment("USERPROFILE")
+	var resolved := McpPathTemplate.expand("$USERPROFILE/godot")
+	# Restore before asserting so a failure can't leak into later tests.
+	if not saved.is_empty():
+		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
+
+	assert_eq(resolved, "$USERPROFILE/godot",
+		"an unresolvable token must be left in place, not replaced with an empty string")
+	assert_false(resolved.is_absolute_path(),
+		"the survivor must stay non-absolute so is_absolute_path() guards catch it: %s" % resolved)
+
+
+func test_path_template_still_expands_a_set_userprofile() -> void:
+	## The counterpart to the test above: leaving tokens alone must not cost us
+	## the substitution itself on Windows, where `$USERPROFILE` is the primary
+	## spelling in every windows-keyed descriptor template.
+	var saved := OS.get_environment("USERPROFILE")
+	var fake := "/tmp/godot-ai-test-userprofile-set"
+	OS.set_environment("USERPROFILE", fake)
+	var resolved := McpPathTemplate.expand("$USERPROFILE/godot")
+	if saved.is_empty():
+		OS.unset_environment("USERPROFILE")
+	else:
+		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
+
+	assert_eq(resolved, fake.path_join("godot"))
+	assert_true(resolved.is_absolute_path())
+
+
+func test_path_template_leaves_home_derived_tokens_in_place_without_home() -> void:
+	## Every remaining token reaches the same state as `$USERPROFILE` once
+	## `_home()` is empty — reachable in production when a dock worker reads a
+	## snapshot that was never warmed (see `env_lookup`), not only when the user
+	## really has no HOME. The home-derived fallbacks must NOT fire either:
+	## `"".path_join(".config")` is the relative `.config`, which reads against
+	## the editor's own working directory instead of the user's config dir.
+	##
+	## `~` is in here too. It was already the caught spelling — it collapsed to
+	## a relative path — but it collapsed to `godot`, which names nothing the
+	## user could act on. Both spellings of the same intent now fail the same
+	## way, and both still say what failed.
+	const VARS := ["HOME", "USERPROFILE", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA"]
+	var saved := {}
+	for var_name in VARS:
+		saved[var_name] = OS.get_environment(var_name)
+		OS.unset_environment(var_name)
+
+	var templates := PackedStringArray([
+		"~/godot",
+		"$HOME/godot",
+		"$XDG_CONFIG_HOME/godot",
+		"$APPDATA/godot",
+		"$LOCALAPPDATA/godot",
+	])
+	var resolved := PackedStringArray()
+	for template in templates:
+		resolved.append(McpPathTemplate.expand(template))
+	# Restore before asserting: leaving HOME unset would break every later test.
+	for var_name in VARS:
+		if not str(saved[var_name]).is_empty():
+			OS.set_environment(var_name, str(saved[var_name]))
+	McpClientConfigurator.warm_env_snapshot()
+
+	for index in range(templates.size()):
+		assert_eq(resolved[index], templates[index],
+			"%s must survive expansion unchanged when home is unresolvable" % templates[index])
+		assert_false(resolved[index].is_absolute_path(),
+			"%s must not expand to an absolute path" % templates[index])
+
+
 func test_path_candidate_expansion_supports_directory_wildcard_and_missing_leaf() -> void:
 	var root := _scratch_dir.path_join("candidate_expand")
 	_remove_dir_recursive(root)
@@ -1137,6 +1217,86 @@ func test_ordered_config_candidates_fail_closed_for_ambiguous_store_roots() -> v
 	_remove_dir_recursive(root.path_join("Packages/Claude_beta"))
 	client.resolved_config_path_details()
 	assert_eq(client._last_config_path_warning, "", "successful resolution resets warning de-duplication")
+	_remove_dir_recursive(root)
+
+
+func test_ordered_config_candidates_fail_closed_for_unresolvable_root() -> void:
+	## An unresolved candidate expands to an empty wildcard group, which used to
+	## look identical to an absent package and fall through to the later path.
+	## We cannot conclude that the higher-priority config is absent when its
+	## root could not be resolved, so the entire resolution must fail closed.
+	var fallback := _scratch_dir.path_join("candidate_unresolved/fallback.json")
+	_remove_if_exists(fallback)
+	var client := _make_test_json_client(fallback)
+	client.display_name = "Unresolved Candidate Test"
+	var candidates := [
+		"$USERPROFILE/godot_ai_unresolved/config.json",
+		fallback,
+	]
+	client.config_path_candidates = {
+		"darwin": candidates,
+		"windows": candidates,
+		"linux": candidates,
+		"unix": candidates,
+	}
+	var saved := OS.get_environment("USERPROFILE")
+	OS.unset_environment("USERPROFILE")
+
+	var resolution := client.resolved_config_path_details()
+	var configured := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+
+	if not saved.is_empty():
+		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
+
+	assert_eq(resolution.get("path"), "",
+		"an unresolvable higher-priority candidate must not fall through")
+	assert_contains(str(resolution.get("error", "")), "$USERPROFILE")
+	assert_eq(configured.get("status"), "error")
+	assert_eq(configured.get("message"), resolution.get("error"))
+	assert_false(FileAccess.file_exists(fallback),
+		"Configure must not write the later candidate when the first cannot be inspected")
+	_remove_if_exists(fallback)
+
+
+func test_authoritative_wildcard_target_fails_closed_for_unresolvable_seed() -> void:
+	## An installed Store package makes its private config authoritative, but
+	## a later read-through root can contain the user's current config. If that
+	## root cannot be resolved, creating an empty private file would mask it.
+	var root := _scratch_dir.path_join("candidate_unresolved_seed")
+	_remove_dir_recursive(root)
+	var package_root := root.path_join("Packages/Claude_store")
+	DirAccess.make_dir_recursive_absolute(package_root)
+	var private_path := package_root.path_join(
+		"LocalCache/Roaming/Claude/claude_desktop_config.json"
+	)
+	var client := _make_test_json_client(private_path)
+	client.display_name = "Unresolved Seed Test"
+	var candidates := [
+		root.path_join("Packages/Claude_*/LocalCache/Roaming/Claude/claude_desktop_config.json"),
+		"$USERPROFILE/godot_ai_unresolved/claude_desktop_config.json",
+	]
+	client.config_path_candidates = {
+		"darwin": candidates,
+		"windows": candidates,
+		"linux": candidates,
+		"unix": candidates,
+	}
+	var saved := OS.get_environment("USERPROFILE")
+	OS.unset_environment("USERPROFILE")
+
+	var resolution := client.resolved_config_path_details()
+	var configured := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+
+	if not saved.is_empty():
+		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
+	assert_eq(resolution.get("path"), "",
+		"an unresolvable read-through seed must block the private target write")
+	assert_contains(str(resolution.get("error", "")), "$USERPROFILE")
+	assert_eq(configured.get("status"), "error")
+	assert_false(FileAccess.file_exists(private_path),
+		"Configure must not mask an unknown fallback with a fresh private file")
 	_remove_dir_recursive(root)
 
 
@@ -1558,6 +1718,160 @@ func test_config_file_env_relative_path_fails_closed() -> void:
 		OS.set_environment(TEST_CFG_FILE_ENV, prior_env)
 	assert_eq(details.get("path"), "")
 	assert_contains(str(details.get("error", "")), "absolute config-file path")
+
+
+func test_config_home_env_relative_path_fails_closed() -> void:
+	## A relative $CODEX_HOME / $CLAUDE_CONFIG_DIR resolves against the EDITOR's
+	## working directory, not the client's, so honouring it aims Configure at
+	## the Godot project directory instead of the file the client reads. Fail
+	## closed with the same variable-naming diagnostic the exact-file override
+	## gives: the write layer's generic "Cannot write to <relative path>" never
+	## says which env var mangled the path, so the user has nothing to fix.
+	var default_path := _scratch_dir.path_join("home_env_default_untouched.toml")
+	_remove_if_exists(default_path)
+	var client := _make_env_override_toml_client(default_path)
+	var relative_home := "godot_ai_relative_cfg_home"
+	var leak_dir := ProjectSettings.globalize_path("res://").path_join(relative_home)
+	var project_leak := leak_dir.path_join("config.toml")
+	_remove_if_exists(project_leak)
+	DirAccess.remove_absolute(leak_dir)
+	var prior_env := OS.get_environment(TEST_CFG_HOME_ENV)
+	OS.set_environment(TEST_CFG_HOME_ENV, relative_home)
+
+	var details := client.resolved_config_path_details()
+	var override := client.config_home_override()
+	var configured := McpTomlStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var status := McpTomlStrategy.check_status(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+
+	if prior_env.is_empty():
+		OS.unset_environment(TEST_CFG_HOME_ENV)
+	else:
+		OS.set_environment(TEST_CFG_HOME_ENV, prior_env)
+
+	var error := str(details.get("error", ""))
+	assert_eq(override, "", "a relative config-home value must not resolve to a path")
+	assert_eq(details.get("path"), "",
+		"a failed-closed override must not fall back to path_template")
+	assert_contains(error, "$%s" % TEST_CFG_HOME_ENV,
+		"the error must name the env var that produced the path: %s" % error)
+	assert_contains(error, "absolute",
+		"the error must say the value has to be absolute: %s" % error)
+	assert_contains(error, relative_home,
+		"the error must echo the offending value: %s" % error)
+	assert_eq(configured.get("status"), "error")
+	assert_eq(configured.get("message"), error,
+		"Configure must surface the env-var explanation, not a generic write failure")
+	assert_eq(status, McpClient.Status.ERROR,
+		"the dock row must read ERROR, not a silently-unconfigured green/grey")
+	assert_false(FileAccess.file_exists(default_path),
+		"a failed-closed override must not fall back to writing the path_template default")
+	assert_false(FileAccess.file_exists(project_leak),
+		"a relative override must never write a config into the Godot project directory")
+	## The atomic write creates the parent before it discovers it cannot open
+	## the file, so the un-gated path leaves a stray directory in the project
+	## even on the "Cannot write to ..." failure. Nothing may be created here.
+	assert_false(DirAccess.dir_exists_absolute(leak_dir),
+		"a relative override must not create a directory in the Godot project either")
+	_remove_if_exists(project_leak)
+	DirAccess.remove_absolute(leak_dir)
+
+
+func test_config_home_env_tilde_value_still_resolves() -> void:
+	## The absolute-path gate must not reject the shell-style value it was
+	## always meant to accept: `CODEX_HOME=~/codex-alt` expands to an absolute
+	## home-relative directory before the check runs.
+	var default_path := _scratch_dir.path_join("home_env_tilde_default.toml")
+	var client := _make_env_override_toml_client(default_path)
+	var prior_env := OS.get_environment(TEST_CFG_HOME_ENV)
+	OS.set_environment(TEST_CFG_HOME_ENV, "~/godot_ai_tilde_cfg_home")
+	var details := client.resolved_config_path_details()
+	if prior_env.is_empty():
+		OS.unset_environment(TEST_CFG_HOME_ENV)
+	else:
+		OS.set_environment(TEST_CFG_HOME_ENV, prior_env)
+
+	assert_eq(details.get("error"), "", "a ~-prefixed config home must not fail closed")
+	var path := str(details.get("path", ""))
+	assert_true(path.is_absolute_path(), "~ must expand to an absolute path: %s" % path)
+	assert_true(path.ends_with("godot_ai_tilde_cfg_home/config.toml"),
+		"the subpath must still be joined onto the expanded home: %s" % path)
+
+
+func test_unresolvable_path_template_fails_closed() -> void:
+	## The descriptor's own `path_template` had no gate at all — the two env
+	## overrides above are checked, but the path every other client resolves
+	## through was taken on trust. That was survivable only while `expand`
+	## replaced an unresolvable token with "", which produced the root-relative
+	## `/godot_ai_unresolved/config.toml` and read as absolute. Now the token
+	## survives, so the path is relative and would resolve against the EDITOR's
+	## working directory — Configure would create a literal `$USERPROFILE`
+	## folder in the Godot project. Fail closed, and say which variable failed.
+	var relative_root := "$USERPROFILE/godot_ai_unresolved"
+	var client := _make_test_toml_client(relative_root.path_join("config.toml"))
+	client.display_name = "Unresolved Template Test"
+	var leak_dir := ProjectSettings.globalize_path("res://").path_join("$USERPROFILE")
+	var saved := OS.get_environment("USERPROFILE")
+	OS.unset_environment("USERPROFILE")
+
+	var details := client.resolved_config_path_details()
+	var path := client.resolved_config_path()
+	var configured := McpTomlStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var status := McpTomlStrategy.check_status(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+
+	if not saved.is_empty():
+		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
+
+	var error := str(details.get("error", ""))
+	assert_eq(details.get("path"), "",
+		"an unresolved template must not be handed to the write layer")
+	assert_eq(path, "", "the plain accessor must fail closed too")
+	assert_contains(error, "$USERPROFILE",
+		"the error must name the variable that failed to resolve: %s" % error)
+	assert_contains(error, client.display_name,
+		"the error must name the client whose path failed: %s" % error)
+	assert_eq(configured.get("status"), "error")
+	assert_eq(configured.get("message"), error,
+		"Configure must surface the resolution failure, not a generic write error")
+	assert_eq(status, McpClient.Status.ERROR,
+		"the dock row must read ERROR, not a silently-unconfigured grey")
+	assert_false(DirAccess.dir_exists_absolute(leak_dir),
+		"an unresolved template must never create a token-named directory in the project")
+
+
+func test_unresolvable_merge_tier_template_fails_closed() -> void:
+	## Pi-style merge tiers resolve their own templates and never pass through
+	## `resolved_config_path_details`, so they need the same gate. Failing the
+	## whole fold — rather than dropping the tier — is the point: a dropped
+	## tier reads as "the user has no config there", which is exactly the wrong
+	## conclusion to draw from a path we could not resolve well enough to look
+	## at. Pi's real windows tiers are `$USERPROFILE`-rooted.
+	var readable_tier := _scratch_dir.path_join("merge_unresolved/mcp.json")
+	_remove_if_exists(readable_tier)
+	_write_text(readable_tier, JSON.stringify({"mcpServers": {}}))
+	var client := _make_merged_json_client(PackedStringArray([
+		"$USERPROFILE/godot_ai_unresolved/mcp.json",
+		readable_tier,
+	]))
+	var saved := OS.get_environment("USERPROFILE")
+	OS.unset_environment("USERPROFILE")
+
+	var status := McpJsonStrategy.check_status_details(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var configured := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+
+	if not saved.is_empty():
+		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
+
+	assert_eq(status.get("status"), McpClient.Status.ERROR,
+		"an unresolvable tier must not read as NOT_CONFIGURED")
+	assert_contains(str(status.get("error_msg", "")), "$USERPROFILE",
+		"the status error must name the variable that failed: %s" % status.get("error_msg", ""))
+	assert_eq(configured.get("status"), "error")
+	assert_contains(str(configured.get("message", "")), "$USERPROFILE")
+	assert_eq(_read_text(readable_tier), JSON.stringify({"mcpServers": {}}),
+		"the resolvable tier must be left untouched — the fold fails as a whole")
+	_remove_if_exists(readable_tier)
 
 
 func test_codex_declares_codex_home_override() -> void:
@@ -3046,6 +3360,24 @@ func test_atomic_write_leaves_no_stale_tmp_after_failed_write() -> void:
 	)
 	var leftovers := _leftover_tmp_files("tmp_fail_dir.txt.tmp")
 	assert_eq(leftovers.size(), 0, "no .tmp staging file may linger after a failed write: %s" % str(leftovers))
+
+
+func test_atomic_write_refuses_a_non_absolute_destination() -> void:
+	## A relative destination resolves against the EDITOR's working directory,
+	## so the staging file is created inside the Godot project and left there
+	## when the rename to the mangled destination fails. The empty path is the
+	## live repro: `_write_transaction`'s own failure test passes `""`, and each
+	## run of it used to drop an mkstemp-named file into `test_project/`.
+	var project_root := ProjectSettings.globalize_path("res://")
+	var before := _project_root_entries(project_root)
+
+	assert_false(McpAtomicWrite.write("", "cannot-write"),
+		"an empty destination must be refused, not staged relative to the editor")
+	assert_false(McpAtomicWrite.write("relative/config.json", "cannot-write"),
+		"a relative destination must be refused")
+
+	assert_eq(_project_root_entries(project_root), before,
+		"a refused write must leave nothing behind in the project directory")
 
 
 func test_atomic_write_does_not_use_fixed_tmp_name() -> void:
@@ -4639,6 +4971,24 @@ func _make_test_toml_client(path: String) -> McpClient:
 	c.toml_section_path = PackedStringArray(["mcp_servers", "godot-ai"])
 	c.toml_body_template = PackedStringArray(["url = \"{url}\"", "enabled = true"])
 	return c
+
+
+## Sorted file listing of the project root, used to prove a refused write
+## leaves no debris there. Files only: the editor may touch directories
+## (`.godot/`) for unrelated reasons mid-suite.
+func _project_root_entries(project_root: String) -> PackedStringArray:
+	var dir := DirAccess.open(project_root)
+	assert_true(dir != null, "project root must be readable to snapshot it")
+	if dir == null:
+		return PackedStringArray()
+	dir.include_hidden = true
+	var entries := dir.get_files()
+	entries.sort()
+	assert_false(
+		entries.is_empty(),
+		"project root snapshot came back empty — enumeration is not trustworthy",
+	)
+	return entries
 
 
 func _remove_if_exists(path: String) -> void:

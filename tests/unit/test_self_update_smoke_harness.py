@@ -63,6 +63,12 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     )
     assert "FileAccess.get_file_as_bytes(src)" in base_manager
     assert "user-update-path.txt" in base_manager
+    # `patch_local_update_banner` replaces `start_install()` by source range.
+    # Keep update-manager state outside that range so train additions are not
+    # silently stripped from the fixture and only discovered as parse errors
+    # in the interactive smoke.
+    assert "var _prewarm_pid := -1" in base_manager
+    assert "const PREWARM_WAIT_BUDGET_MS := 180 * 1000" in base_manager
 
     base_configurator = (project / "addons" / "godot_ai" / "client_configurator.gd").read_text(
         encoding="utf-8"
@@ -114,6 +120,8 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     # manager); the dock should not contain it either.
     assert "smoke://local-prestaged" not in vnext_dock
     assert "smoke://local-prestaged" not in vnext_manager
+    assert "var _prewarm_pid := -1" in vnext_manager
+    assert "const PREWARM_WAIT_BUDGET_MS := 180 * 1000" in vnext_manager
     assert 'var _self_update_smoke_trigger: Dictionary = {"armed": true}' in vnext_dock
     assert 'var _self_update_smoke_array_trigger: Array[String] = ["armed"]' in vnext_dock
     assert "MCP | [self-update-smoke vnext _exit_tree]" in vnext_dock
