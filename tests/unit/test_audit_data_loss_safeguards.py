@@ -265,6 +265,8 @@ def test_atomic_write_does_not_remove_target_before_swap() -> None:
 
 
 def test_atomic_write_uses_copy_then_verify_as_rename_fallback() -> None:
+    """A rejected atomic rename must overwrite-copy and verify the new bytes."""
+
     source = ATOMIC_WRITE_PATH.read_text(encoding="utf-8")
     write_block = get_func_block(source, "static func write(")
     assert "DirAccess.copy_absolute(tmp_path, path)" in write_block, (
@@ -322,6 +324,8 @@ def test_atomic_write_permission_warning_includes_godot_error_text() -> None:
 
 
 def test_atomic_write_restores_from_backup_when_swap_fails() -> None:
+    """A failed swap must restore the prior config from its restricted backup."""
+
     source = ATOMIC_WRITE_PATH.read_text(encoding="utf-8")
     write_block = get_func_block(source, "static func write(")
     assert "DirAccess.copy_absolute(path, backup_path)" in write_block, (
