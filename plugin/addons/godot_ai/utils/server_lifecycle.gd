@@ -1288,9 +1288,31 @@ func check_server_health() -> void:
 		if elapsed >= int(_host.SPAWN_GRACE_MS) and not McpServerStateScript.is_terminal_diagnosis(_server_state):
 			_diagnose_spawn_fast_exit(_spawn_dead_since_ms)
 		return
-	if elapsed >= int(_host.SERVER_WATCH_MS):
-		## Survived startup — mid-session crashes surface via WebSocket disconnect.
+	if elapsed >= watch_budget_ms(real_pid, int(_host.SERVER_WATCH_MS), int(_host.SERVER_COLD_START_WATCH_MS)):
+		## #896: past the budget we stop watching either way, but a spawn that
+		## never published a pid-file did not "survive startup" — it just never
+		## proved anything. Say so, or the only remaining signal is a silent
+		## reconnect loop.
+		if real_pid <= 0:
+			print(
+				"MCP | server spawn never published a pid-file within %ds; "
+				% int(_host.SERVER_COLD_START_WATCH_MS / 1000)
+				+ "no longer watching it. If the editor stays disconnected, "
+				+ "check the Godot output log for the server's own errors."
+			)
 		_host._stop_server_watch()
+
+
+## How long to keep watching a spawn, given whether it has published its
+## pid-file yet.
+##
+## Pure so tests can drive the decision without a live spawn. `pid_from_file`
+## is the authoritative "the server got far enough to run" signal: the Python
+## server writes it during import, before uvicorn binds. Until it appears, a
+## live launcher PID proves only that `uvx` has not exited — on a cold start
+## that is usually a download still in progress, not a started server.
+static func watch_budget_ms(pid_from_file: int, warm_ms: int, cold_ms: int) -> int:
+	return warm_ms if pid_from_file > 0 else cold_ms
 
 
 ## The spawned server died inside the SPAWN_GRACE_MS window. Decide what

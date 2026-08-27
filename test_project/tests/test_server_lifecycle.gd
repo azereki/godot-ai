@@ -1497,6 +1497,47 @@ func test_handoff_not_pending_once_the_pid_file_lands() -> void:
 		"a published pid-file ends the handoff wait")
 
 
+## ----- startup watch budget (#896) -----
+
+func test_watch_budget_extends_until_the_pid_file_appears() -> void:
+	## #896: the short watch justifies itself with "mid-session crashes surface
+	## via WebSocket disconnect" — which is only true once there IS a connection.
+	## A cold uvx spawn can still be downloading its ~67-package environment at
+	## SERVER_WATCH_MS, having proven nothing. Stopping the watch there means a
+	## launcher that dies afterwards is never observed, `_diagnose_spawn_fast_exit`
+	## never runs (it is only reachable from inside the watch), and the plugin
+	## redials forever behind a bare "Disconnected".
+	var warm := int(GodotAiPlugin.SERVER_WATCH_MS)
+	var cold := int(GodotAiPlugin.SERVER_COLD_START_WATCH_MS)
+
+	## pid-file published: the server proved it started, short budget applies.
+	assert_eq(McpServerLifecycleManagerScript.watch_budget_ms(4242, warm, cold), warm,
+		"a published pid-file means the short watch is enough")
+
+	## No pid-file: keep watching, because nothing has been proven yet.
+	assert_eq(McpServerLifecycleManagerScript.watch_budget_ms(0, warm, cold), cold,
+		"without a pid-file the spawn has proven nothing and must stay watched")
+	assert_eq(McpServerLifecycleManagerScript.watch_budget_ms(-1, warm, cold), cold,
+		"an unreadable pid-file must be treated as not-yet-published")
+
+
+func test_cold_start_watch_outlasts_a_package_build() -> void:
+	## The extended window exists to cover a cold environment build, so it must
+	## be at least as long as the budget allowed for that same download
+	## elsewhere — otherwise the watch still ends before the evidence arrives.
+	assert_true(
+		int(GodotAiPlugin.SERVER_COLD_START_WATCH_MS) > int(GodotAiPlugin.SERVER_WATCH_MS),
+		"the cold-start watch must be longer than the warm one"
+	)
+	## Stated in absolute terms rather than against the Configure pre-warm's
+	## constant: that lives on a separate change, and this watch must hold on
+	## its own regardless of whether a pre-warm ran at all.
+	assert_true(
+		int(GodotAiPlugin.SERVER_COLD_START_WATCH_MS) >= 180 * 1000,
+		"the watch must outlast a cold ~67-package environment build"
+	)
+
+
 func test_handoff_expires_so_a_dead_windows_spawn_is_still_diagnosed() -> void:
 	## The wait is bounded: a genuinely dead spawn that never publishes must
 	## still reach the fast-exit diagnosis, inside SERVER_WATCH_MS.
