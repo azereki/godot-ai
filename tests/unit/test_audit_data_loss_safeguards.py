@@ -279,6 +279,41 @@ def test_atomic_write_uses_copy_then_verify_as_rename_fallback() -> None:
     )
 
 
+def test_atomic_write_copy_paths_fail_closed_on_permission_errors() -> None:
+    """Every successful copy must also prove its intended file mode.
+
+    Configs and their backups can contain access tokens. Treating a copied
+    payload as successful after chmod failed leaves those secrets under the
+    process umask, commonly 0644 on POSIX systems.
+    """
+
+    source = ATOMIC_WRITE_PATH.read_text(encoding="utf-8")
+    write_block = get_func_block(source, "static func write(")
+
+    backup_copy = write_block.index("DirAccess.copy_absolute(path, backup_path) == OK")
+    backup_mode = write_block.index("if not _apply_mode(backup_path, target_mode):", backup_copy)
+    backup_success = write_block.index("backup_made = true", backup_mode)
+    assert backup_copy < backup_mode < backup_success
+
+    backup_failure = write_block.index("DirAccess.remove_absolute(backup_path)", backup_success)
+    assert backup_failure > backup_success
+
+    destination_copy = write_block.index("DirAccess.copy_absolute(tmp_path, path) == OK")
+    destination_mode = write_block.index("if _apply_mode(path, target_mode):", destination_copy)
+    destination_success = write_block.index("return true", destination_mode)
+    assert destination_copy < destination_mode < destination_success
+
+    restore_copy = write_block.index("DirAccess.copy_absolute(backup_path, path) == OK")
+    restore_mode = write_block.index("and _apply_mode(path, target_mode)", restore_copy)
+    assert restore_copy < restore_mode
+
+
+def test_atomic_write_permission_warning_includes_godot_error_text() -> None:
+    source = ATOMIC_WRITE_PATH.read_text(encoding="utf-8")
+    mode_block = get_func_block(source, "static func _apply_mode(")
+    assert "error_string(err)" in mode_block
+
+
 def test_atomic_write_restores_from_backup_when_swap_fails() -> None:
     source = ATOMIC_WRITE_PATH.read_text(encoding="utf-8")
     write_block = get_func_block(source, "static func write(")

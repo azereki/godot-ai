@@ -52,6 +52,16 @@ def test_recover_incompatible_success_unblocks_existing_connection() -> None:
     assert "_recover_incompatible_server_impl(stale_version)" in lifecycle_recover_block
     assert "start_server()" in lifecycle_recover_impl
 
+    # The outer transaction stays armed to coalesce unrelated recovery, but
+    # grants its own respawn walk a narrow capability to recover an old attach
+    # bridge that reclaims the port after the first kill.
+    assert "_recovery_owned_startup_generation = owned_startup_gen" in lifecycle_recover_impl
+    assert lifecycle_recover_impl.index(
+        "_recovery_owned_startup_generation = owned_startup_gen"
+    ) < (
+        lifecycle_recover_impl.index("await start_server()")
+    ) < lifecycle_recover_impl.index("_recovery_owned_startup_generation = -1")
+
     assert "state != ServerStateScript.SPAWNING" in resume_block
     assert "state != ServerStateScript.READY" in resume_block
     assert "_lifecycle.is_connection_blocked()" in resume_block
