@@ -3070,14 +3070,24 @@ func test_atomic_write_rejects_empty_path_without_creating_a_file() -> void:
 
 ## Names of the files directly under `res://`, hidden ones included — the
 ## directory a relative or empty write target resolves against in the editor.
+##
+## Asserts rather than returning a quiet [] when the root cannot be read: the
+## caller diffs two of these snapshots, so a silently-empty list on EITHER
+## call makes the diff vacuously empty and the test passes without ever
+## having looked for the debris it exists to catch.
 func _project_root_files() -> Array[String]:
 	var out: Array[String] = []
 	var dir := DirAccess.open("res://")
+	assert_true(dir != null, "project root must be readable to snapshot it")
 	if dir == null:
 		return out
 	dir.include_hidden = true
 	for f in dir.get_files():
 		out.append(f)
+	assert_false(
+		out.is_empty(),
+		"project root snapshot came back empty — enumeration is not trustworthy",
+	)
 	return out
 
 
