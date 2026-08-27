@@ -1142,6 +1142,111 @@ func test_prewarm_argv_rejects_empty_and_non_pep440_versions() -> void:
 	)
 
 
+## ----- Configure-time pre-warm planning (#851) -----
+#
+# The entry Configure writes pins an exact `godot-ai==X`. If uv has never
+# built that environment, the first CLIENT spawn builds it (~67 packages) —
+# which flashes a terminal window on Windows (#851) and can push the spawn
+# past an MCP client's default 30s connect timeout, so the tools look like
+# they vanished. Configure pays that cost up front instead. These pin the
+# decision only; the plan is pure, so no environment is ever built here.
+
+func _prewarm_overrides(tier: String) -> Dictionary:
+	var overrides := {
+		"venv_python": "",
+		"uvx_path": "",
+		"system_path": "",
+		"consoleless_python": "C:/Python313/pythonw.exe",
+	}
+	match tier:
+		"dev_venv":
+			overrides["venv_python"] = "C:/repo/.venv/Scripts/python.exe"
+			overrides["consoleless_python"] = "C:/repo/.venv/Scripts/pythonw.exe"
+		"uvx":
+			overrides["uvx_path"] = "C:/Tools/uv/uvx.exe"
+		"system":
+			overrides["system_path"] = "C:/Python313/Scripts/godot-ai.exe"
+			overrides["system_version_result"] = {
+				"exit_code": 0, "stdout": "godot-ai 3.0.6", "stderr": "",
+				"output": "godot-ai 3.0.6", "timed_out": false, "spawn_failed": false,
+			}
+	return overrides
+
+
+func test_prewarm_plan_warms_the_uvx_tier_with_the_written_pin() -> void:
+	## The warmed version must be exactly the pin the entry carries, or the
+	## warm builds an environment the client never launches.
+	var plan := McpClientConfigurator.prewarm_attach_plan(
+		_context(), _prewarm_overrides("uvx")
+	)
+	assert_true(bool(plan.get("warm", false)), "the uvx tier must be warmed")
+	assert_eq(plan.get("version"), "3.0.6")
+
+
+func test_prewarm_plan_skips_tiers_with_no_environment_to_build() -> void:
+	## dev-venv and system launches run an already-installed package — there
+	## is no per-version uv environment, so warming would be pure waste.
+	for tier in ["dev_venv", "system"]:
+		var plan := McpClientConfigurator.prewarm_attach_plan(
+			_context(), _prewarm_overrides(tier)
+		)
+		assert_false(bool(plan.get("warm", false)), "%s tier must not be warmed" % tier)
+		assert_contains(str(plan.get("reason", "")), tier)
+
+
+func test_prewarm_plan_skips_when_launch_discovery_fails() -> void:
+	## No launcher resolved means Configure itself failed; there is nothing
+	## to warm and nothing to report.
+	var plan := McpClientConfigurator.prewarm_attach_plan(
+		_context(), _prewarm_overrides("none")
+	)
+	assert_false(bool(plan.get("warm", false)))
+	assert_contains(str(plan.get("reason", "")), "discovery")
+
+
+func test_prewarm_plan_strips_local_version_metadata_from_the_pin() -> void:
+	## The pin written into the entry drops any `+local` segment, so the
+	## warm must drop it identically — otherwise uv resolves a different
+	## requirement and the client still cold-starts.
+	var context := _context()
+	context["plugin_version"] = "3.0.6+dev"
+	var plan := McpClientConfigurator.prewarm_attach_plan(
+		context, _prewarm_overrides("uvx")
+	)
+	assert_true(bool(plan.get("warm", false)))
+	assert_eq(plan.get("version"), "3.0.6", "the +local segment must be stripped")
+
+
+func test_prewarm_launch_skips_without_spawning_when_plan_declines() -> void:
+	## The wrapper must surface the plan's reason and never reach a spawn.
+	var result := McpClientConfigurator.prewarm_attach_launch(
+		_context(), McpClientConfigurator.PREWARM_TIMEOUT_MS, _prewarm_overrides("dev_venv")
+	)
+	assert_true(bool(result.get("skipped", false)), "a declined plan must skip")
+	assert_contains(str(result.get("reason", "")), "dev_venv")
+
+
+func test_prewarm_blocking_skips_when_version_is_unusable() -> void:
+	## Same PEP 440 hardening as the fire-and-forget spawn: an unusable pin
+	## must skip rather than hand uv something it can reinterpret.
+	for bad in ["", "   ", "3.2.*", "3.2.0 --index-url http://evil"]:
+		var result := McpClientConfigurator.prewarm_server_package_blocking(bad, 1000)
+		assert_true(
+			bool(result.get("skipped", false)),
+			"version %s must not reach a spawn" % [bad]
+		)
+
+
+func test_prewarm_timeout_budget_exceeds_the_cli_registry_default() -> void:
+	## A cold build is expected to take tens of seconds. Reusing the 8s
+	## registry budget would kill the warm exactly when it is doing the work
+	## this feature exists to do.
+	assert_true(
+		McpClientConfigurator.PREWARM_TIMEOUT_MS > McpCliExec.DEFAULT_TIMEOUT_MS * 5,
+		"pre-warm needs a budget sized for a cold package build"
+	)
+
+
 func _pi_clone(path: String) -> McpClient:
 	var registered := McpClientRegistry.get_by_id("pi")
 	var client := McpClient.new()

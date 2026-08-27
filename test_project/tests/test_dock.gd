@@ -1743,6 +1743,135 @@ func test_dock_log_toggle_mutes_buffer_console_echo() -> void:
 	dock.free()
 
 
+func test_configure_phase_labels_the_package_build_instead_of_hanging_silent() -> void:
+	## #851: Configure now pre-builds the pinned uv environment so the first
+	## CLIENT spawn is warm. That build can run for tens of seconds on a cold
+	## cache, and a motionless "Configuring…" reads as a hang — so the worker
+	## reports a phase and the poll promotes the label.
+	var dock := McpDockScript.new()
+	var btn := Button.new()
+	btn.text = "Configuring…"
+	dock._client_rows["claude_code"] = {"configure_btn": btn}
+
+	## Config-write phase: the label must not move yet.
+	dock._apply_client_action_phase("claude_code")
+	assert_eq(btn.text, "Configuring…", "label must not move before the warm starts")
+
+	## Worker reports it reached the package warm.
+	dock._set_client_action_phase("claude_code", "prewarm")
+	dock._apply_client_action_phase("claude_code")
+	assert_eq(btn.text, "Installing…", "a cold package build must be labelled, not silent")
+
+	## The poll runs every frame — the rewrite must happen once, not forever.
+	btn.text = "sentinel"
+	dock._apply_client_action_phase("claude_code")
+	assert_eq(btn.text, "sentinel", "the label must be rewritten once, not every frame")
+
+	## Cleared state must not resurrect the label under the next action.
+	dock._clear_client_action_phase("claude_code")
+	btn.text = "Configuring…"
+	dock._apply_client_action_phase("claude_code")
+	assert_eq(btn.text, "Configuring…", "a cleared phase must not relabel a new action")
+
+	btn.free()
+	dock.free()
+
+
+func test_abandoned_worker_blocks_an_overlapping_action_for_that_row() -> void:
+	## The watchdog abandons a worker by erasing the row's `_client_action_threads`
+	## slot — which is also the dispatch guard. So without a per-client orphan
+	## record, a re-click after a timeout starts a SECOND worker while the first
+	## is still running: two uv builds and two writers on the same config file.
+	var dock := McpDockScript.new()
+	McpDockScript._orphaned_client_action_owners.clear()
+
+	assert_false(
+		McpDockScript._has_live_orphan("claude_code"),
+		"a row with no abandoned worker must be dispatchable"
+	)
+
+	## A live orphan holds the row.
+	var live := Thread.new()
+	live.start(func() -> int:
+		## Long enough to still be running when the assertion below reads it.
+		OS.delay_msec(400)
+		return 0
+	)
+	McpDockScript._orphaned_client_action_owners["claude_code"] = [live]
+	assert_true(
+		McpDockScript._has_live_orphan("claude_code"),
+		"a still-running abandoned worker must block a new action on its row"
+	)
+	## A different row is unaffected — the guard is per client, not global.
+	assert_false(
+		McpDockScript._has_live_orphan("codex"),
+		"one row's orphan must not block every other client"
+	)
+
+	live.wait_to_finish()
+	assert_false(
+		McpDockScript._has_live_orphan("claude_code"),
+		"a finished orphan must release the row"
+	)
+
+	## The prune must drop the finished orphan so the row is not held forever.
+	dock._release_finished_orphan_owners()
+	assert_false(
+		McpDockScript._orphaned_client_action_owners.has("claude_code"),
+		"prune must clear the finished orphan record"
+	)
+	McpDockScript._orphaned_client_action_owners.clear()
+	dock.free()
+
+
+func test_prewarm_phase_widens_the_client_action_watchdog() -> void:
+	## Regression (#894 CodeRabbit): the action watchdog abandons a worker after
+	## CLIENT_ACTION_TIMEOUT_MSEC (30s), sized for a CLI registry call. The
+	## Configure pre-warm can legitimately run far longer while uv builds the
+	## pinned environment — so a cold build would trip the watchdog, re-enable
+	## the row, discard the worker's completion, and report a false Configure
+	## timeout for exactly the slow cold start the pre-warm exists to absorb.
+	var dock := McpDockScript.new()
+
+	assert_eq(
+		dock._client_action_budget_msec("claude_code"),
+		McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC,
+		"a plain config write keeps the short registry budget"
+	)
+
+	dock._set_client_action_phase("claude_code", "prewarm")
+	var warmed := dock._client_action_budget_msec("claude_code")
+	assert_true(
+		warmed >= McpClientConfigurator.PREWARM_TIMEOUT_MS,
+		"the watchdog must outlast the pre-warm's own ceiling, not fire mid-build"
+	)
+	assert_true(
+		warmed > McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC,
+		"the prewarm phase must widen the budget"
+	)
+
+	## A cleared phase must fall back to the short budget, or one slow Configure
+	## would leave the row's next action effectively unwatched.
+	dock._clear_client_action_phase("claude_code")
+	assert_eq(
+		dock._client_action_budget_msec("claude_code"),
+		McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC,
+		"a cleared phase must restore the short budget"
+	)
+	dock.free()
+
+
+func test_configure_phase_is_ignored_for_an_unknown_row() -> void:
+	## A row can be rebuilt (status refresh) while its worker is still in
+	## flight; the poll must not fault on the vanished row.
+	var dock := McpDockScript.new()
+	dock._set_client_action_phase("ghost", "prewarm")
+	dock._apply_client_action_phase("ghost")
+	dock._clear_client_action_phase("ghost")
+	assert_true(true, "phase handling must tolerate a missing row")
+	dock.free()
+
+
 ## Save/restore helpers so tests that drive the (now persisted) log toggle
 ## don't clobber the user's actual EditorSetting.
 func _save_mcp_logging_setting() -> Dictionary:
