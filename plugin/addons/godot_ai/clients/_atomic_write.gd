@@ -15,6 +15,17 @@ extends RefCounted
 
 
 static func write(path: String, content: String) -> bool:
+	# An empty path is never a writable target, but it is not inert either:
+	# in the editor Godot's safe-save is on, so opening "" for WRITE runs
+	# mkstemp on the template "" + "-XXXXXX", which succeeds and drops a
+	# randomly-named file with the payload bytes in the process's working
+	# directory (the project root). The close-time rename back to "" then
+	# fails, orphaning it. `write` already reported false for this case, so
+	# refusing up front changes no caller behavior — it only stops the
+	# stray file from being created.
+	if path.is_empty():
+		return false
+
 	# If the target is a symlink (stow/chezmoi-managed dotfiles), rename-over
 	# would replace the LINK with a regular file, silently detaching the
 	# config from the user's dotfile repo (#534). Resolve the link chain and

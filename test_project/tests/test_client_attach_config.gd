@@ -960,6 +960,8 @@ func test_pi_json_strategy_honors_merged_config_tier_precedence() -> void:
 func test_json_merge_transaction_rolls_back_earlier_write_failure() -> void:
 	var first_path := _scratch_dir.path_join("merge_transaction_first.json")
 	_write(first_path, "original")
+	# "" is the unwritable second tier: McpAtomicWrite refuses an empty target
+	# outright, so this fails without touching the filesystem.
 	var result := McpJsonStrategy._write_transaction([
 		{"path": first_path, "text": "changed", "original_text": "original"},
 		{"path": "", "text": "cannot-write", "original_text": ""},

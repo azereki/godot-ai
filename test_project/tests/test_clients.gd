@@ -3048,6 +3048,49 @@ func test_atomic_write_leaves_no_stale_tmp_after_failed_write() -> void:
 	assert_eq(leftovers.size(), 0, "no .tmp staging file may linger after a failed write: %s" % str(leftovers))
 
 
+func test_atomic_write_rejects_empty_path_without_creating_a_file() -> void:
+	## An empty target used to leak a randomly-named file holding the payload
+	## into the editor's working directory (the project root): with safe-save
+	## on, Godot opens "" for WRITE by running mkstemp on "" + "-XXXXXX", which
+	## succeeds, and only the close-time rename back to "" fails. `write` said
+	## false either way, so the stray was invisible except in `git status`.
+	## Scan the project root because that is where the debris landed.
+	var before := _project_root_files()
+	assert_false(
+		McpAtomicWrite.write("", "cannot-write"),
+		"an empty path must be refused",
+	)
+	var after := _project_root_files()
+	var strays: Array[String] = []
+	for name in after:
+		if not before.has(name):
+			strays.append(name)
+	assert_eq(strays.size(), 0, "an empty-path write must create no file: %s" % str(strays))
+
+
+## Names of the files directly under `res://`, hidden ones included — the
+## directory a relative or empty write target resolves against in the editor.
+##
+## Asserts rather than returning a quiet [] when the root cannot be read: the
+## caller diffs two of these snapshots, so a silently-empty list on EITHER
+## call makes the diff vacuously empty and the test passes without ever
+## having looked for the debris it exists to catch.
+func _project_root_files() -> Array[String]:
+	var out: Array[String] = []
+	var dir := DirAccess.open("res://")
+	assert_true(dir != null, "project root must be readable to snapshot it")
+	if dir == null:
+		return out
+	dir.include_hidden = true
+	for f in dir.get_files():
+		out.append(f)
+	assert_false(
+		out.is_empty(),
+		"project root snapshot came back empty — enumeration is not trustworthy",
+	)
+	return out
+
+
 func test_atomic_write_does_not_use_fixed_tmp_name() -> void:
 	## #534: two editors clicking Configure at once must not interleave bytes
 	## on a shared "<path>.tmp". Prove the fixed name is no longer the staging
