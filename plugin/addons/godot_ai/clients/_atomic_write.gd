@@ -95,8 +95,18 @@ static func write(path: String, content: String) -> bool:
 	if had_original:
 		DirAccess.remove_absolute(backup_path)
 		if DirAccess.copy_absolute(path, backup_path) == OK:
+			if not _apply_mode(backup_path, target_mode):
+				## The backup contains the same secrets as the live config. Do
+				## not leave that copy behind — or touch the destination — when
+				## it cannot be restricted to the intended mode.
+				DirAccess.remove_absolute(backup_path)
+				DirAccess.remove_absolute(tmp_path)
+				return false
 			backup_made = true
-			_apply_mode(backup_path, target_mode)
+		else:
+			## copy_absolute may leave a partial destination on failure. It
+			## contains config bytes under the process umask, so remove it.
+			DirAccess.remove_absolute(backup_path)
 
 	if DirAccess.rename_absolute(tmp_path, path) == OK:
 		return true
@@ -107,10 +117,13 @@ static func write(path: String, content: String) -> bool:
 	# leaves the user's prior config in place rather than nuking it.
 	if DirAccess.copy_absolute(tmp_path, path) == OK and _written_size_matches(path, content):
 		# copy_absolute creates the destination with the default mode, so
-		# re-apply the preserved/owner-only mode after the copy lands.
-		_apply_mode(path, target_mode)
-		DirAccess.remove_absolute(tmp_path)
-		return true
+		# re-apply the preserved/owner-only mode after the copy lands. A
+		# permission failure is a failed write: fall through to the same
+		# restore/remove path as a partial copy instead of reporting success
+		# with a potentially exposed token-bearing config.
+		if _apply_mode(path, target_mode):
+			DirAccess.remove_absolute(tmp_path)
+			return true
 
 	# Copy didn't land cleanly. Restore the destination to its pre-call state.
 	if backup_made:
@@ -121,8 +134,17 @@ static func write(path: String, content: String) -> bool:
 		# user's prior bytes are still in `.backup` for manual recovery
 		# and the false return value tells the caller the swap didn't
 		# complete.
-		DirAccess.copy_absolute(backup_path, path)
-		_apply_mode(path, target_mode)
+		var restored := (
+			DirAccess.copy_absolute(backup_path, path) == OK
+			and _apply_mode(path, target_mode)
+		)
+		if not restored:
+			## The backup's mode was already verified before the swap. Remove
+			## any partial/default-mode destination, then move that restricted
+			## inode back into place. If even the same-directory rename fails,
+			## the complete prior contents remain in `.backup` for recovery.
+			DirAccess.remove_absolute(path)
+			DirAccess.rename_absolute(backup_path, path)
 	elif not had_original and FileAccess.file_exists(path):
 		# No prior file existed but copy_absolute landed partial bytes at
 		# `path`. Remove them so the failure leaves nothing on disk rather
@@ -214,7 +236,7 @@ static func _apply_mode(path: String, mode: int) -> bool:
 		return true
 	# Surface a real chmod failure (not the Windows no-op) so permission
 	# hardening on a sensitive config doesn't fail completely silently.
-	push_warning("MCP | could not set permissions on %s (error %d)" % [path, err])
+	push_warning("MCP | could not set permissions on %s: %s" % [path, error_string(err)])
 	return false
 
 

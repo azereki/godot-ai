@@ -973,6 +973,72 @@ func test_walk_spends_budget_and_weak_kills_stale_occupant_when_authorized() -> 
 		"fixture: the still-held port must stop the walk before a real spawn")
 
 
+func test_recovery_owned_respawn_can_replace_reclaimed_stale_listener() -> void:
+	## The first recovery kill freed the port, but an attach bridge immediately
+	## reclaimed it with the same old backend before the owned respawn walk ran.
+	## The outer transaction must remain armed (so unrelated callers/handshakes
+	## coalesce) while this nested walk spends the second bounded recovery round.
+	## Pre-fix, `_recovery_in_flight` rejected this walk at its first line and
+	## stranded the update at INCOMPATIBLE.
+	var host := _stale_occupant_host()
+	## The reclaimed listener releases after the nested weak-proof kill.
+	host.port_in_use_sequence = [false] as Array[bool]
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager.authorize_stale_recovery()
+	manager._recovery_in_flight = true
+	manager._recovery_owned_startup_generation = manager._async_generation
+
+	var recovered: bool = await manager._recover_startup_port_occupant(
+		TEST_PORT,
+		host.live_status,
+		"0.0.1",
+		McpClientConfigurator.get_plugin_version(),
+		manager._async_generation,
+	)
+	var killed := host.killed_targets.duplicate()
+	var budget := int(manager.get_status_dict().get("stale_recovery_budget", -1))
+	var outer_still_owns: bool = manager._recovery_in_flight
+	manager._recovery_owned_startup_generation = -1
+	manager._recovery_in_flight = false
+	host.free()
+
+	assert_true(recovered, "the recovery-owned respawn walk must recover the reclaimed port")
+	assert_eq(killed, [13131] as Array[int],
+		"the reclaimed stale listener must receive the second bounded kill")
+	assert_eq(budget, 1, "the nested walk must spend exactly one remaining round")
+	assert_true(outer_still_owns,
+		"the nested walk must not release the outer transaction's coalescing guard")
+
+
+func test_cancelled_walk_cannot_inherit_recovery_owned_startup_authority() -> void:
+	## A concurrent force-restart/invalidation creates a new startup generation.
+	## It must not inherit the narrow authority granted to the outer recovery's
+	## original respawn walk.
+	var host := _stale_occupant_host()
+	var manager := McpServerLifecycleManagerScript.new(host)
+	manager.authorize_stale_recovery()
+	manager._recovery_in_flight = true
+	manager._recovery_owned_startup_generation = manager._async_generation
+	manager._async_generation += 1
+
+	var recovered: bool = await manager._recover_startup_port_occupant(
+		TEST_PORT,
+		host.live_status,
+		"0.0.1",
+		McpClientConfigurator.get_plugin_version(),
+		manager._async_generation,
+	)
+	var killed := host.killed_targets.duplicate()
+	var budget := int(manager.get_status_dict().get("stale_recovery_budget", -1))
+	manager._recovery_owned_startup_generation = -1
+	manager._recovery_in_flight = false
+	host.free()
+
+	assert_false(recovered, "a replacement generation must coalesce, not recover")
+	assert_true(killed.is_empty(), "a replacement generation must not use stale-kill authority")
+	assert_eq(budget, 2, "a rejected replacement walk must not spend recovery budget")
+
+
 func test_walk_stale_budget_ignores_same_version_occupant() -> void:
 	## The budget only ever targets a version DRIFT. A same-version occupant
 	## that fails compatibility another way (here: WS port mismatch) must not

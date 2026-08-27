@@ -120,6 +120,14 @@ var _stale_recovery_budget: int = 0
 ## stale handshake verdicts into it so an older continuation cannot kill the
 ## fresh server that another continuation just spawned.
 var _recovery_in_flight: bool = false
+## Generation-scoped capability for the startup walk spawned by
+## `_recover_incompatible_server_impl`. The outer recovery keeps
+## `_recovery_in_flight` armed so handshakes and unrelated recovery calls still
+## coalesce, while this token lets only that exact owned walk spend another
+## bounded stale-recovery round if an attach bridge reclaims the port after the
+## kill. A later walk created by invalidation gets a different generation and
+## cannot inherit the authority.
+var _recovery_owned_startup_generation: int = -1
 
 ## Bounded deadline for the foreign-port adoption-confirmation watcher.
 ## Zero when disarmed.
@@ -1624,9 +1632,14 @@ func _recover_startup_port_occupant(
 	current_version: String,
 	async_gen: int,
 ) -> bool:
-	if _recovery_in_flight:
+	var owns_recovery := not _recovery_in_flight
+	var is_owned_startup := (
+		_recovery_in_flight and async_gen == _recovery_owned_startup_generation
+	)
+	if not owns_recovery and not is_owned_startup:
 		return false
-	_recovery_in_flight = true
+	if owns_recovery:
+		_recovery_in_flight = true
 	## Forward `live` so the strong proof helper reuses our snapshot. The kill
 	## invalidates it; every later consumer re-probes before using live status.
 	var recovered: bool = await recover_strong_port_occupant(port, 3.0, live)
@@ -1639,7 +1652,10 @@ func _recover_startup_port_occupant(
 			% [live_version, port, _stale_recovery_budget]
 		)
 		recovered = await _recover_stale_port_occupant_impl(port, 3.0)
-	_recovery_in_flight = false
+	## A nested recovery-owned startup must leave the outer transaction armed;
+	## only the path that acquired ownership here may release it.
+	if owns_recovery:
+		_recovery_in_flight = false
 	return recovered
 
 
@@ -2091,7 +2107,15 @@ func _recover_incompatible_server_impl(stale_version: String = "") -> bool:
 	## the automatic handshake-mismatch trigger reuses this manager flow and
 	## must only SPEND budget; re-arming inside it would unbound the
 	## kill/respawn loop against a persistent bridge respawner.
+	## Keep the outer transaction armed while the respawn walk runs so stale WS
+	## handshakes and unrelated recovery calls still coalesce. Grant only this
+	## owned startup walk permission to spend a remaining recovery round if the
+	## old attach bridge reclaims the port between the kill and the respawn.
+	var owned_startup_gen := _async_generation
+	_recovery_owned_startup_generation = owned_startup_gen
 	await start_server()
+	if _recovery_owned_startup_generation == owned_startup_gen:
+		_recovery_owned_startup_generation = -1
 	return true
 
 

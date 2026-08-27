@@ -265,6 +265,8 @@ def test_atomic_write_does_not_remove_target_before_swap() -> None:
 
 
 def test_atomic_write_uses_copy_then_verify_as_rename_fallback() -> None:
+    """A rejected atomic rename must overwrite-copy and verify the new bytes."""
+
     source = ATOMIC_WRITE_PATH.read_text(encoding="utf-8")
     write_block = get_func_block(source, "static func write(")
     assert "DirAccess.copy_absolute(tmp_path, path)" in write_block, (
@@ -279,7 +281,51 @@ def test_atomic_write_uses_copy_then_verify_as_rename_fallback() -> None:
     )
 
 
+def test_atomic_write_copy_paths_fail_closed_on_permission_errors() -> None:
+    """Every successful copy must also prove its intended file mode.
+
+    Configs and their backups can contain access tokens. Treating a copied
+    payload as successful after chmod failed leaves those secrets under the
+    process umask, commonly 0644 on POSIX systems.
+    """
+
+    source = ATOMIC_WRITE_PATH.read_text(encoding="utf-8")
+    write_block = get_func_block(source, "static func write(")
+
+    backup_copy = write_block.index("DirAccess.copy_absolute(path, backup_path) == OK")
+    backup_mode = write_block.index("if not _apply_mode(backup_path, target_mode):", backup_copy)
+    backup_mode_cleanup = write_block.index(
+        "DirAccess.remove_absolute(backup_path)", backup_mode
+    )
+    backup_success = write_block.index("backup_made = true", backup_mode)
+    assert backup_copy < backup_mode < backup_mode_cleanup < backup_success
+
+    partial_backup_cleanup = write_block.index(
+        "DirAccess.remove_absolute(backup_path)", backup_success
+    )
+    assert partial_backup_cleanup > backup_success
+
+    destination_copy = write_block.index("DirAccess.copy_absolute(tmp_path, path) == OK")
+    destination_mode = write_block.index("if _apply_mode(path, target_mode):", destination_copy)
+    destination_success = write_block.index("return true", destination_mode)
+    assert destination_copy < destination_mode < destination_success
+
+    restore_copy = write_block.index("DirAccess.copy_absolute(backup_path, path) == OK")
+    restore_mode = write_block.index("and _apply_mode(path, target_mode)", restore_copy)
+    assert restore_copy < restore_mode
+
+
+def test_atomic_write_permission_warning_includes_godot_error_text() -> None:
+    """Permission failures should name Godot's readable error, not only its number."""
+
+    source = ATOMIC_WRITE_PATH.read_text(encoding="utf-8")
+    mode_block = get_func_block(source, "static func _apply_mode(")
+    assert "error_string(err)" in mode_block
+
+
 def test_atomic_write_restores_from_backup_when_swap_fails() -> None:
+    """A failed swap must restore the prior config from its restricted backup."""
+
     source = ATOMIC_WRITE_PATH.read_text(encoding="utf-8")
     write_block = get_func_block(source, "static func write(")
     assert "DirAccess.copy_absolute(path, backup_path)" in write_block, (
