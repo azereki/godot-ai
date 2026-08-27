@@ -2068,6 +2068,10 @@ func _dispatch_client_action(client_id: String, action: String) -> void:
 	if row.is_empty():
 		return
 
+	## Drop any phase left behind by a previous action on this row — a
+	## generation-mismatch or shutdown return can skip the normal finalize,
+	## and a stale phase would suppress the label for this new action.
+	_clear_client_action_phase(client_id)
 	_set_row_action_in_flight(client_id, action)
 	## Snapshot `server_url` on main: `http_url()` reads
 	## `EditorInterface.get_editor_settings()`, which is main-thread-only.
@@ -2108,14 +2112,30 @@ func _run_client_action_worker(
 	generation: int,
 ) -> Dictionary:
 	var result: Dictionary
+	var prewarm: Dictionary = {}
 	if action == "remove":
 		result = ClientConfigurator.remove(client_id, server_url, launch_context)
 	else:
 		result = ClientConfigurator.configure(client_id, server_url, launch_context)
+		## #851: the entry we just wrote pins an exact `godot-ai==X`. If uv has
+		## never built that environment, the FIRST client spawn builds it —
+		## ~67 packages — which is what flashes a terminal window on Windows
+		## and what can push a bridge spawn past the MCP client's default 30s
+		## connect timeout, so the tools appear to vanish. Pay that cost here,
+		## on a deliberate click the dock can label, instead of on the client's
+		## critical path.
+		##
+		## Best-effort: the config file is already written and correct. A
+		## failed or timed-out warm only means the next launch pays the cold
+		## cost it always used to, so `result` is deliberately left untouched.
+		if result.get("status") == "ok":
+			_set_client_action_phase(client_id, _PHASE_PREWARM)
+			prewarm = ClientConfigurator.prewarm_attach_launch(launch_context)
 	return {
 		"client_id": client_id,
 		"action": action,
 		"result": result,
+		"prewarm": prewarm,
 		"generation": generation,
 	}
 
@@ -2123,13 +2143,19 @@ func _run_client_action_worker(
 func _poll_completed_client_action_threads() -> void:
 	for client_id in _client_action_threads.keys():
 		var thread: Thread = _client_action_threads[client_id]
-		if thread == null or thread.is_alive():
+		if thread == null:
+			continue
+		if thread.is_alive():
+			_apply_client_action_phase(String(client_id))
 			continue
 		var payload: Variant = thread.wait_to_finish()
 		_client_action_threads[client_id] = null
 		if payload is Dictionary:
 			var data := payload as Dictionary
 			var result: Dictionary = data.get("result", {})
+			_report_prewarm_outcome(
+				String(data.get("client_id", client_id)), data.get("prewarm", {})
+			)
 			_apply_client_action_result(
 				String(data.get("client_id", client_id)),
 				String(data.get("action", _client_action_names.get(client_id, "configure"))),
@@ -2161,6 +2187,7 @@ func _apply_client_action_result(client_id: String, action: String, result: Dict
 	_client_action_threads.erase(client_id)
 	_client_action_started_msec.erase(client_id)
 	_client_action_names.erase(client_id)
+	_clear_client_action_phase(client_id)
 	_finalize_action_buttons(client_id)
 	if _server_blocks_client_health():
 		_apply_row_status(client_id, Client.Status.ERROR, _server_blocked_client_message())
@@ -2185,6 +2212,85 @@ func _apply_client_action_result(client_id: String, action: String, result: Dict
 		if action == "configure":
 			_show_manual_command_for(client_id)
 	_refresh_clients_summary()
+
+
+## Phase label for the Configure worker's pre-warm step. The config write
+## itself is fast; building the pinned uv environment is the part that can
+## run for tens of seconds, so it gets its own label rather than sitting
+## under a motionless "Configuring…".
+const _PHASE_PREWARM := "prewarm"
+
+## Worker-written, main-read. `Dictionary` writes are not atomic across
+## threads, so both sides take the mutex — the same discipline `CliFinder`
+## uses for its cache. Held only across the dictionary access, never across
+## the subprocess, so the main thread can never block on uv.
+var _client_action_phase_mutex := Mutex.new()
+var _client_action_phases: Dictionary = {}
+## Rows whose button text already reflects their phase, so the per-frame poll
+## rewrites the label once instead of on every frame.
+var _client_action_phase_shown: Dictionary = {}
+
+
+func _set_client_action_phase(client_id: String, phase: String) -> void:
+	_client_action_phase_mutex.lock()
+	_client_action_phases[client_id] = phase
+	_client_action_phase_mutex.unlock()
+
+
+func _read_client_action_phase(client_id: String) -> String:
+	_client_action_phase_mutex.lock()
+	var phase := String(_client_action_phases.get(client_id, ""))
+	_client_action_phase_mutex.unlock()
+	return phase
+
+
+func _clear_client_action_phase(client_id: String) -> void:
+	_client_action_phase_mutex.lock()
+	_client_action_phases.erase(client_id)
+	_client_action_phase_mutex.unlock()
+	_client_action_phase_shown.erase(client_id)
+
+
+## Per-frame, for a still-running worker: promote the button label when the
+## worker reports it has moved on to warming the package environment. Keeps
+## the dock honest about why Configure is taking a while — otherwise a cold
+## uv build looks like a hang.
+func _apply_client_action_phase(client_id: String) -> void:
+	if _read_client_action_phase(client_id) != _PHASE_PREWARM:
+		return
+	if _client_action_phase_shown.get(client_id, "") == _PHASE_PREWARM:
+		return
+	var row: Dictionary = _client_rows.get(client_id, {})
+	if row.is_empty():
+		return
+	_client_action_phase_shown[client_id] = _PHASE_PREWARM
+	(row["configure_btn"] as Button).text = "Installing…"
+
+
+## One line per Configure so a cold build is attributable after the fact —
+## the dock label is transient, and #851's symptom (a terminal window on
+## Windows) is easiest to correlate against a timestamped log entry. Silent
+## on the skip paths: a dev-venv/system tier having no env to warm is the
+## normal case, not news.
+func _report_prewarm_outcome(client_id: String, prewarm: Variant) -> void:
+	if not (prewarm is Dictionary):
+		return
+	var data := prewarm as Dictionary
+	if data.is_empty() or bool(data.get("skipped", false)):
+		return
+	if bool(data.get("timed_out", false)):
+		print(
+			"MCP | %s: package pre-warm timed out; the first client launch will build the environment"
+			% client_id
+		)
+		return
+	if int(data.get("exit_code", -1)) != 0:
+		print(
+			"MCP | %s: package pre-warm failed (exit %d); the first client launch will build the environment"
+			% [client_id, int(data.get("exit_code", -1))]
+		)
+		return
+	print("MCP | %s: package environment pre-warmed" % client_id)
 
 
 ## In-flight visual: rewrite the verb onto the button the user just

@@ -49,6 +49,18 @@ telemetry toggle, or tool-domain change. Never silently fall back to a bare `uvx
 command for these entries—report ERROR and leave the config untouched when no
 verified tier exists.
 
+Configure pre-builds the pinned `godot-ai==X` uv environment before it
+returns (`prewarm_attach_plan` / `prewarm_attach_launch`), so the first
+client spawn is a warm cache hit. Without it the *client* pays for building
+~67 packages on its own critical path, which flashes a terminal window on
+Windows (#851) and can overrun an MCP client's default 30s connect timeout —
+the tools then appear to vanish until a restart. Only the `uvx` tier is
+warmed; dev-venv and system launches run an already-installed package. The
+warm is best-effort and never downgrades a successful Configure: the config
+file is already written, and a failure only restores the old cold-start cost.
+The dock relabels the button `Installing…` while it runs so a cold build does
+not read as a hang.
+
 Per-strategy command rendering (`CommandShape` docs in `_base.gd`):
 
 - **JSON** — FLAT (`command` string + `args` array, optional

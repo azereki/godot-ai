@@ -1743,6 +1743,51 @@ func test_dock_log_toggle_mutes_buffer_console_echo() -> void:
 	dock.free()
 
 
+func test_configure_phase_labels_the_package_build_instead_of_hanging_silent() -> void:
+	## #851: Configure now pre-builds the pinned uv environment so the first
+	## CLIENT spawn is warm. That build can run for tens of seconds on a cold
+	## cache, and a motionless "Configuring…" reads as a hang — so the worker
+	## reports a phase and the poll promotes the label.
+	var dock := McpDockScript.new()
+	var btn := Button.new()
+	btn.text = "Configuring…"
+	dock._client_rows["claude_code"] = {"configure_btn": btn}
+
+	## Config-write phase: the label must not move yet.
+	dock._apply_client_action_phase("claude_code")
+	assert_eq(btn.text, "Configuring…", "label must not move before the warm starts")
+
+	## Worker reports it reached the package warm.
+	dock._set_client_action_phase("claude_code", "prewarm")
+	dock._apply_client_action_phase("claude_code")
+	assert_eq(btn.text, "Installing…", "a cold package build must be labelled, not silent")
+
+	## The poll runs every frame — the rewrite must happen once, not forever.
+	btn.text = "sentinel"
+	dock._apply_client_action_phase("claude_code")
+	assert_eq(btn.text, "sentinel", "the label must be rewritten once, not every frame")
+
+	## Cleared state must not resurrect the label under the next action.
+	dock._clear_client_action_phase("claude_code")
+	btn.text = "Configuring…"
+	dock._apply_client_action_phase("claude_code")
+	assert_eq(btn.text, "Configuring…", "a cleared phase must not relabel a new action")
+
+	btn.free()
+	dock.free()
+
+
+func test_configure_phase_is_ignored_for_an_unknown_row() -> void:
+	## A row can be rebuilt (status refresh) while its worker is still in
+	## flight; the poll must not fault on the vanished row.
+	var dock := McpDockScript.new()
+	dock._set_client_action_phase("ghost", "prewarm")
+	dock._apply_client_action_phase("ghost")
+	dock._clear_client_action_phase("ghost")
+	assert_true(true, "phase handling must tolerate a missing row")
+	dock.free()
+
+
 ## Save/restore helpers so tests that drive the (now persisted) log toggle
 ## don't clobber the user's actual EditorSetting.
 func _save_mcp_logging_setting() -> Dictionary:
