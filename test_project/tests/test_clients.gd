@@ -3512,6 +3512,30 @@ func test_atomic_write_new_file_defaults_to_owner_only() -> void:
 	)
 
 
+func test_atomic_write_restricts_empty_temp_before_payload_handle_opens() -> void:
+	## Regression for the Godot 4.6 macOS warning wall seen during a 23-client
+	## post-update repin. set_unix_permissions returns FAILED while a Godot
+	## FileAccess owns the path, so the writer must close the empty create handle,
+	## chmod the inode, and only then reopen it for payload bytes.
+	if OS.get_name() == "Windows":
+		skip("POSIX file permissions are unavailable on Windows")
+		return
+	var path := _scratch_dir.path_join("perm_restricted_before_payload.txt")
+	var owner_only := _owner_only_mode()
+	var payload_handle := McpAtomicWrite._open_restricted_temp(path, owner_only)
+
+	assert_true(payload_handle != null, "restricted temp should reopen for payload writing")
+	if payload_handle == null:
+		return
+	assert_eq(
+		FileAccess.get_unix_permissions(path) & _PERM_MASK,
+		owner_only,
+		"temp inode must already be 0600 while the payload handle is open",
+	)
+	payload_handle.store_string("secret")
+	payload_handle.close()
+
+
 func test_atomic_write_preserves_relaxed_mode_on_rewrite() -> void:
 	## We preserve the prior mode — we do NOT force 0600 on a file that was
 	## already group/other-readable (e.g. a 0644 cursor config). This proves
