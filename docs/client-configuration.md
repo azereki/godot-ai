@@ -28,6 +28,24 @@ rules are not visible in the code:
   dispatched on `config_type "dsh"`), plus the matching branch in
   `client_configurator.gd` and `_manual_command.gd`.
 
+### Path resolution fails closed
+
+Every descriptor path is `~`- or `$VAR`-rooted and expands through
+`_path_template.gd`. A token that cannot be resolved — the variable is unset, or
+a dock worker is reading an env snapshot that was never warmed — is **left in
+the string** rather than replaced with an empty string. Substituting the empty
+string is what turned `$USERPROFILE/godot` into `/godot`, a root-relative path
+that `is_absolute_path()` accepts, so every fail-closed guard in this layer
+waved it through and Configure wrote somewhere the user never named.
+
+The invariant that replaces it: **a resolved config path is absolute or it is an
+error**. `McpClient.resolved_config_path_details()` enforces it for every
+descriptor path (both env overrides, `config_path_candidates`, and plain
+`path_template`), `_json_strategy.gd::_load_merge_tiers` enforces it for Pi's
+merge tiers, and `McpAtomicWrite.write` refuses a non-absolute destination as a
+last line of defence. The dock reports the unexpanded path, which still shows
+what failed to resolve.
+
 MCP tools `client_configure`, `client_remove`, and `client_status` expose this to
 AI clients.
 

@@ -15,17 +15,15 @@ extends RefCounted
 
 
 static func write(path: String, content: String) -> bool:
-	# An empty path is never a writable target, but it is not inert either:
-	# in the editor Godot's safe-save is on, so opening "" for WRITE runs
-	# mkstemp on the template "" + "-XXXXXX", which succeeds and drops a
-	# randomly-named file with the payload bytes in the process's working
-	# directory (the project root). The close-time rename back to "" then
-	# fails, orphaning it. `write` already reported false for this case, so
-	# refusing up front changes no caller behavior — it only stops the
-	# stray file from being created.
-	if path.is_empty():
+	# Last line of defence for the path-resolution layer above. A relative (or
+	# empty) destination resolves against the EDITOR's working directory, not the
+	# caller's. The empty-path case is especially deceptive: editor safe-save
+	# runs mkstemp on "-XXXXXX", writes the payload into the project root, then
+	# fails only when renaming back to "" and leaves the random file behind.
+	# Callers gate this already (`McpClient.resolved_config_path_details`), but a
+	# writer that cannot tell where it is writing must refuse rather than guess.
+	if not path.is_absolute_path():
 		return false
-
 	# If the target is a symlink (stow/chezmoi-managed dotfiles), rename-over
 	# would replace the LINK with a regular file, silently detaching the
 	# config from the user's dotfile repo (#534). Resolve the link chain and
