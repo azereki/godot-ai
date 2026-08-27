@@ -15,6 +15,14 @@ extends RefCounted
 
 
 static func write(path: String, content: String) -> bool:
+	# Last line of defence for the path-resolution layer above. A relative (or
+	# empty) destination resolves against the EDITOR's working directory, not
+	# the caller's: the staging file lands inside the Godot project, the rename
+	# to the mangled destination fails, and the debris stays there. Callers gate
+	# this already (`McpClient.resolved_config_path_details`), but a writer that
+	# cannot tell where it is writing must refuse rather than guess.
+	if not path.is_absolute_path():
+		return false
 	# If the target is a symlink (stow/chezmoi-managed dotfiles), rename-over
 	# would replace the LINK with a regular file, silently detaching the
 	# config from the user's dotfile repo (#534). Resolve the link chain and

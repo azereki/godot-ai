@@ -270,6 +270,35 @@ func resolved_config_path() -> String:
 ## is empty for ordinary unsupported/missing path mappings to preserve the
 ## long-standing status behavior for clients not installed on this platform.
 func resolved_config_path_details() -> Dictionary:
+	var details := _resolve_config_path_details()
+	var path := str(details.get("path", ""))
+	if path.is_empty() or path.is_absolute_path():
+		return details
+	## Last gate before every strategy's read/write. `McpPathTemplate.expand`
+	## leaves a token it cannot resolve in place, so an unset `$USERPROFILE` (or
+	## a `~` with no HOME) reaches here as a RELATIVE path rather than as the
+	## root-relative `/godot` that sails through `is_absolute_path()`. Acting on
+	## it would resolve against the editor's own working directory and create a
+	## literal `$USERPROFILE` folder in the Godot project. No descriptor
+	## template is intentionally relative — every one is `~`- or `$VAR`-rooted —
+	## so a non-absolute survivor is always a resolution failure. Report it with
+	## the unexpanded path, which still shows what could not be resolved.
+	return {"path": "", "error": unresolved_config_path_error(display_name, path)}
+
+
+## Shared wording for a path template `McpPathTemplate.expand` could not fully
+## resolve. Used by the guard above and by the merge-tier loader in
+## `_json_strategy.gd`, which resolves its own templates and never passes
+## through `resolved_config_path_details`.
+static func unresolved_config_path_error(client_name: String, path: String) -> String:
+	return (
+		"Could not resolve %s's config path: %s did not expand to an absolute "
+		+ "path. Set HOME/USERPROFILE (or the variable the path names) in the "
+		+ "environment the editor was launched from."
+	) % [client_name, path]
+
+
+func _resolve_config_path_details() -> Dictionary:
 	## Reflected reads: after an in-session self-update, an instance created
 	## before the update can answer Nil for vars the update added, and the
 	## typed calls below would each hard-error (Nil -> Dictionary, #850's
