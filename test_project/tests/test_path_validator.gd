@@ -98,22 +98,36 @@ func test_well_formed_nested_path_passes_boundary_check() -> void:
 
 # ----- null byte (truncation trap, audit GH-4) -----
 
-func test_rejects_embedded_null_byte() -> void:
+func test_rejects_replacement_character() -> void:
 	## A NUL can truncate a C string, so the path written could differ from the
-	## one validated/reported. Reject any path containing one.
+	## one validated/reported. Godot cannot hold U+0000 in a String — it decodes
+	## an attempted NUL (and any other malformed input) to U+FFFD — so U+FFFD is
+	## what an embedded-null payload actually looks like by the time it reaches
+	## the validator. Reject it.
 	##
-	## Some Godot builds (e.g. 4.3) strip embedded nulls from String, so the
-	## payload can't be constructed there — the validator's check is simply a
-	## harmless no-op on those builds (a String that can't hold a null can't
-	## smuggle one past the guard). Skip rather than assert 4.6-only behavior.
-	var nul := String.chr(0)
-	if nul.is_empty() or not ("res://a" + nul + "b").contains(nul):
-		skip("this Godot build does not retain embedded null bytes in String")
-		return
-	# No "..": the ONLY reason to reject this path is the embedded null.
-	var err := McpPathValidator.validate_resource_path("res://safe" + nul + "name.gd")
-	assert_false(err.is_empty(), "path with an embedded null byte must be rejected")
+	## Deliberately does NOT build the payload with `String.chr(0)`: constructing
+	## that string is itself what made the engine print "Unexpected NUL
+	## character" on every validated path (issue #889).
+	# No "..": the ONLY reason to reject this path is the bad codepoint.
+	var err := McpPathValidator.validate_resource_path("res://safe\uFFFDname.gd")
+	assert_false(err.is_empty(), "path with a replacement character must be rejected")
 	assert_contains(err, "null")
+
+
+func test_loadable_rejects_replacement_character() -> void:
+	## The same guard must cover the ResourceLoader entry point.
+	var err := McpPathValidator.validate_loadable_path("res://safe\uFFFDname.tscn")
+	assert_false(err.is_empty(), "loadable path with a replacement character must be rejected")
+
+
+func test_valid_path_survives_codepoint_scan() -> void:
+	## Regression for #889: ordinary and non-ASCII paths must pass the scan
+	## cleanly. Accented/CJK characters decode fine and must not be mistaken for
+	## the replacement character.
+	assert_eq(McpPathValidator.validate_resource_path("res://scripts/player.gd"), "",
+		"plain ASCII path must validate")
+	assert_eq(McpPathValidator.validate_resource_path("res://scènes/日本語.gd"), "",
+		"valid non-ASCII path must validate")
 
 
 # ----- write blocklist: project-critical files (audit GH-3) -----
