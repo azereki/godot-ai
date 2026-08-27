@@ -1483,6 +1483,44 @@ func test_drain_client_action_workers_clears_threads_and_bumps_generation() -> v
 		"Drain must bump generation so any late result from the drained worker is rejected as stale")
 
 
+func test_drain_cancels_active_and_orphaned_action_workers_before_join() -> void:
+	## A cold uvx prewarm has a deliberate 180s normal budget. Teardown must
+	## signal all worker rows first, including watchdog-orphaned ones, before
+	## waiting for threads or editor close/update can inherit that full delay.
+	var active_id := "cancel-active"
+	var orphan_id := "cancel-orphan"
+	var active := Thread.new()
+	var orphan := Thread.new()
+	var active_err := active.start(func() -> void:
+		var deadline := Time.get_ticks_msec() + 2000
+		while not _dock._is_client_action_cancel_requested(active_id) \
+			and Time.get_ticks_msec() < deadline:
+			OS.delay_msec(10)
+	)
+	var orphan_err := orphan.start(func() -> void:
+		var deadline := Time.get_ticks_msec() + 2000
+		while not _dock._is_client_action_cancel_requested(orphan_id) \
+			and Time.get_ticks_msec() < deadline:
+			OS.delay_msec(10)
+	)
+	assert_eq(active_err, OK)
+	assert_eq(orphan_err, OK)
+	_dock._client_action_threads[active_id] = active
+	McpDockScript._orphaned_client_action_threads.append(orphan)
+	McpDockScript._orphaned_client_action_owners[orphan_id] = [orphan]
+	var started_msec := Time.get_ticks_msec()
+
+	_dock._drain_client_action_workers()
+
+	var elapsed_msec := Time.get_ticks_msec() - started_msec
+	assert_true(elapsed_msec < 1000,
+		"Drain must cancel both workers before joining (elapsed=%dms)" % elapsed_msec)
+	assert_true(McpDockScript._orphaned_client_action_threads.is_empty())
+	assert_true(McpDockScript._orphaned_client_action_owners.is_empty())
+	assert_false(_dock._is_client_action_cancel_requested(active_id),
+		"Drain must clear cancellation state after every worker has joined")
+
+
 func test_drain_client_action_workers_restores_in_flight_row_buttons() -> void:
 	## Issue #239 follow-up: `McpUpdateManager._install_zip` has a bail-out
 	## branch (zip extract failure) that clears `_install_in_flight` on the

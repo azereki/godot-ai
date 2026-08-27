@@ -230,6 +230,11 @@ static var _orphaned_client_action_threads: Array[Thread] = []
 ## Static for the same reason as the array: a script reload must not GC a
 ## live Thread.
 static var _orphaned_client_action_owners: Dictionary = {}
+## Cooperative stop shared across dock instances because orphan action
+## threads survive script/dock replacement. A new action clears its row's
+## flag before starting; teardown sets every active/orphaned row before join.
+static var _client_action_cancel_mutex := Mutex.new()
+static var _client_action_cancelled_clients: Dictionary = {}
 
 # Dev-mode only
 var _dev_section: VBoxContainer
@@ -404,6 +409,13 @@ func _drain_client_action_workers() -> void:
 	## user-visible failure mode for the install-update bail-out branch
 	## (zip extract failure on the manager clears `_install_in_flight` and
 	## the dock stays alive).
+	## Signal every worker before joining any one of them. Normal Configure
+	## keeps its full cold-install budget, while shutdown/update can stop all
+	## in-flight uvx poll loops concurrently and avoid a 180s editor stall.
+	for client_id in _client_action_threads.keys():
+		_set_client_action_cancel_requested(String(client_id), true)
+	for client_id in _orphaned_client_action_owners.keys():
+		_set_client_action_cancel_requested(String(client_id), true)
 	for client_id in _client_action_threads.keys():
 		var t: Thread = _client_action_threads[client_id]
 		if t != null:
@@ -432,6 +444,9 @@ func _drain_client_action_workers() -> void:
 	_client_action_phases.clear()
 	_client_action_phase_mutex.unlock()
 	_client_action_phase_shown.clear()
+	_client_action_cancel_mutex.lock()
+	_client_action_cancelled_clients.clear()
+	_client_action_cancel_mutex.unlock()
 
 
 func _check_client_action_timeouts() -> void:
@@ -2149,6 +2164,7 @@ func _dispatch_client_action(client_id: String, action: String) -> void:
 	## generation-mismatch or shutdown return can skip the normal finalize,
 	## and a stale phase would suppress the label for this new action.
 	_clear_client_action_phase(client_id)
+	_set_client_action_cancel_requested(client_id, false)
 	_set_row_action_in_flight(client_id, action)
 	## Snapshot `server_url` on main: `http_url()` reads
 	## `EditorInterface.get_editor_settings()`, which is main-thread-only.
@@ -2207,7 +2223,12 @@ func _run_client_action_worker(
 		## cost it always used to, so `result` is deliberately left untouched.
 		if result.get("status") == "ok":
 			_set_client_action_phase(client_id, _PHASE_PREWARM)
-			prewarm = ClientConfigurator.prewarm_attach_launch(launch_context)
+			prewarm = ClientConfigurator.prewarm_attach_launch(
+				launch_context,
+				ClientConfigurator.PREWARM_TIMEOUT_MS,
+				{},
+				Callable(self, "_is_client_action_cancel_requested").bind(client_id),
+			)
 	return {
 		"client_id": client_id,
 		"action": action,
@@ -2306,6 +2327,23 @@ var _client_action_phases: Dictionary = {}
 ## Rows whose button text already reflects their phase, so the per-frame poll
 ## rewrites the label once instead of on every frame.
 var _client_action_phase_shown: Dictionary = {}
+
+
+## Thread-safe cancellation state read by McpCliExec's 50ms poll loop.
+func _set_client_action_cancel_requested(client_id: String, requested: bool) -> void:
+	_client_action_cancel_mutex.lock()
+	if requested:
+		_client_action_cancelled_clients[client_id] = true
+	else:
+		_client_action_cancelled_clients.erase(client_id)
+	_client_action_cancel_mutex.unlock()
+
+
+func _is_client_action_cancel_requested(client_id: String) -> bool:
+	_client_action_cancel_mutex.lock()
+	var requested := bool(_client_action_cancelled_clients.get(client_id, false))
+	_client_action_cancel_mutex.unlock()
+	return requested
 
 
 func _set_client_action_phase(client_id: String, phase: String) -> void:

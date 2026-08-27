@@ -980,6 +980,7 @@ func test_path_template_leaves_unresolvable_token_in_place() -> void:
 	# Restore before asserting so a failure can't leak into later tests.
 	if not saved.is_empty():
 		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
 
 	assert_eq(resolved, "$USERPROFILE/godot",
 		"an unresolvable token must be left in place, not replaced with an empty string")
@@ -999,6 +1000,7 @@ func test_path_template_still_expands_a_set_userprofile() -> void:
 		OS.unset_environment("USERPROFILE")
 	else:
 		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
 
 	assert_eq(resolved, fake.path_join("godot"))
 	assert_true(resolved.is_absolute_path())
@@ -1036,6 +1038,7 @@ func test_path_template_leaves_home_derived_tokens_in_place_without_home() -> vo
 	for var_name in VARS:
 		if not str(saved[var_name]).is_empty():
 			OS.set_environment(var_name, str(saved[var_name]))
+	McpClientConfigurator.warm_env_snapshot()
 
 	for index in range(templates.size()):
 		assert_eq(resolved[index], templates[index],
@@ -1244,6 +1247,7 @@ func test_ordered_config_candidates_fail_closed_for_unresolvable_root() -> void:
 
 	if not saved.is_empty():
 		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
 
 	assert_eq(resolution.get("path"), "",
 		"an unresolvable higher-priority candidate must not fall through")
@@ -1253,6 +1257,47 @@ func test_ordered_config_candidates_fail_closed_for_unresolvable_root() -> void:
 	assert_false(FileAccess.file_exists(fallback),
 		"Configure must not write the later candidate when the first cannot be inspected")
 	_remove_if_exists(fallback)
+
+
+func test_authoritative_wildcard_target_fails_closed_for_unresolvable_seed() -> void:
+	## An installed Store package makes its private config authoritative, but
+	## a later read-through root can contain the user's current config. If that
+	## root cannot be resolved, creating an empty private file would mask it.
+	var root := _scratch_dir.path_join("candidate_unresolved_seed")
+	_remove_dir_recursive(root)
+	var package_root := root.path_join("Packages/Claude_store")
+	DirAccess.make_dir_recursive_absolute(package_root)
+	var private_path := package_root.path_join(
+		"LocalCache/Roaming/Claude/claude_desktop_config.json"
+	)
+	var client := _make_test_json_client(private_path)
+	client.display_name = "Unresolved Seed Test"
+	var candidates := [
+		root.path_join("Packages/Claude_*/LocalCache/Roaming/Claude/claude_desktop_config.json"),
+		"$USERPROFILE/godot_ai_unresolved/claude_desktop_config.json",
+	]
+	client.config_path_candidates = {
+		"darwin": candidates,
+		"windows": candidates,
+		"linux": candidates,
+		"unix": candidates,
+	}
+	var saved := OS.get_environment("USERPROFILE")
+	OS.unset_environment("USERPROFILE")
+
+	var resolution := client.resolved_config_path_details()
+	var configured := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+
+	if not saved.is_empty():
+		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
+	assert_eq(resolution.get("path"), "",
+		"an unresolvable read-through seed must block the private target write")
+	assert_contains(str(resolution.get("error", "")), "$USERPROFILE")
+	assert_eq(configured.get("status"), "error")
+	assert_false(FileAccess.file_exists(private_path),
+		"Configure must not mask an unknown fallback with a fresh private file")
+	_remove_dir_recursive(root)
 
 
 func test_candidate_detect_path_marks_store_package_installed_without_config() -> void:
@@ -1775,6 +1820,7 @@ func test_unresolvable_path_template_fails_closed() -> void:
 
 	if not saved.is_empty():
 		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
 
 	var error := str(details.get("error", ""))
 	assert_eq(details.get("path"), "",
@@ -1815,6 +1861,7 @@ func test_unresolvable_merge_tier_template_fails_closed() -> void:
 
 	if not saved.is_empty():
 		OS.set_environment("USERPROFILE", saved)
+	McpClientConfigurator.warm_env_snapshot()
 
 	assert_eq(status.get("status"), McpClient.Status.ERROR,
 		"an unresolvable tier must not read as NOT_CONFIGURED")

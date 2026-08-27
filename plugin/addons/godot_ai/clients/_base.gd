@@ -394,26 +394,40 @@ func _resolve_ordered_config_path_candidates(templates: Variant) -> Dictionary:
 		# anything currently visible through read-through by naming the first
 		# later existing candidate as a one-time seed source.
 		if template.contains("*"):
-			var seed_path := _first_existing_later_candidate(ordered_templates, index + 1)
+			var seed := _first_existing_later_candidate(ordered_templates, index + 1)
+			if not str(seed.get("error", "")).is_empty():
+				_clear_config_path_warning()
+				return {"path": "", "error": seed["error"]}
 			_clear_config_path_warning()
-			return {"path": path, "error": "", "seed_path": seed_path}
+			return {"path": path, "error": "", "seed_path": seed.get("path", "")}
 		if fallback_create_path.is_empty():
 			fallback_create_path = path
 	_clear_config_path_warning()
 	return {"path": fallback_create_path, "error": ""}
 
 
-func _first_existing_later_candidate(templates: Array, start_index: int) -> String:
+## Find a readable seed for a newly-created authoritative wildcard target.
+## An unresolved later root is an error, not an absent seed: writing without
+## inspecting it could silently discard configuration visible through the
+## package's read-through fallback.
+func _first_existing_later_candidate(templates: Array, start_index: int) -> Dictionary:
 	for index in range(start_index, templates.size()):
-		var group := McpPathTemplate.expand_path_candidates(str(templates[index]))
+		var template := str(templates[index])
+		var expanded_template := McpPathTemplate.expand(template)
+		if not expanded_template.is_absolute_path():
+			return {
+				"path": "",
+				"error": unresolved_config_path_error(display_name, expanded_template),
+			}
+		var group := McpPathTemplate.expand_path_candidates(template)
 		# A seed is optional. Never choose among an ambiguous later wildcard;
 		# the authoritative target was already resolved by the earlier group.
 		if group.size() != 1:
 			continue
 		var path := String(group[0])
 		if FileAccess.file_exists(path):
-			return path
-	return ""
+			return {"path": path, "error": ""}
+	return {"path": "", "error": ""}
 
 
 func _warn_config_path_once(message: String) -> void:

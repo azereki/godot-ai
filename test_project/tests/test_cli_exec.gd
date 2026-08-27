@@ -113,6 +113,32 @@ func test_run_kills_subprocess_when_budget_expires() -> void:
 		"Timeout kill must return within ~budget+poll, not wait for sleep to finish (elapsed=%dms)" % elapsed_msec)
 
 
+func test_run_cancels_subprocess_without_reporting_timeout() -> void:
+	## Teardown/update cancellation must retain the long normal cold-install
+	## budget while still letting the editor stop an in-flight uvx promptly.
+	if OS.get_name() == "Windows":
+		skip("Windows lacks `sleep` as a standalone exe; cover via Unix")
+		return
+	var sleep_exe := "/bin/sleep"
+	if not FileAccess.file_exists(sleep_exe):
+		sleep_exe = "/usr/bin/sleep"
+	if not FileAccess.file_exists(sleep_exe):
+		skip("No /bin/sleep or /usr/bin/sleep on this host")
+		return
+	var started_msec := Time.get_ticks_msec()
+	var result := McpCliExec.run(
+		sleep_exe, ["5"], 5000, true, func() -> bool: return true
+	)
+	var elapsed_msec := Time.get_ticks_msec() - started_msec
+	assert_true(bool(result.get("cancelled", false)),
+		"a requested stop must be reported as cancellation")
+	assert_false(bool(result.get("timed_out", false)),
+		"cooperative shutdown is not a wall-clock timeout")
+	assert_eq(int(result.get("exit_code", 0)), -1)
+	assert_true(elapsed_msec < 3000,
+		"Cancellation must kill promptly instead of waiting for the child (elapsed=%dms)" % elapsed_msec)
+
+
 func test_run_wraps_cmd_files_through_cmd_exe_on_windows() -> void:
 	## Regression for #251: `McpCliFinder` resolving a Node-style CLI to
 	## its `.cmd` wrapper used to trip CreateProcessW with

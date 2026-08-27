@@ -1588,7 +1588,9 @@ static func prewarm_server_package_argv(version: String) -> Array[String]:
 ## Returns the `McpCliExec.run` dict, plus `skipped` (true when there is no
 ## uvx tier to warm or no usable version pin).
 static func prewarm_server_package_blocking(
-	version: String, timeout_ms: int = PREWARM_TIMEOUT_MS
+	version: String,
+	timeout_ms: int = PREWARM_TIMEOUT_MS,
+	cancel_check: Callable = Callable(),
 ) -> Dictionary:
 	var args := prewarm_server_package_argv(version)
 	if args.is_empty():
@@ -1597,7 +1599,7 @@ static func prewarm_server_package_blocking(
 	if uvx.is_empty():
 		## dev-venv and system tiers have no per-version cache to warm.
 		return {"skipped": true, "reason": "no uvx"}
-	var result := McpCliExec.run(uvx, args, timeout_ms, true)
+	var result := McpCliExec.run(uvx, args, timeout_ms, true, cancel_check)
 	result["skipped"] = false
 	return result
 
@@ -1635,11 +1637,14 @@ static func prewarm_attach_launch(
 	launch_context: Dictionary,
 	timeout_ms: int = PREWARM_TIMEOUT_MS,
 	discovery_override: Dictionary = {},
+	cancel_check: Callable = Callable(),
 ) -> Dictionary:
 	var plan := prewarm_attach_plan(launch_context, discovery_override)
 	if not bool(plan.get("warm", false)):
 		return {"skipped": true, "reason": str(plan.get("reason", ""))}
-	return prewarm_server_package_blocking(str(plan.get("version", "")), timeout_ms)
+	return prewarm_server_package_blocking(
+		str(plan.get("version", "")), timeout_ms, cancel_check
+	)
 
 
 static func _uvx_cli_names() -> Array[String]:
