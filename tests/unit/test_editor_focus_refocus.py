@@ -298,7 +298,12 @@ def test_install_update_drains_workers_and_blocks_spawning_before_extract() -> N
 
     flag_set_idx = install_block.find("_install_in_flight = true")
     drain_idx = install_block.find("_drain_dock_workers()")
-    handoff_idx = install_block.find("install_downloaded_update")
+    # Match the CALL, not the name. A bare `install_downloaded_update` search
+    # also matches any comment that mentions the function, and a comment above
+    # the drain would then read as a handoff before it — failing this test for
+    # prose rather than for ordering (hit for real when #896 documented the
+    # pre-warm gate directly above the drain).
+    handoff_idx = install_block.find("_plugin.install_downloaded_update(")
     symlink_return_idx = install_block.find("addons_dir_is_symlink()")
 
     assert flag_set_idx > 0, (
@@ -312,6 +317,11 @@ def test_install_update_drains_workers_and_blocks_spawning_before_extract() -> N
         "if not joined first."
     )
     assert symlink_return_idx > 0, "Test fixture broken: could not locate the symlink-safety check."
+    assert handoff_idx > 0, (
+        "Test fixture broken: could not locate the `_plugin.install_downloaded_update(` "
+        "handoff. Without this the ordering assertion below compares against -1 and "
+        "fails for the wrong reason."
+    )
 
     assert symlink_return_idx < flag_set_idx, (
         "Order: symlink-safety check → set _install_in_flight flag. Setting "
