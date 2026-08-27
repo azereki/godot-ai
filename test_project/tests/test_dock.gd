@@ -1777,6 +1777,43 @@ func test_configure_phase_labels_the_package_build_instead_of_hanging_silent() -
 	dock.free()
 
 
+func test_prewarm_phase_widens_the_client_action_watchdog() -> void:
+	## Regression (#894 CodeRabbit): the action watchdog abandons a worker after
+	## CLIENT_ACTION_TIMEOUT_MSEC (30s), sized for a CLI registry call. The
+	## Configure pre-warm can legitimately run far longer while uv builds the
+	## pinned environment — so a cold build would trip the watchdog, re-enable
+	## the row, discard the worker's completion, and report a false Configure
+	## timeout for exactly the slow cold start the pre-warm exists to absorb.
+	var dock := McpDockScript.new()
+
+	assert_eq(
+		dock._client_action_budget_msec("claude_code"),
+		McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC,
+		"a plain config write keeps the short registry budget"
+	)
+
+	dock._set_client_action_phase("claude_code", "prewarm")
+	var warmed := dock._client_action_budget_msec("claude_code")
+	assert_true(
+		warmed >= McpClientConfigurator.PREWARM_TIMEOUT_MS,
+		"the watchdog must outlast the pre-warm's own ceiling, not fire mid-build"
+	)
+	assert_true(
+		warmed > McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC,
+		"the prewarm phase must widen the budget"
+	)
+
+	## A cleared phase must fall back to the short budget, or one slow Configure
+	## would leave the row's next action effectively unwatched.
+	dock._clear_client_action_phase("claude_code")
+	assert_eq(
+		dock._client_action_budget_msec("claude_code"),
+		McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC,
+		"a cleared phase must restore the short budget"
+	)
+	dock.free()
+
+
 func test_configure_phase_is_ignored_for_an_unknown_row() -> void:
 	## A row can be rebuilt (status refresh) while its worker is still in
 	## flight; the poll must not fault on the vanished row.

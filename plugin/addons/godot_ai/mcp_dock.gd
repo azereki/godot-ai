@@ -401,6 +401,7 @@ func _drain_client_action_workers() -> void:
 		_client_action_generations[client_id] = int(_client_action_generations.get(client_id, 0)) + 1
 		_client_action_started_msec.erase(client_id)
 		_client_action_names.erase(client_id)
+		_clear_client_action_phase(String(client_id))
 		_finalize_action_buttons(String(client_id))
 		var row: Dictionary = _client_rows.get(String(client_id), {})
 		if not row.is_empty():
@@ -416,6 +417,10 @@ func _drain_client_action_workers() -> void:
 	_orphaned_client_action_threads.clear()
 	_client_action_started_msec.clear()
 	_client_action_names.clear()
+	_client_action_phase_mutex.lock()
+	_client_action_phases.clear()
+	_client_action_phase_mutex.unlock()
+	_client_action_phase_shown.clear()
 
 
 func _check_client_action_timeouts() -> void:
@@ -424,8 +429,27 @@ func _check_client_action_timeouts() -> void:
 		if not _client_action_started_msec.has(client_id):
 			continue
 		var started := int(_client_action_started_msec.get(client_id, 0))
-		if now - started >= CLIENT_ACTION_TIMEOUT_MSEC:
+		if now - started >= _client_action_budget_msec(String(client_id)):
 			_abandon_client_action_thread(String(client_id))
+
+
+## Watchdog budget for an in-flight client action.
+##
+## The 30s default is sized for a CLI registry call. Once the worker reports it
+## has moved on to building the pinned uv environment, that budget is far too
+## short: a cold build is *expected* to run for tens of seconds, and abandoning
+## it would report a false Configure timeout for exactly the slow cold start the
+## pre-warm exists to absorb — re-enabling the row and discarding the worker's
+## completion while the build is still running and about to succeed.
+##
+## The prewarm phase therefore gets the base budget plus the pre-warm's own
+## ceiling. The action still cannot hang forever: `McpCliExec.run` bounds the
+## build at `PREWARM_TIMEOUT_MS` on its own, so this is a backstop above a
+## backstop rather than the only limit.
+func _client_action_budget_msec(client_id: String) -> int:
+	if _read_client_action_phase(client_id) == _PHASE_PREWARM:
+		return CLIENT_ACTION_TIMEOUT_MSEC + ClientConfigurator.PREWARM_TIMEOUT_MS
+	return CLIENT_ACTION_TIMEOUT_MSEC
 
 
 func _abandon_client_action_thread(client_id: String) -> void:
@@ -438,6 +462,7 @@ func _abandon_client_action_thread(client_id: String) -> void:
 		_orphaned_client_action_threads.append(thread)
 	_client_action_threads.erase(client_id)
 	_client_action_started_msec.erase(client_id)
+	_clear_client_action_phase(client_id)
 	var action := str(_client_action_names.get(client_id, "configure"))
 	_client_action_names.erase(client_id)
 	_client_action_generations[client_id] = int(_client_action_generations.get(client_id, 0)) + 1
