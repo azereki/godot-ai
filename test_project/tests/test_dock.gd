@@ -1777,6 +1777,53 @@ func test_configure_phase_labels_the_package_build_instead_of_hanging_silent() -
 	dock.free()
 
 
+func test_abandoned_worker_blocks_an_overlapping_action_for_that_row() -> void:
+	## The watchdog abandons a worker by erasing the row's `_client_action_threads`
+	## slot — which is also the dispatch guard. So without a per-client orphan
+	## record, a re-click after a timeout starts a SECOND worker while the first
+	## is still running: two uv builds and two writers on the same config file.
+	var dock := McpDockScript.new()
+	McpDockScript._orphaned_client_action_owners.clear()
+
+	assert_false(
+		McpDockScript._has_live_orphan("claude_code"),
+		"a row with no abandoned worker must be dispatchable"
+	)
+
+	## A live orphan holds the row.
+	var live := Thread.new()
+	live.start(func() -> int:
+		## Long enough to still be running when the assertion below reads it.
+		OS.delay_msec(400)
+		return 0
+	)
+	McpDockScript._orphaned_client_action_owners["claude_code"] = [live]
+	assert_true(
+		McpDockScript._has_live_orphan("claude_code"),
+		"a still-running abandoned worker must block a new action on its row"
+	)
+	## A different row is unaffected — the guard is per client, not global.
+	assert_false(
+		McpDockScript._has_live_orphan("codex"),
+		"one row's orphan must not block every other client"
+	)
+
+	live.wait_to_finish()
+	assert_false(
+		McpDockScript._has_live_orphan("claude_code"),
+		"a finished orphan must release the row"
+	)
+
+	## The prune must drop the finished orphan so the row is not held forever.
+	dock._release_finished_orphan_owners()
+	assert_false(
+		McpDockScript._orphaned_client_action_owners.has("claude_code"),
+		"prune must clear the finished orphan record"
+	)
+	McpDockScript._orphaned_client_action_owners.clear()
+	dock.free()
+
+
 func test_prewarm_phase_widens_the_client_action_watchdog() -> void:
 	## Regression (#894 CodeRabbit): the action watchdog abandons a worker after
 	## CLIENT_ACTION_TIMEOUT_MSEC (30s), sized for a CLI registry call. The

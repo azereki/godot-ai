@@ -220,6 +220,16 @@ var _client_action_names: Dictionary = {}
 ## Timed-out Configure/Remove workers are abandoned but retained here until
 ## they finish, so GDScript does not destroy a live Thread object.
 static var _orphaned_client_action_threads: Array[Thread] = []
+## Which client each abandoned worker belonged to, so a row whose worker was
+## abandoned but is STILL RUNNING can't start a second one on top of it.
+## The flat array above exists to keep Thread objects alive; it carries no
+## client association, and `_abandon_client_action_thread` erases the row's
+## `_client_action_threads` slot — so the dispatch guard alone would let a
+## re-click spawn an overlapping worker. Two concurrent Configure workers for
+## one client means two uv builds and two writers on the same config file.
+## Static for the same reason as the array: a script reload must not GC a
+## live Thread.
+static var _orphaned_client_action_owners: Dictionary = {}
 
 # Dev-mode only
 var _dev_section: VBoxContainer
@@ -415,6 +425,7 @@ func _drain_client_action_workers() -> void:
 		if thread != null:
 			thread.wait_to_finish()
 	_orphaned_client_action_threads.clear()
+	_orphaned_client_action_owners.clear()
 	_client_action_started_msec.clear()
 	_client_action_names.clear()
 	_client_action_phase_mutex.lock()
@@ -460,13 +471,21 @@ func _abandon_client_action_thread(client_id: String) -> void:
 	var worker_alive := thread != null and thread.is_alive()
 	if thread != null:
 		_orphaned_client_action_threads.append(thread)
+		if worker_alive:
+			var owned: Array = _orphaned_client_action_owners.get(client_id, [])
+			owned.append(thread)
+			_orphaned_client_action_owners[client_id] = owned
 	_client_action_threads.erase(client_id)
 	_client_action_started_msec.erase(client_id)
 	_clear_client_action_phase(client_id)
 	var action := str(_client_action_names.get(client_id, "configure"))
 	_client_action_names.erase(client_id)
 	_client_action_generations[client_id] = int(_client_action_generations.get(client_id, 0)) + 1
-	_finalize_action_buttons(client_id)
+	## Only hand the row back when nothing is still running for it. Re-enabling
+	## while the abandoned worker is mid-build invites a second worker on top
+	## of the first; the prune below re-enables the row once it actually ends.
+	if not worker_alive:
+		_finalize_action_buttons(client_id)
 	print("MCP | client action timed out: client=%s action=%s elapsed_ms=%d worker_alive=%s" % [
 		client_id,
 		action,
@@ -474,11 +493,12 @@ func _abandon_client_action_thread(client_id: String) -> void:
 		str(worker_alive),
 	])
 	var label := "Remove" if action == "remove" else "Configure"
-	_apply_row_status(
-		client_id,
-		Client.Status.ERROR,
-		"%s did not report completion in time; refreshing current status." % label
+	var detail := (
+		"%s is taking longer than expected and is still running; refreshing current status." % label
+		if worker_alive
+		else "%s did not report completion in time; refreshing current status." % label
 	)
+	_apply_row_status(client_id, Client.Status.ERROR, detail)
 	_refresh_clients_summary()
 	if is_inside_tree():
 		_request_client_status_refresh(true)
@@ -494,8 +514,35 @@ func _prune_orphaned_client_action_threads() -> void:
 			thread.wait_to_finish()
 			_orphaned_client_action_threads.remove_at(i)
 			completed_orphan = true
+	_release_finished_orphan_owners()
 	if completed_orphan and is_inside_tree():
 		_request_client_action_completion_refresh()
+
+
+## Hand a row back once its abandoned worker has actually finished. Pairs with
+## `_abandon_client_action_thread`, which deliberately leaves the buttons
+## disabled while the orphan is still running — without this the row would stay
+## disabled forever.
+func _release_finished_orphan_owners() -> void:
+	for client_id in _orphaned_client_action_owners.keys():
+		var owned: Array = _orphaned_client_action_owners[client_id]
+		for i in range(owned.size() - 1, -1, -1):
+			var t: Thread = owned[i]
+			if t == null or not t.is_alive():
+				owned.remove_at(i)
+		if owned.is_empty():
+			_orphaned_client_action_owners.erase(client_id)
+			if not _client_action_threads.has(client_id):
+				_finalize_action_buttons(String(client_id))
+
+
+## True while a previously-abandoned worker for this client is still running.
+static func _has_live_orphan(client_id: String) -> bool:
+	var owned: Array = _orphaned_client_action_owners.get(client_id, [])
+	for t in owned:
+		if t != null and (t as Thread).is_alive():
+			return true
+	return false
 
 
 func _request_client_action_completion_refresh() -> void:
@@ -2088,6 +2135,11 @@ func _dispatch_client_action(client_id: String, action: String) -> void:
 		## SIGABRT in `GDScriptFunction::call`. See `_update_manager`.
 		return
 	if _client_action_threads.has(client_id):
+		return
+	## An abandoned-but-still-running worker owns this row's config file just
+	## as much as a tracked one does. Defensive: `_abandon_client_action_thread`
+	## already leaves the buttons disabled in that state.
+	if _has_live_orphan(client_id):
 		return
 	var row: Dictionary = _client_rows.get(client_id, {})
 	if row.is_empty():
