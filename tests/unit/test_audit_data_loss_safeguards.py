@@ -292,11 +292,16 @@ def test_atomic_write_copy_paths_fail_closed_on_permission_errors() -> None:
 
     backup_copy = write_block.index("DirAccess.copy_absolute(path, backup_path) == OK")
     backup_mode = write_block.index("if not _apply_mode(backup_path, target_mode):", backup_copy)
+    backup_mode_cleanup = write_block.index(
+        "DirAccess.remove_absolute(backup_path)", backup_mode
+    )
     backup_success = write_block.index("backup_made = true", backup_mode)
-    assert backup_copy < backup_mode < backup_success
+    assert backup_copy < backup_mode < backup_mode_cleanup < backup_success
 
-    backup_failure = write_block.index("DirAccess.remove_absolute(backup_path)", backup_success)
-    assert backup_failure > backup_success
+    partial_backup_cleanup = write_block.index(
+        "DirAccess.remove_absolute(backup_path)", backup_success
+    )
+    assert partial_backup_cleanup > backup_success
 
     destination_copy = write_block.index("DirAccess.copy_absolute(tmp_path, path) == OK")
     destination_mode = write_block.index("if _apply_mode(path, target_mode):", destination_copy)
@@ -309,6 +314,8 @@ def test_atomic_write_copy_paths_fail_closed_on_permission_errors() -> None:
 
 
 def test_atomic_write_permission_warning_includes_godot_error_text() -> None:
+    """Permission failures should name Godot's readable error, not only its number."""
+
     source = ATOMIC_WRITE_PATH.read_text(encoding="utf-8")
     mode_block = get_func_block(source, "static func _apply_mode(")
     assert "error_string(err)" in mode_block
