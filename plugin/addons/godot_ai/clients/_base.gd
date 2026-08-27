@@ -216,6 +216,7 @@ var config_file_env: String = ""
 ## override to apply. Only declare a mapping when the client's docs guarantee
 ## the env var relocates the exact file we write — a wrong mapping writes the
 ## MCP entry somewhere the client never reads and Configure false-succeeds.
+## Relative values fail closed for the same reason `config_file_env`'s do.
 var config_home_env: String = ""
 ## Path of the config file relative to the env var's directory, e.g.
 ## "config.toml". Joined verbatim — no per-OS variants needed because the env
@@ -285,10 +286,10 @@ func resolved_config_path_details() -> Dictionary:
 	if not str(file_override.get("path", "")).is_empty() or not str(file_override.get("error", "")).is_empty():
 		_clear_config_path_warning()
 		return file_override
-	var override := config_home_override()
-	if not override.is_empty():
+	var home_override := config_home_override_details()
+	if not str(home_override.get("path", "")).is_empty() or not str(home_override.get("error", "")).is_empty():
 		_clear_config_path_warning()
-		return {"path": override, "error": ""}
+		return home_override
 	var candidate_key := McpPathTemplate.platform_key(candidates)
 	if not candidate_key.is_empty():
 		return _resolve_ordered_config_path_candidates(candidates[candidate_key])
@@ -390,18 +391,40 @@ func _clear_config_path_warning() -> void:
 	_config_path_warning_mutex.unlock()
 
 
-## The env-var-relocated config path, or "" when no override applies
-## (no mapping declared, env var unset, or env var empty/whitespace).
-func config_home_override() -> String:
+## The config-home env override plus any fail-closed diagnostic. Empty path and
+## error means no override applies (no mapping declared, env var unset, or env
+## var empty/whitespace).
+func config_home_override_details() -> Dictionary:
 	if config_home_env.is_empty() or config_home_env_subpath.is_empty():
-		return ""
+		return {"path": "", "error": ""}
 	## env_lookup, not OS.get_environment: this runs on dock worker threads,
 	## which must not race the spawn window's setenv/unsetenv (#691).
 	var home := McpPathTemplate.env_lookup(config_home_env).strip_edges()
 	if home.is_empty():
-		return ""
+		return {"path": "", "error": ""}
 	# Expand a leading ~ so `CODEX_HOME=~/codex-alt` behaves like the shell.
-	return McpPathTemplate.expand(home).path_join(config_home_env_subpath)
+	var expanded := McpPathTemplate.expand(home)
+	## Same fail-closed rule as `config_file_override_details`: a relative value
+	## resolves against the EDITOR's working directory, not the client's, so
+	## honouring it silently aims the write at the Godot project directory
+	## instead of the file the client reads. The write layer can only name the
+	## mangled path it was handed; only here do we still know which env var
+	## produced it, so this is where the user-facing explanation belongs.
+	if not expanded.is_absolute_path():
+		return {
+			"path": "",
+			"error": "%s's $%s override must be an absolute config-home directory path; got %s" % [
+				display_name, config_home_env, home,
+			],
+		}
+	return {"path": expanded.path_join(config_home_env_subpath), "error": ""}
+
+
+## The env-var-relocated config path, or "" when no override applies (no
+## mapping declared, env var unset, env var empty/whitespace, or a value that
+## failed closed — `config_home_override_details` carries that diagnostic).
+func config_home_override() -> String:
+	return str(config_home_override_details().get("path", ""))
 
 
 ## True when a CLI client also declares where its config file lives, so it can
