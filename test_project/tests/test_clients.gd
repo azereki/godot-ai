@@ -1560,6 +1560,83 @@ func test_config_file_env_relative_path_fails_closed() -> void:
 	assert_contains(str(details.get("error", "")), "absolute config-file path")
 
 
+func test_config_home_env_relative_path_fails_closed() -> void:
+	## A relative $CODEX_HOME / $CLAUDE_CONFIG_DIR resolves against the EDITOR's
+	## working directory, not the client's, so honouring it aims Configure at
+	## the Godot project directory instead of the file the client reads. Fail
+	## closed with the same variable-naming diagnostic the exact-file override
+	## gives: the write layer's generic "Cannot write to <relative path>" never
+	## says which env var mangled the path, so the user has nothing to fix.
+	var default_path := _scratch_dir.path_join("home_env_default_untouched.toml")
+	_remove_if_exists(default_path)
+	var client := _make_env_override_toml_client(default_path)
+	var relative_home := "godot_ai_relative_cfg_home"
+	var leak_dir := ProjectSettings.globalize_path("res://").path_join(relative_home)
+	var project_leak := leak_dir.path_join("config.toml")
+	_remove_if_exists(project_leak)
+	DirAccess.remove_absolute(leak_dir)
+	var prior_env := OS.get_environment(TEST_CFG_HOME_ENV)
+	OS.set_environment(TEST_CFG_HOME_ENV, relative_home)
+
+	var details := client.resolved_config_path_details()
+	var override := client.config_home_override()
+	var configured := McpTomlStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var status := McpTomlStrategy.check_status(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+
+	if prior_env.is_empty():
+		OS.unset_environment(TEST_CFG_HOME_ENV)
+	else:
+		OS.set_environment(TEST_CFG_HOME_ENV, prior_env)
+
+	var error := str(details.get("error", ""))
+	assert_eq(override, "", "a relative config-home value must not resolve to a path")
+	assert_eq(details.get("path"), "",
+		"a failed-closed override must not fall back to path_template")
+	assert_contains(error, "$%s" % TEST_CFG_HOME_ENV,
+		"the error must name the env var that produced the path: %s" % error)
+	assert_contains(error, "absolute",
+		"the error must say the value has to be absolute: %s" % error)
+	assert_contains(error, relative_home,
+		"the error must echo the offending value: %s" % error)
+	assert_eq(configured.get("status"), "error")
+	assert_eq(configured.get("message"), error,
+		"Configure must surface the env-var explanation, not a generic write failure")
+	assert_eq(status, McpClient.Status.ERROR,
+		"the dock row must read ERROR, not a silently-unconfigured green/grey")
+	assert_false(FileAccess.file_exists(default_path),
+		"a failed-closed override must not fall back to writing the path_template default")
+	assert_false(FileAccess.file_exists(project_leak),
+		"a relative override must never write a config into the Godot project directory")
+	## The atomic write creates the parent before it discovers it cannot open
+	## the file, so the un-gated path leaves a stray directory in the project
+	## even on the "Cannot write to ..." failure. Nothing may be created here.
+	assert_false(DirAccess.dir_exists_absolute(leak_dir),
+		"a relative override must not create a directory in the Godot project either")
+	_remove_if_exists(project_leak)
+	DirAccess.remove_absolute(leak_dir)
+
+
+func test_config_home_env_tilde_value_still_resolves() -> void:
+	## The absolute-path gate must not reject the shell-style value it was
+	## always meant to accept: `CODEX_HOME=~/codex-alt` expands to an absolute
+	## home-relative directory before the check runs.
+	var default_path := _scratch_dir.path_join("home_env_tilde_default.toml")
+	var client := _make_env_override_toml_client(default_path)
+	var prior_env := OS.get_environment(TEST_CFG_HOME_ENV)
+	OS.set_environment(TEST_CFG_HOME_ENV, "~/godot_ai_tilde_cfg_home")
+	var details := client.resolved_config_path_details()
+	if prior_env.is_empty():
+		OS.unset_environment(TEST_CFG_HOME_ENV)
+	else:
+		OS.set_environment(TEST_CFG_HOME_ENV, prior_env)
+
+	assert_eq(details.get("error"), "", "a ~-prefixed config home must not fail closed")
+	var path := str(details.get("path", ""))
+	assert_true(path.is_absolute_path(), "~ must expand to an absolute path: %s" % path)
+	assert_true(path.ends_with("godot_ai_tilde_cfg_home/config.toml"),
+		"the subpath must still be joined onto the expanded home: %s" % path)
+
+
 func test_codex_declares_codex_home_override() -> void:
 	var client := McpClientRegistry.get_by_id("codex")
 	assert_true(client != null, "codex must be registered")
