@@ -644,6 +644,29 @@ func test_configure_all_dispatches_while_incompatible() -> void:
 		"Configure all must dispatch writes for unconfigured rows while INCOMPATIBLE")
 
 
+func test_configure_all_dispatches_while_incompatible_refresh_running() -> void:
+	## `_set_incompatible_server()` can flip INCOMPATIBLE without clearing
+	## `_refresh_state`. Per-row Configure already ignores RUNNING; Configure
+	## all must too, or the button stays dead until the sweep finishes.
+	var plugin := _RestartDispatchPlugin.new()
+	plugin.status = {
+		"state": McpServerState.INCOMPATIBLE,
+		"message": "Port 8000 is occupied by godot-ai server v1.2.10; plugin expects v2.2.0.",
+	}
+	var dock := _RepinRecordingDock.new()
+	dock._plugin = plugin
+	dock._refresh_state = McpClientRefreshState.RUNNING
+	dock._client_rows["claude_code"] = {"status": McpClient.Status.NOT_CONFIGURED}
+
+	dock._on_configure_all_clients()
+	var configured := dock.configured_ids.duplicate()
+	dock.free()
+	plugin.free()
+
+	assert_eq(configured, ["claude_code"] as Array[String],
+		"Configure all must dispatch while INCOMPATIBLE even if a refresh is RUNNING")
+
+
 func test_post_update_repin_reconfigures_pin_only_rows_once() -> void:
 	## After a self-update the plugin arms the one-shot repin; the first
 	## completed sweep with drift must reconfigure the rows whose only drift

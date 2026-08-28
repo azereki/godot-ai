@@ -2453,7 +2453,14 @@ func _on_refresh_clients_pressed() -> void:
 
 
 func _on_configure_all_clients() -> void:
-	if ClientRefreshStateScript.should_disable_client_actions(_refresh_state):
+	## Per-row Configure already bypasses the RUNNING gate. INCOMPATIBLE
+	## skips health interpretation (#916), so Configure all must do the same
+	## even if a status sweep is still in flight — `_set_incompatible_server`
+	## does not reset `_refresh_state`.
+	if (
+		ClientRefreshStateScript.should_disable_client_actions(_refresh_state)
+		and not _server_blocks_client_health()
+	):
 		return
 	for client_id in _client_rows:
 		var status: Client.Status = _client_rows[client_id].get("status", Client.Status.NOT_CONFIGURED)
@@ -3054,7 +3061,10 @@ func _refresh_clients_summary() -> void:
 		)
 	_clients_summary_label.text = text
 	if _client_configure_all_btn != null:
-		_client_configure_all_btn.disabled = ClientRefreshStateScript.should_disable_client_actions(_refresh_state)
+		_client_configure_all_btn.disabled = (
+			ClientRefreshStateScript.should_disable_client_actions(_refresh_state)
+			and not _server_blocks_client_health()
+		)
 	if _client_empty_cta_btn != null:
 		_client_empty_cta_btn.visible = configured == 0 and _client_status_refresh_has_completed()
 	_refresh_drift_banner(mismatched_ids)
