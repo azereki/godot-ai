@@ -175,6 +175,7 @@ var _started := false
 var _validated := false
 var _finished := false
 var _status_wait_started_ms := 0
+var _pre_instance_id := ""
 
 
 func _ready() -> void:
@@ -191,7 +192,20 @@ func _process(_delta: float) -> void:
 \tif _finished:
 \t\treturn
 \t_frames += 1
-\tif not _started and _frames >= START_AFTER_FRAMES:
+\tif not _started:
+\t\tif _frames < START_AFTER_FRAMES:
+\t\t\treturn
+\t\tif _frames > MAX_FRAMES:
+\t\t\tpush_error("SELF_UPDATE_TEST | pre-update /godot-ai/status timed out")
+\t\t\t_finished = true
+\t\t\tget_tree().quit(12)
+\t\t\treturn
+\t\tvar pre := _fetch_status(HTTP_PORT)
+\t\tvar pre_id := str(pre.get("instance_id", ""))
+\t\tif pre_id.is_empty():
+\t\t\treturn
+\t\t_pre_instance_id = pre_id
+\t\tprint("SELF_UPDATE_TEST | pre-update instance_id=%s" % _pre_instance_id)
 \t\t_call_install()
 \t\treturn
 \tif _started and not _validated:
@@ -245,15 +259,19 @@ func _try_write_status() -> bool:
 \tvar version := str(payload.get("server_version", ""))
 \tif version.is_empty():
 \t\treturn false
+\tvar post_id := str(payload.get("instance_id", ""))
+\tif post_id.is_empty() or post_id == _pre_instance_id:
+\t\treturn false
 \tvar f := FileAccess.open(STATUS_PATH, FileAccess.WRITE)
 \tif f == null:
 \t\tpush_error("SELF_UPDATE_TEST | failed to write status snapshot")
 \t\treturn false
 \tf.store_string(JSON.stringify(payload))
 \tf.close()
-\tprint("SELF_UPDATE_TEST | status name=%s server_version=%s" % [
+\tprint("SELF_UPDATE_TEST | status name=%s server_version=%s instance_id=%s" % [
 \t\tpayload.get("name"),
 \t\tversion,
+\t\tpost_id,
 \t])
 \treturn true
 
@@ -284,6 +302,7 @@ func _fetch_status(port: int) -> Dictionary:
 \tif not http.has_response():
 \t\treturn {{}}
 \tvar body := PackedByteArray()
+\tdeadline = Time.get_ticks_msec() + 2000
 \twhile http.get_status() == HTTPClient.STATUS_BODY:
 \t\thttp.poll()
 \t\tvar chunk := http.read_response_body_chunk()
@@ -291,6 +310,8 @@ func _fetch_status(port: int) -> Dictionary:
 \t\t\tbody.append_array(chunk)
 \t\telse:
 \t\t\tOS.delay_msec(5)
+\t\tif Time.get_ticks_msec() > deadline:
+\t\t\treturn {{}}
 \tvar parsed: Variant = JSON.parse_string(body.get_string_from_utf8())
 \tif typeof(parsed) != TYPE_DICTIONARY:
 \t\treturn {{}}

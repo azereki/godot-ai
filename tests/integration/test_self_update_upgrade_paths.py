@@ -36,6 +36,9 @@ def test_install_update_driver_calls_plugin_handoff(tmp_path: Path) -> None:
     assert f"const HTTP_PORT := {LIVE_HTTP_PORT}" in text
     assert "/godot-ai/status" in text
     assert "SELF_UPDATE_TEST | calling install_downloaded_update" in text
+    assert "SELF_UPDATE_TEST | pre-update instance_id=" in text
+    assert "post_id == _pre_instance_id" in text
+    assert "deadline = Time.get_ticks_msec() + 2000" in text
 
 
 def test_current_runner_upgrades_to_synthetic_next_without_parse_errors(
@@ -174,6 +177,7 @@ def test_install_downloaded_update_restarts_live_server(tmp_path: Path) -> None:
     assert "SELF_UPDATE_TEST | calling install_downloaded_update" in log
     assert "SELF_UPDATE_TEST | synthetic handler marker synthetic_next" in log
     assert f"SELF_UPDATE_TEST | status name=godot-ai server_version={server_version}" in log
+    assert "SELF_UPDATE_TEST | pre-update instance_id=" in log
     assert read_plugin_version(base_addon / "plugin.cfg") == next_version
 
     status_path = project / POST_UPDATE_STATUS_FILE
@@ -181,5 +185,14 @@ def test_install_downloaded_update_restarts_live_server(tmp_path: Path) -> None:
     payload = json.loads(status_path.read_text(encoding="utf-8"))
     assert payload.get("name") == "godot-ai"
     assert payload.get("server_version") == server_version
+    post_id = payload.get("instance_id")
+    assert isinstance(post_id, str) and post_id
+    pre_line = next(
+        line
+        for line in log.splitlines()
+        if line.startswith("SELF_UPDATE_TEST | pre-update instance_id=")
+    )
+    pre_id = pre_line.split("=", 1)[1]
+    assert post_id != pre_id
 
     shutil.rmtree(vnext_addon.parents[1], ignore_errors=True)

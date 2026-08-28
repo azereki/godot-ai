@@ -11,6 +11,7 @@ matters: click Update in the dock.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import platform
@@ -1168,7 +1169,13 @@ def fetch_status_payload(http_port: int, timeout: float = 2.0) -> dict | None:
             if getattr(resp, "status", 200) != 200:
                 return None
             payload = json.loads(resp.read().decode())
-    except (OSError, TimeoutError, ValueError, urllib.error.URLError):
+    except (
+        OSError,
+        TimeoutError,
+        ValueError,
+        urllib.error.URLError,
+        http.client.IncompleteRead,
+    ):
         return None
     return payload if isinstance(payload, dict) else None
 
