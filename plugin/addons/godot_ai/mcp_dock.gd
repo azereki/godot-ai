@@ -2123,10 +2123,9 @@ func _on_install_uv() -> void:
 # --- Client section ---
 
 func _on_configure_client(client_id: String) -> void:
-	if _server_blocks_client_health():
-		_apply_row_status(client_id, Client.Status.ERROR, _server_blocked_client_message())
-		_refresh_clients_summary()
-		return
+	## Configure writes an explicit url + live plugin version; it does not
+	## need a healthy occupant. INCOMPATIBLE only suppresses status
+	## interpretation (#916).
 	_dispatch_client_action(client_id, "configure")
 
 
@@ -2291,10 +2290,6 @@ func _apply_client_action_result(client_id: String, action: String, result: Dict
 	_client_action_names.erase(client_id)
 	_clear_client_action_phase(client_id)
 	_finalize_action_buttons(client_id)
-	if _server_blocks_client_health():
-		_apply_row_status(client_id, Client.Status.ERROR, _server_blocked_client_message())
-		_refresh_clients_summary()
-		return
 
 	var success_status := Client.Status.NOT_CONFIGURED if action == "remove" else Client.Status.CONFIGURED
 	if result.get("status") == "ok":
@@ -2458,11 +2453,6 @@ func _on_refresh_clients_pressed() -> void:
 
 
 func _on_configure_all_clients() -> void:
-	if _server_blocks_client_health():
-		for client_id in _client_rows:
-			_apply_row_status(String(client_id), Client.Status.ERROR, _server_blocked_client_message())
-		_refresh_clients_summary()
-		return
 	if ClientRefreshStateScript.should_disable_client_actions(_refresh_state):
 		return
 	for client_id in _client_rows:
@@ -3140,9 +3130,7 @@ func _refresh_all_client_statuses() -> void:
 	## refresh: it bypasses focus-in cooldown but still runs probes off the editor
 	## main thread.
 	if _server_blocks_client_health():
-		for client_id in _client_rows:
-			_apply_row_status(String(client_id), Client.Status.ERROR, _server_blocked_client_message())
-		_refresh_clients_summary()
+		## Skip interpretation — do not paint every row ERROR (#916).
 		return
 	_request_client_status_refresh(true)
 
@@ -3251,9 +3239,7 @@ func _perform_initial_client_status_refresh() -> void:
 		return
 
 	if _server_blocks_client_health():
-		for client_id in _client_rows:
-			_apply_row_status(String(client_id), Client.Status.ERROR, _server_blocked_client_message())
-		_refresh_clients_summary()
+		## Skip interpretation — do not paint every row ERROR (#916).
 		return
 
 	_warm_strategy_bytecode()
@@ -3338,9 +3324,7 @@ func _request_client_status_refresh(force: bool = false) -> bool:
 	## when a refresh is requested. The existing UI remains visible until the
 	## background worker's result is applied on the main thread.
 	if _server_blocks_client_health():
-		for client_id in _client_rows:
-			_apply_row_status(String(client_id), Client.Status.ERROR, _server_blocked_client_message())
-		_refresh_clients_summary()
+		## Skip interpretation — do not paint every row ERROR (#916).
 		return false
 	if _is_self_update_in_progress():
 		## Self-update is overwriting plugin scripts on disk; spawning a worker
@@ -3511,8 +3495,7 @@ func _apply_client_status_refresh_results(results: Dictionary, generation: int) 
 		_client_status_refresh_thread.wait_to_finish()
 		_client_status_refresh_thread = null
 	if _server_blocks_client_health():
-		for client_id in _client_rows:
-			_apply_row_status(String(client_id), Client.Status.ERROR, _server_blocked_client_message())
+		## Skip interpretation — do not paint every row ERROR (#916).
 		_finalize_completed_refresh()
 		return
 

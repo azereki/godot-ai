@@ -1118,9 +1118,14 @@ func test_incompatible_server_message_names_actual_version_when_discoverable() -
 	## attach-bridge leases; the message must name the full repair that
 	## actually works — repin AND restart the client apps — not just "stop
 	## the old server", which the bridges would undo by respawning it.
+	assert_contains(message, "Restart Server")
 	assert_contains(message, "Configure all")
 	assert_contains(message, "repin")
 	assert_contains(message, "restart those client apps")
+	assert_true(
+		message.find("Restart Server") < message.find("Configure all"),
+		"Restart Server must be named before Configure all (#916)",
+	)
 
 
 func test_incompatible_server_message_names_ws_port_mismatch() -> void:

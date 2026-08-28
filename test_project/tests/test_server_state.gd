@@ -52,9 +52,9 @@ func test_is_terminal_diagnosis_excludes_non_diagnostic_states() -> void:
 
 
 func test_blocks_client_health_only_for_incompatible() -> void:
-	## Dock's `_server_blocks_client_health` gates the client-row red state
+	## Dock's `_server_blocks_client_health` skips health interpretation
 	## on this — narrowing it to only INCOMPATIBLE keeps SPAWNING / FOREIGN_PORT
-	## from misclassifying the dock as broken.
+	## from misclassifying the dock as broken. Configure writes stay allowed.
 	assert_true(McpServerState.blocks_client_health(McpServerState.INCOMPATIBLE))
 	assert_false(McpServerState.blocks_client_health(McpServerState.READY))
 	assert_false(McpServerState.blocks_client_health(McpServerState.FOREIGN_PORT))
