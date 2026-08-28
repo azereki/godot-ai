@@ -36,6 +36,26 @@ func suite_setup(ctx: Dictionary) -> void:
 		_call_log.append("_fail_pure")
 		return ErrorCodes.make(ErrorCodes.INVALID_PARAMS, "forced failure"))
 
+	## Commits a real undo action but reports no `undoable` key — the shape a
+	## `custom_tool:` sub-command has, since `custom_tool_wrapper.gd` returns the
+	## addon handler's dict verbatim and never stamps the spec's flag. Rollback
+	## must still revert it, so this stub pins that the depth is measured from
+	## the editor's history rather than read off the response.
+	_dispatcher.register("_commits_unreported", func(_p: Dictionary) -> Dictionary:
+		_call_log.append("_commits_unreported")
+		_node_handler.create_node({
+			"type": "Node3D", "name": "_BatchUnreported", "parent_path": "/Main",
+		})
+		return {"data": {}})
+	## Commits, then returns an error. Rollback must still see the commit —
+	## `_record_committed` cannot wait for `status == "ok"`.
+	_dispatcher.register("_commits_then_errors", func(_p: Dictionary) -> Dictionary:
+		_call_log.append("_commits_then_errors")
+		_node_handler.create_node({
+			"type": "Node3D", "name": "_BatchCommittedError", "parent_path": "/Main",
+		})
+		return ErrorCodes.make(ErrorCodes.INVALID_PARAMS, "committed then failed"))
+
 	_handler = BatchHandler.new(_dispatcher, _undo_redo)
 
 
@@ -200,6 +220,153 @@ func test_rollback_on_failure_with_undo_true() -> void:
 	# Rollback undid the create
 	var after_count := scene_root.get_child_count()
 	assert_eq(after_count, before_count)
+
+
+## Rollback depth is the number of actions the batch actually committed, not the
+## number of sub-commands that succeeded. `_ok_pure` succeeds without pushing an
+## action — the shape of `create_script` / `write_text_file`, which write to disk
+## and report `undoable: false`. Counting it undoes one action too many, and the
+## extra undo lands on the editor's shared history: the user's pre-batch edits.
+##
+## Cleanup is guarded on presence throughout: `assert_*` records a failure and
+## returns rather than aborting the body, so an unguarded trailing undo would
+## consume an unrelated action from shared history on every regression.
+func test_rollback_does_not_undo_actions_the_batch_did_not_create() -> void:
+	var scene_root := EditorInterface.get_edited_scene_root()
+	## The "user's prior edit" — committed, undoable, and not part of the batch.
+	var sentinel := _node_handler.create_node({
+		"type": "Node3D", "name": "_BatchSentinel", "parent_path": "/Main",
+	})
+	assert_eq(sentinel.data.undoable, true, "sentinel must be an undoable action")
+
+	var result := _handler.batch_execute({
+		"commands": [
+			{"command": "_ok_pure", "params": {}},
+			{"command": "create_node", "params": {"type": "Node3D", "name": "_BatchVictim", "parent_path": "/Main"}},
+			{"command": "_fail_pure", "params": {}},
+		],
+	})
+	assert_true(scene_root.has_node(^"_BatchSentinel"),
+		"rollback must not walk past the batch into pre-batch history")
+	assert_eq(result.data.stopped_at, 2)
+	assert_eq(result.data.succeeded, 2, "both non-error sub-commands are still counted as succeeded")
+	assert_eq(result.data.rolled_back, true)
+	assert_false(scene_root.has_node(^"_BatchVictim"), "rollback undid the batch's own create")
+
+	_undo_leftovers([^"_BatchSentinel", ^"_BatchVictim"])
+
+
+## The mirror ordering: undoable first, non-undoable second. Guards against a
+## refactor that ties history capture to the first iteration only.
+func test_rollback_correct_when_the_undoable_sub_command_runs_first() -> void:
+	var scene_root := EditorInterface.get_edited_scene_root()
+	var sentinel := _node_handler.create_node({
+		"type": "Node3D", "name": "_BatchSentinelC", "parent_path": "/Main",
+	})
+	assert_eq(sentinel.data.undoable, true, "sentinel setup")
+
+	var result := _handler.batch_execute({
+		"commands": [
+			{"command": "create_node", "params": {"type": "Node3D", "name": "_BatchVictimC", "parent_path": "/Main"}},
+			{"command": "_ok_pure", "params": {}},
+			{"command": "_fail_pure", "params": {}},
+		],
+	})
+	assert_true(scene_root.has_node(^"_BatchSentinelC"),
+		"rollback must not reach the pre-batch sentinel")
+	assert_eq(result.data.rolled_back, true)
+	assert_false(scene_root.has_node(^"_BatchVictimC"), "the batch's own create was undone")
+
+	_undo_leftovers([^"_BatchSentinelC", ^"_BatchVictimC"])
+
+
+## A sub-command can commit an action without reporting `undoable` — every
+## `custom_tool:` does, because the wrapper returns the addon's dict verbatim.
+## Rollback must still revert it, so the depth cannot be read off the response.
+func test_rollback_reverts_a_commit_that_reported_no_undoable_flag() -> void:
+	var scene_root := EditorInterface.get_edited_scene_root()
+	var sentinel := _node_handler.create_node({
+		"type": "Node3D", "name": "_BatchSentinelU", "parent_path": "/Main",
+	})
+	assert_eq(sentinel.data.undoable, true, "sentinel setup")
+
+	var result := _handler.batch_execute({
+		"commands": [
+			{"command": "_commits_unreported", "params": {}},
+			{"command": "_fail_pure", "params": {}},
+		],
+	})
+	assert_eq(result.data.stopped_at, 1)
+	assert_false(scene_root.has_node(^"_BatchUnreported"),
+		"an action committed without an `undoable` flag must still be rolled back")
+	assert_eq(result.data.rolled_back, true)
+	assert_true(scene_root.has_node(^"_BatchSentinelU"),
+		"and rollback still must not reach pre-batch history")
+
+	_undo_leftovers([^"_BatchSentinelU", ^"_BatchUnreported"])
+
+
+## A handler can `commit_action()` and still return an error dict. Recording
+## only on `status == "ok"` would leave that mutation out of `committed`.
+func test_rollback_reverts_a_commit_from_a_failing_subcommand() -> void:
+	var scene_root := EditorInterface.get_edited_scene_root()
+	var sentinel := _node_handler.create_node({
+		"type": "Node3D", "name": "_BatchSentinelE", "parent_path": "/Main",
+	})
+	assert_eq(sentinel.data.undoable, true, "sentinel setup")
+
+	var result := _handler.batch_execute({
+		"commands": [
+			{"command": "_commits_then_errors", "params": {}},
+		],
+	})
+	assert_eq(result.data.stopped_at, 0)
+	assert_eq(result.data.succeeded, 0)
+	assert_eq(result.data.rolled_back, true)
+	assert_false(scene_root.has_node(^"_BatchCommittedError"),
+		"a commit that preceded an error status must still be rolled back")
+	assert_true(scene_root.has_node(^"_BatchSentinelE"),
+		"and rollback still must not reach pre-batch history")
+	assert_eq(_call_log, ["_commits_then_errors"])
+
+	_undo_leftovers([^"_BatchSentinelE", ^"_BatchCommittedError"])
+
+
+## A batch whose successful sub-commands committed nothing has nothing to roll
+## back, and `rolled_back` must say so rather than undoing unrelated history.
+func test_rollback_is_a_noop_when_nothing_was_committed() -> void:
+	var scene_root := EditorInterface.get_edited_scene_root()
+	var sentinel := _node_handler.create_node({
+		"type": "Node3D", "name": "_BatchSentinel2", "parent_path": "/Main",
+	})
+	assert_eq(sentinel.data.undoable, true, "sentinel setup")
+
+	var result := _handler.batch_execute({
+		"commands": [
+			{"command": "_ok_pure", "params": {}},
+			{"command": "_ok_pure", "params": {}},
+			{"command": "_fail_pure", "params": {}},
+		],
+	})
+	assert_true(scene_root.has_node(^"_BatchSentinel2"),
+		"a batch that committed nothing must leave prior history alone")
+	assert_eq(result.data.stopped_at, 2)
+	assert_eq(result.data.succeeded, 2)
+	assert_eq(result.data.rolled_back, false, "nothing was committed, so nothing was rolled back")
+
+	_undo_leftovers([^"_BatchSentinel2"])
+
+
+## Undo one action per node in `names` that is still present, so a regression
+## leaves the shared history where it started instead of eating an unrelated
+## action. Never asserts: cleanup failures must not mask the real assertion.
+func _undo_leftovers(names: Array) -> void:
+	var scene_root := EditorInterface.get_edited_scene_root()
+	if scene_root == null:
+		return
+	for n in names:
+		if scene_root.has_node(n):
+			editor_undo(_undo_redo)
 
 
 func test_real_multi_step_success() -> void:
