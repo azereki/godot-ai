@@ -541,11 +541,10 @@ func test_client_rows_show_config_file_buttons_only_for_file_clients() -> void:
 		"Pure CLI clients should not show a dead Reveal in folder button")
 
 
-func test_incompatible_server_marks_clients_unhealthy() -> void:
-	## URL-only client checks are not enough when the URL points at an old
-	## server with an incompatible tool surface. The dock must not show green
-	## client rows while the plugin has blocked server adoption.
-	_dock._build_ui()
+func test_incompatible_server_does_not_paint_client_rows_error() -> void:
+	## INCOMPATIBLE skips health interpretation so Configure / Configure all
+	## can still write pins (#916). Rows must not be painted ERROR/red with
+	## the blocked-server paragraph — that made Configure all unusable.
 	var plugin := _RestartDispatchPlugin.new()
 	plugin.status = {
 		"state": McpServerState.INCOMPATIBLE,
@@ -553,17 +552,23 @@ func test_incompatible_server_marks_clients_unhealthy() -> void:
 		"connection_blocked": true,
 	}
 	_dock._plugin = plugin
+	_dock._build_ui()
 
 	var any_id := McpClientConfigurator.client_ids()[0]
-	_dock._refresh_all_client_statuses()
 	var row: Dictionary = _dock._client_rows[any_id]
 	var dot: ColorRect = row["dot"]
-	assert_eq(dot.color, Color.RED, "Blocked incompatible server must render client rows red")
-	assert_contains(
-		(row["name_label"] as Label).text,
-		"Port 8000 is occupied by godot-ai server v1.2.10",
-		"Client row must explain the live server mismatch instead of looking healthy"
+	var name_label := row["name_label"] as Label
+	var display_name := McpClientConfigurator.client_display_name(any_id)
+	_dock._refresh_all_client_statuses()
+	assert_ne(dot.color, Color.RED, "INCOMPATIBLE must not paint client rows ERROR/red")
+	assert_eq(dot.color, McpDockScript.COLOR_MUTED,
+		"skipped interpretation leaves the initial muted dot")
+	assert_false(
+		name_label.text.contains("Port 8000 is occupied by godot-ai server v1.2.10"),
+		"blocked-server message must not be stamped onto every client row"
 	)
+	assert_eq(name_label.text, display_name,
+		"row caption stays the display name so Configure all remains usable")
 	plugin.free()
 
 
@@ -615,6 +620,51 @@ class _RepinRecordingDock extends McpDockScript:
 	) -> bool:
 		gate_from_versions.append(from_version)
 		return pin_only_ids.has(client_id)
+
+
+func test_configure_all_dispatches_while_incompatible() -> void:
+	## The write path must run while INCOMPATIBLE — Configure writes an
+	## explicit url + live plugin version and does not need a healthy occupant.
+	var plugin := _RestartDispatchPlugin.new()
+	plugin.status = {
+		"state": McpServerState.INCOMPATIBLE,
+		"message": "Port 8000 is occupied by godot-ai server v1.2.10; plugin expects v2.2.0.",
+	}
+	var dock := _RepinRecordingDock.new()
+	dock._plugin = plugin
+	dock._client_rows["claude_code"] = {"status": McpClient.Status.NOT_CONFIGURED}
+	dock._client_rows["cursor"] = {"status": McpClient.Status.CONFIGURED}
+
+	dock._on_configure_all_clients()
+	var configured := dock.configured_ids.duplicate()
+	dock.free()
+	plugin.free()
+
+	assert_eq(configured, ["claude_code"] as Array[String],
+		"Configure all must dispatch writes for unconfigured rows while INCOMPATIBLE")
+
+
+func test_configure_all_dispatches_while_incompatible_refresh_running() -> void:
+	## `_set_incompatible_server()` can flip INCOMPATIBLE without clearing
+	## `_refresh_state`. Per-row Configure already ignores RUNNING; Configure
+	## all must too, or the button stays dead until the sweep finishes.
+	var plugin := _RestartDispatchPlugin.new()
+	plugin.status = {
+		"state": McpServerState.INCOMPATIBLE,
+		"message": "Port 8000 is occupied by godot-ai server v1.2.10; plugin expects v2.2.0.",
+	}
+	var dock := _RepinRecordingDock.new()
+	dock._plugin = plugin
+	dock._refresh_state = McpClientRefreshState.RUNNING
+	dock._client_rows["claude_code"] = {"status": McpClient.Status.NOT_CONFIGURED}
+
+	dock._on_configure_all_clients()
+	var configured := dock.configured_ids.duplicate()
+	dock.free()
+	plugin.free()
+
+	assert_eq(configured, ["claude_code"] as Array[String],
+		"Configure all must dispatch while INCOMPATIBLE even if a refresh is RUNNING")
 
 
 func test_post_update_repin_reconfigures_pin_only_rows_once() -> void:
@@ -691,9 +741,9 @@ func test_post_update_repin_requires_a_from_version() -> void:
 
 func test_post_update_repin_stays_pending_while_server_blocks_health() -> void:
 	## While the post-update stale-occupant recovery is still in flight the
-	## server state is INCOMPATIBLE and every row reads ERROR — consuming the
-	## flag on that sweep would drop the repin. It must stay pending and fire
-	## on the first healthy sweep.
+	## server state is INCOMPATIBLE and health interpretation is skipped
+	## (#916) — consuming the flag on that sweep would drop the repin. It
+	## must stay pending and fire on the first healthy sweep.
 	var plugin := _RestartDispatchPlugin.new()
 	plugin.status = {"state": McpServerState.INCOMPATIBLE, "message": "incompatible"}
 	var dock := _RepinRecordingDock.new()
@@ -716,7 +766,7 @@ func test_post_update_repin_stays_pending_while_server_blocks_health() -> void:
 	assert_true(pending_while_blocked,
 		"an INCOMPATIBLE-server sweep must keep the repin pending")
 	assert_true(configured_while_blocked.is_empty(),
-		"no reconfigure may run while rows read ERROR")
+		"auto-repin must not fire while the server is INCOMPATIBLE")
 	assert_eq(configured_after_recovery, ["claude_code"] as Array[String],
 		"the first healthy sweep must run the deferred repin")
 
