@@ -148,6 +148,23 @@ func test_write_rejects_godot_metadata_dir() -> void:
 	assert_contains(err, ".godot")
 
 
+func test_write_rejects_godot_metadata_dir_backslash() -> void:
+	## Windows-style separators must not skip the `.godot/` segment check
+	## (issue #905). `"\\"` in a GDScript literal is one backslash.
+	var err := McpPathValidator.validate_resource_path("res://.godot\\uid_cache.bin", true)
+	assert_false(err.is_empty(), "writing res://.godot\\uid_cache.bin must be rejected")
+	assert_contains(err, ".godot")
+
+
+func test_path_error_rejects_godot_metadata_dir_backslash() -> void:
+	var err: Variant = McpPathValidator.path_error("res://.godot\\uid_cache.bin", "path", true)
+	assert_true(err is Dictionary, "path_error must reject backslash .godot write")
+	assert_has_key(err, "error")
+	var inner: Dictionary = err["error"]
+	assert_eq(inner.get("code", ""), "VALUE_OUT_OF_RANGE")
+	assert_contains(str(inner.get("message", "")), ".godot")
+
+
 func test_write_allows_import_sidecar() -> void:
 	## .import sidecars are source-controlled import config; editing them then
 	## reimporting is a legitimate, recoverable workflow, so writes are allowed.
@@ -195,6 +212,28 @@ func test_write_rejects_loaded_plugin_tree() -> void:
 	var err := McpPathValidator.validate_resource_path("res://addons/godot_ai/plugin.gd", true)
 	assert_false(err.is_empty(), "writing under res://addons/godot_ai/ must be rejected")
 	assert_contains(err, "addons/godot_ai")
+
+
+func test_write_rejects_loaded_plugin_tree_backslash() -> void:
+	## Same guard as above, with Windows separators (#905).
+	var err := McpPathValidator.validate_resource_path("res://addons\\godot_ai\\plugin.gd", true)
+	assert_false(err.is_empty(), "writing res://addons\\godot_ai\\plugin.gd must be rejected")
+	assert_contains(err, "addons/godot_ai")
+
+
+func test_write_rejects_loaded_plugin_tree_mixed_separators() -> void:
+	var err := McpPathValidator.validate_resource_path("res://addons\\godot_ai/plugin.gd", true)
+	assert_false(err.is_empty(), "mixed-separator plugin path must be rejected")
+	assert_contains(err, "addons/godot_ai")
+
+
+func test_path_error_rejects_loaded_plugin_tree_backslash() -> void:
+	var err: Variant = McpPathValidator.path_error("res://addons\\godot_ai\\plugin.gd", "path", true)
+	assert_true(err is Dictionary, "path_error must reject backslash plugin-tree write")
+	assert_has_key(err, "error")
+	var inner: Dictionary = err["error"]
+	assert_eq(inner.get("code", ""), "VALUE_OUT_OF_RANGE")
+	assert_contains(str(inner.get("message", "")), "addons/godot_ai")
 
 
 func test_write_rejects_loaded_plugin_tree_nested() -> void:

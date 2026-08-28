@@ -158,9 +158,12 @@ static func _reject_sensitive_write(path: String) -> String:
 		return "Refusing to write res://project.godot (project manifest)"
 	if file_lower == "override.cfg":
 		return "Refusing to write res://override.cfg (startup config override)"
-	# Reject the `.godot/` editor-metadata dir at any depth. Split drops empty
-	# segments so a trailing slash can't hide a segment from the check.
-	var segments := path.trim_prefix("res://").split("/", false)
+	# Reject the `.godot/` editor-metadata dir at any depth. Normalize
+	# backslashes first — a Windows-style `res://.godot\uid_cache.bin`
+	# would otherwise be a single segment and skip both this check and the
+	# loaded-plugin clause below. Split drops empty segments so a trailing
+	# slash can't hide a segment from the check.
+	var segments := path.replace("\\", "/").trim_prefix("res://").split("/", false)
 	for segment in segments:
 		if segment.to_lower() == ".godot":
 			return "Refusing to write under res://.godot/ (editor metadata)"
