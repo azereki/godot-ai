@@ -3607,9 +3607,9 @@ func _maybe_auto_repin_after_update() -> void:
 	if not _pending_post_update_repin:
 		return
 	## While the server is INCOMPATIBLE (post-update stale-occupant recovery
-	## still in flight) every row reads ERROR, not CONFIGURED_MISMATCH — a
-	## consume here would see an empty mismatch list and drop the repin on
-	## the floor. Stay pending for the sweep that lands after recovery.
+	## still in flight) health interpretation is skipped (#916), so this
+	## sweep cannot observe CONFIGURED_MISMATCH. Consuming here would drop
+	## the repin on the floor. Stay pending for the sweep after recovery.
 	if _server_blocks_client_health():
 		return
 	if ClientRefreshStateScript.should_disable_client_actions(_refresh_state):
