@@ -116,7 +116,12 @@ def test_godot_bin_uses_windows_fallbacks_when_which_misses(
     exe = tmp_path / "godot.exe"
     exe.write_bytes(b"fake")
     monkeypatch.setenv("GODOT_BIN", "godot")
-    monkeypatch.setattr("tests.integration._self_update_fixture.os.name", "nt")
+    # Patch the local helper, not os.name — that aliases the real os module
+    # and makes pathlib instantiate WindowsPath on Linux CI.
+    monkeypatch.setattr(
+        "tests.integration._self_update_fixture._is_windows",
+        lambda: True,
+    )
     monkeypatch.setattr(
         "tests.integration._self_update_fixture.shutil.which",
         lambda name: str(exe) if name == "godot.exe" else None,

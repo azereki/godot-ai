@@ -43,6 +43,16 @@ def _path_is_file(path: Path) -> bool:
         return False
 
 
+def _is_windows() -> bool:
+    """Host check isolated so tests can fake Windows without patching ``os.name``.
+
+    ``os.name`` is the real ``os`` module attribute. Patching it on Linux makes
+    ``pathlib.Path`` construct ``WindowsPath`` and crashes the pytest session
+    (``NotImplementedError`` during report/cache writes).
+    """
+    return os.name == "nt"
+
+
 def _windows_godot_fallbacks(name: str) -> Path | None:
     """Resolve ``GODOT_BIN=godot`` on Windows CI.
 
@@ -110,7 +120,7 @@ def godot_bin_or_skip() -> str:
     else:
         found = shutil.which(godot_bin)
         resolved = Path(found) if found is not None else None
-        if (resolved is None or not resolved.exists()) and os.name == "nt":
+        if (resolved is None or not resolved.exists()) and _is_windows():
             resolved = _windows_godot_fallbacks(godot_bin)
     if resolved is None or not resolved.exists():
         # CI sets GODOT_BIN=godot. Skipping here would make pytest exit 0
