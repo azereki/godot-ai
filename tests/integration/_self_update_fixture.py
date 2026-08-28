@@ -47,7 +47,9 @@ def godot_bin_or_skip() -> str:
         found = shutil.which(godot_bin)
         resolved = Path(found) if found is not None else None
     if resolved is None or not resolved.exists():
-        pytest.skip(f"GODOT_BIN does not resolve to an executable: {godot_bin}")
+        # CI sets GODOT_BIN=godot. Skipping here would make pytest exit 0
+        # with zero tests run and hide a missing engine (#917).
+        pytest.fail(f"GODOT_BIN does not resolve to an executable: {godot_bin}")
     return str(resolved)
 
 
