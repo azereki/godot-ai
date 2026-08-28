@@ -36,16 +36,82 @@ def load_smoke_script() -> ModuleType:
     return module
 
 
+def _path_is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _windows_godot_fallbacks(name: str) -> Path | None:
+    """Resolve ``GODOT_BIN=godot`` on Windows CI.
+
+    chickensoft ``setup-godot`` adds ``~/bin`` to PATH and hard-links the
+    real ``Godot_v*_win64.exe`` as an *extensionless* ``godot`` alias, then
+    exports ``GODOT`` / ``GODOT4`` to that path. Git Bash can invoke
+    ``godot``; ``shutil.which("godot")`` does not (PATHEXT is ``.exe``-only).
+    Skipping would hide a missing engine (#917); failing without this
+    lookup fails CI even when the engine is present.
+    """
+    names = [name]
+    if not name.lower().endswith(".exe"):
+        names.append(f"{name}.exe")
+
+    for candidate in names:
+        found = shutil.which(candidate)
+        if found is not None:
+            path = Path(found)
+            if _path_is_file(path):
+                return path
+
+    # shutil.which skips extensionless files; walk PATH for the alias.
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        folder = Path(directory)
+        for candidate in names:
+            hit = folder / candidate
+            if _path_is_file(hit):
+                return hit
+
+    if name.lower() not in {"godot", "godot.exe"}:
+        return None
+
+    for key in ("GODOT", "GODOT4"):
+        raw = os.environ.get(key, "")
+        if not raw:
+            continue
+        env_path = Path(raw)
+        if _path_is_file(env_path):
+            return env_path
+        exe = env_path.parent / "godot.exe"
+        if _path_is_file(exe):
+            return exe
+
+    home = Path.home()
+    for hit in (home / "bin" / "godot.exe", home / "bin" / "godot"):
+        if _path_is_file(hit):
+            return hit
+    install = home / "godot"
+    if install.is_dir():
+        matches = sorted(install.rglob("Godot_v*.exe"))
+        if matches:
+            return matches[0]
+    return None
+
+
 def godot_bin_or_skip() -> str:
     godot_bin = os.environ.get("GODOT_BIN", "")
     if not godot_bin:
         pytest.skip("GODOT_BIN is not set; skipping Godot self-update integration test")
     candidate = Path(godot_bin).expanduser()
     if candidate.exists() or candidate.is_absolute() or "/" in godot_bin or "\\" in godot_bin:
-        resolved = candidate
+        resolved = candidate if candidate.exists() else None
     else:
         found = shutil.which(godot_bin)
         resolved = Path(found) if found is not None else None
+        if (resolved is None or not resolved.exists()) and os.name == "nt":
+            resolved = _windows_godot_fallbacks(godot_bin)
     if resolved is None or not resolved.exists():
         # CI sets GODOT_BIN=godot. Skipping here would make pytest exit 0
         # with zero tests run and hide a missing engine (#917).
