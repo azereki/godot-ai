@@ -163,11 +163,9 @@ async def _observed_timeout_sec(command: str) -> float:
     ## reply (screenshot decoding, pagination, readiness reads) raise on the way
     ## back out — KeyError, TypeError, AttributeError or ValueError depending on
     ## the handler. Only the OUTBOUND timeout matters here, and it is already
-    ## recorded by the time any of those fire. The catch stays broad rather than
-    ## enumerated because the set varies per handler and a missed type would
-    ## turn this into a spurious failure; `assert sent` below is what keeps it
-    ## honest, failing loudly if the handler never reached send_command at all.
-    with contextlib.suppress(Exception):
+    ## recorded by the time any of those fire. Unexpected exception types must
+    ## fail the test; `assert sent` still fails if send_command was never reached.
+    with contextlib.suppress(KeyError, TypeError, AttributeError, ValueError):
         await COMMAND_DRIVERS[command](runtime)
     sent = [call for call in client.calls if call["command"] == command]
     assert sent, f"handler for {command!r} never issued a {command!r} command"
@@ -211,7 +209,7 @@ async def test_editor_screenshot_timeout_covers_vision_route_budget() -> None:
     budget = _vision_route_budget_sec()
     client = RecordingClient()
     runtime = DirectRuntime(registry=SessionRegistry(), client=client)
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(KeyError, TypeError, AttributeError, ValueError):
         await editor_handlers.editor_screenshot(runtime, source="viewport")
     sent = [call for call in client.calls if call["command"] == "take_screenshot"]
     assert sent, "editor_screenshot never issued take_screenshot"

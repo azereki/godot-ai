@@ -58,6 +58,7 @@ async def project_run(
         params["scene"] = scene
     if not autosave:
         params["autosave"] = False
+    await require_writable_async(runtime)
     return await runtime.send_command("run_project", params, timeout=RUN_PROJECT_TIMEOUT_SEC)
 
 
