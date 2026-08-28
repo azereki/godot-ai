@@ -127,6 +127,10 @@ func batch_execute(params: Dictionary) -> Dictionary:
 			before.append(ur.get_version())
 
 		var raw_result: Dictionary = _dispatcher.dispatch_direct(cmd_name, sub_params)
+		## Record before reading status. A handler can commit_action() and still
+		## return an error; those actions must be in `committed` so a later
+		## (or this) failure rolls them back.
+		_record_committed(tracked, before, committed)
 		var status: String = raw_result.get("status", "ok")
 
 		var result_entry: Dictionary = {"command": cmd_name, "status": status}
@@ -140,7 +144,6 @@ func batch_execute(params: Dictionary) -> Dictionary:
 			result_entry["data"] = data
 			if typeof(data) == TYPE_DICTIONARY and data.get("undoable", false) != true:
 				all_undoable = false
-			_record_committed(tracked, before, committed)
 			results.append(result_entry)
 			succeeded += 1
 

@@ -47,6 +47,14 @@ func suite_setup(ctx: Dictionary) -> void:
 			"type": "Node3D", "name": "_BatchUnreported", "parent_path": "/Main",
 		})
 		return {"data": {}})
+	## Commits, then returns an error. Rollback must still see the commit —
+	## `_record_committed` cannot wait for `status == "ok"`.
+	_dispatcher.register("_commits_then_errors", func(_p: Dictionary) -> Dictionary:
+		_call_log.append("_commits_then_errors")
+		_node_handler.create_node({
+			"type": "Node3D", "name": "_BatchCommittedError", "parent_path": "/Main",
+		})
+		return ErrorCodes.make(ErrorCodes.INVALID_PARAMS, "committed then failed"))
 
 	_handler = BatchHandler.new(_dispatcher, _undo_redo)
 
@@ -296,6 +304,32 @@ func test_rollback_reverts_a_commit_that_reported_no_undoable_flag() -> void:
 		"and rollback still must not reach pre-batch history")
 
 	_undo_leftovers([^"_BatchSentinelU", ^"_BatchUnreported"])
+
+
+## A handler can `commit_action()` and still return an error dict. Recording
+## only on `status == "ok"` would leave that mutation out of `committed`.
+func test_rollback_reverts_a_commit_from_a_failing_subcommand() -> void:
+	var scene_root := EditorInterface.get_edited_scene_root()
+	var sentinel := _node_handler.create_node({
+		"type": "Node3D", "name": "_BatchSentinelE", "parent_path": "/Main",
+	})
+	assert_eq(sentinel.data.undoable, true, "sentinel setup")
+
+	var result := _handler.batch_execute({
+		"commands": [
+			{"command": "_commits_then_errors", "params": {}},
+		],
+	})
+	assert_eq(result.data.stopped_at, 0)
+	assert_eq(result.data.succeeded, 0)
+	assert_eq(result.data.rolled_back, true)
+	assert_false(scene_root.has_node(^"_BatchCommittedError"),
+		"a commit that preceded an error status must still be rolled back")
+	assert_true(scene_root.has_node(^"_BatchSentinelE"),
+		"and rollback still must not reach pre-batch history")
+	assert_eq(_call_log, ["_commits_then_errors"])
+
+	_undo_leftovers([^"_BatchSentinelE", ^"_BatchCommittedError"])
 
 
 ## A batch whose successful sub-commands committed nothing has nothing to roll
