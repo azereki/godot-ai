@@ -12,6 +12,25 @@ from godot_ai.godot_client.session_diagnostics import (
 from godot_ai.handlers._readiness import require_writable_async, sync_readiness_from_snapshot
 from godot_ai.runtime.direct import DirectRuntime
 
+## Must stay above the plugin's own deferred budget for `run_project`
+## (`DEFERRED_TIMEOUT_MS_BY_COMMAND["run_project"] = 6000` in dispatcher.gd).
+## `run_project` defers: the plugin returns DEFERRED_RESPONSE and re-polls game
+## status until the launch resolves, so it can legitimately take the full 6 s on
+## a cold start or a large scene. At the inherited 5.0 s default the server gave
+## up first and reported a successful launch as a timeout — which `GodotClient`
+## then charged to the editor-bridge circuit breaker.
+##
+## 6.0 s budget + the repo's standing 2 s transport margin for this exact
+## cross-language pairing, spelled out in `handlers/custom.py`: "the server-side
+## future must outlive that budget ... +2s margin covers transport latency".
+## `vision_routing.gd`'s 13 000 ms editor-screenshot override under
+## SCREENSHOT_TIMEOUT_SEC = 15.0 is the same +2. Exact ties exist elsewhere
+## (game_eval, game_command, check_client_status) and are not wrong, but the
+## plugin's timer starts when the dispatcher registers the deferred request —
+## strictly after the server began its own — so the margin costs nothing and
+## removes the round-trip from the race.
+RUN_PROJECT_TIMEOUT_SEC = 8.0
+
 COMMON_SETTINGS = [
     "application/config/name",
     "application/config/description",
@@ -39,7 +58,7 @@ async def project_run(
         params["scene"] = scene
     if not autosave:
         params["autosave"] = False
-    return await runtime.send_command("run_project", params)
+    return await runtime.send_command("run_project", params, timeout=RUN_PROJECT_TIMEOUT_SEC)
 
 
 async def project_stop(runtime: DirectRuntime) -> dict:
