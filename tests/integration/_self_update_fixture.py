@@ -20,6 +20,9 @@ TEST_ZIP_RES_PATH = f"res://{TEST_ZIP_DIR}/{TEST_ZIP_NAME}"
 TEST_TEMP_DIR = "user://godot_ai_self_update_upgrade_test/"
 TEST_HTTP_PORT = 18100
 TEST_WS_PORT = 19600
+LIVE_HTTP_PORT = 18210
+LIVE_WS_PORT = 19710
+POST_UPDATE_STATUS_FILE = "_test_post_update_status.json"
 
 PARSE_ERROR_PATTERNS = (
     "SCRIPT ERROR: Parse Error",
@@ -160,14 +163,16 @@ def patch_fixture_addon(
     server_version: str,
     next_version: str,
     skip_server_start: bool,
+    http_port: int = TEST_HTTP_PORT,
+    ws_port: int = TEST_WS_PORT,
 ) -> None:
     smoke = load_smoke_script()
     smoke.patch_fixture_plugin(
         addon_dir,
         version=version,
         server_version=server_version,
-        http_port=TEST_HTTP_PORT,
-        ws_port=TEST_WS_PORT,
+        http_port=http_port,
+        ws_port=ws_port,
         force_local_update=False,
         next_version=next_version,
     )
@@ -190,6 +195,231 @@ def patch_server_start_noop(plugin_gd: Path) -> None:
 def create_plugin_zip(addon_dir: Path, zip_path: Path) -> None:
     smoke = load_smoke_script()
     smoke.create_plugin_zip(addon_dir, zip_path)
+
+
+def link_dev_checkout_anchor(anchor: Path, repo_root: Path) -> None:
+    """Junction/symlink repo ``.venv`` + ``src`` so a tmp project can spawn locally.
+
+    ``ClientConfigurator._find_venv_python_in`` only treats a ``.venv`` as a
+    godot-ai checkout when a sibling ``src/godot_ai`` exists. A bare tmp
+    project would fall through to uvx and flake without network.
+    """
+    venv = repo_root / ".venv"
+    src = repo_root / "src"
+    python_name = "python.exe" if os.name == "nt" else "python"
+    python = venv / ("Scripts" if os.name == "nt" else "bin") / python_name
+    if not python.is_file() or not (src / "godot_ai").is_dir():
+        pytest.skip("repo .venv + src/godot_ai required to spawn a live server")
+    anchor.mkdir(parents=True, exist_ok=True)
+    _dir_link(anchor / ".venv", venv)
+    _dir_link(anchor / "src", src)
+
+
+def _dir_link(link: Path, target: Path) -> None:
+    if link.exists():
+        return
+    resolved = target.resolve()
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(resolved)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"mklink /J failed for {link} -> {resolved}: {completed.stderr}"
+            )
+        return
+    link.symlink_to(resolved, target_is_directory=True)
+
+
+def write_install_update_driver(project_dir: Path, *, http_port: int) -> None:
+    """Drive ``install_downloaded_update()`` and snapshot ``/godot-ai/status``."""
+    (project_dir / "_test_runner_driver.gd").write_text(
+        f"""@tool
+extends Node
+
+const ZIP_PATH := "{TEST_ZIP_RES_PATH}"
+const TEMP_DIR := "{TEST_TEMP_DIR}"
+const HTTP_PORT := {http_port}
+const STATUS_PATH := "res://{POST_UPDATE_STATUS_FILE}"
+const START_AFTER_FRAMES := 45
+const MAX_FRAMES := 1800
+const STATUS_WAIT_MS := 45000
+
+var _frames := 0
+var _started := false
+var _validated := false
+var _finished := false
+var _status_wait_started_ms := 0
+var _pre_instance_id := ""
+
+
+func _ready() -> void:
+\tif not Engine.is_editor_hint():
+\t\tqueue_free()
+\t\treturn
+\tif OS.get_environment("_SELF_UPDATE_DRIVER_SKIP") == "1":
+\t\tqueue_free()
+\t\treturn
+\tset_process(true)
+
+
+func _process(_delta: float) -> void:
+\tif _finished:
+\t\treturn
+\t_frames += 1
+\tif not _started:
+\t\tif _frames < START_AFTER_FRAMES:
+\t\t\treturn
+\t\tif _frames > MAX_FRAMES:
+\t\t\tpush_error("SELF_UPDATE_TEST | pre-update /godot-ai/status timed out")
+\t\t\t_finished = true
+\t\t\tget_tree().quit(12)
+\t\t\treturn
+\t\tvar pre := _fetch_status(HTTP_PORT)
+\t\tvar pre_id := str(pre.get("instance_id", ""))
+\t\tif pre_id.is_empty():
+\t\t\treturn
+\t\t_pre_instance_id = pre_id
+\t\tprint("SELF_UPDATE_TEST | pre-update instance_id=%s" % _pre_instance_id)
+\t\t_call_install()
+\t\treturn
+\tif _started and not _validated:
+\t\tif _frames > MAX_FRAMES:
+\t\t\tpush_error("SELF_UPDATE_TEST | install_downloaded_update timed out")
+\t\t\t_finished = true
+\t\t\tget_tree().quit(10)
+\t\t\treturn
+\t\tif _try_validate_install():
+\t\t\t_validated = true
+\t\t\t_status_wait_started_ms = Time.get_ticks_msec()
+\t\treturn
+\tif _validated:
+\t\tif _try_write_status():
+\t\t\t_finished = true
+\t\t\tget_tree().quit(0)
+\t\t\treturn
+\t\tif Time.get_ticks_msec() - _status_wait_started_ms > STATUS_WAIT_MS:
+\t\t\tpush_error("SELF_UPDATE_TEST | post-update /godot-ai/status timed out")
+\t\t\t_finished = true
+\t\t\tget_tree().quit(13)
+
+
+func _call_install() -> void:
+\t_started = true
+\tvar plugin := _find_godot_ai_plugin()
+\tif plugin == null:
+\t\tpush_error("SELF_UPDATE_TEST | failed to find Godot AI plugin")
+\t\t_finished = true
+\t\tget_tree().quit(11)
+\t\treturn
+\tprint("SELF_UPDATE_TEST | calling install_downloaded_update")
+\tplugin.install_downloaded_update(ZIP_PATH, TEMP_DIR, null)
+
+
+func _try_validate_install() -> bool:
+\tvar Handler := load(
+\t\t"res://addons/godot_ai/handlers/self_update_synthetic_next.gd"
+\t)
+\tif Handler == null:
+\t\treturn false
+\tvar marker: String = Handler.marker()
+\tprint("SELF_UPDATE_TEST | synthetic handler marker %s" % marker)
+\treturn true
+
+
+func _try_write_status() -> bool:
+\tvar payload := _fetch_status(HTTP_PORT)
+\tif payload.get("name") != "godot-ai":
+\t\treturn false
+\tvar version := str(payload.get("server_version", ""))
+\tif version.is_empty():
+\t\treturn false
+\tvar post_id := str(payload.get("instance_id", ""))
+\tif post_id.is_empty() or post_id == _pre_instance_id:
+\t\treturn false
+\tvar f := FileAccess.open(STATUS_PATH, FileAccess.WRITE)
+\tif f == null:
+\t\tpush_error("SELF_UPDATE_TEST | failed to write status snapshot")
+\t\treturn false
+\tf.store_string(JSON.stringify(payload))
+\tf.close()
+\tprint("SELF_UPDATE_TEST | status name=%s server_version=%s instance_id=%s" % [
+\t\tpayload.get("name"),
+\t\tversion,
+\t\tpost_id,
+\t])
+\treturn true
+
+
+func _fetch_status(port: int) -> Dictionary:
+\tvar http := HTTPClient.new()
+\tif http.connect_to_host("127.0.0.1", port) != OK:
+\t\treturn {{}}
+\tvar deadline := Time.get_ticks_msec() + 2000
+\twhile (
+\t\thttp.get_status() == HTTPClient.STATUS_CONNECTING
+\t\tor http.get_status() == HTTPClient.STATUS_RESOLVING
+\t):
+\t\thttp.poll()
+\t\tif Time.get_ticks_msec() > deadline:
+\t\t\treturn {{}}
+\t\tOS.delay_msec(10)
+\tif http.get_status() != HTTPClient.STATUS_CONNECTED:
+\t\treturn {{}}
+\tif http.request(HTTPClient.METHOD_GET, "/godot-ai/status", PackedStringArray()) != OK:
+\t\treturn {{}}
+\tdeadline = Time.get_ticks_msec() + 2000
+\twhile http.get_status() == HTTPClient.STATUS_REQUESTING:
+\t\thttp.poll()
+\t\tif Time.get_ticks_msec() > deadline:
+\t\t\treturn {{}}
+\t\tOS.delay_msec(10)
+\tif not http.has_response():
+\t\treturn {{}}
+\tvar body := PackedByteArray()
+\tdeadline = Time.get_ticks_msec() + 2000
+\twhile http.get_status() == HTTPClient.STATUS_BODY:
+\t\thttp.poll()
+\t\tvar chunk := http.read_response_body_chunk()
+\t\tif chunk.size() > 0:
+\t\t\tbody.append_array(chunk)
+\t\telse:
+\t\t\tOS.delay_msec(5)
+\t\tif Time.get_ticks_msec() > deadline:
+\t\t\treturn {{}}
+\tvar parsed: Variant = JSON.parse_string(body.get_string_from_utf8())
+\tif typeof(parsed) != TYPE_DICTIONARY:
+\t\treturn {{}}
+\treturn parsed
+
+
+func _find_godot_ai_plugin() -> EditorPlugin:
+\tvar tree := get_tree()
+\tif tree == null:
+\t\treturn null
+\tvar found := _walk_plugin(tree.root)
+\tif found != null:
+\t\treturn found
+\tvar base := EditorInterface.get_base_control()
+\tif base == null:
+\t\treturn null
+\treturn _walk_plugin(base.get_parent())
+
+
+func _walk_plugin(node: Node) -> EditorPlugin:
+\tif node is EditorPlugin and node.has_method("install_downloaded_update"):
+\t\treturn node
+\tfor child in node.get_children():
+\t\tvar found := _walk_plugin(child)
+\t\tif found != null:
+\t\t\treturn found
+\treturn null
+""",
+        encoding="utf-8",
+    )
 
 
 def write_forward_driver(project_dir: Path) -> None:
@@ -302,6 +532,7 @@ def run_godot_editor(
     *,
     allow_headless: bool,
     headless: bool = True,
+    timeout: int = 90,
 ) -> str:
     env = os.environ.copy()
     if allow_headless:
@@ -331,7 +562,7 @@ def run_godot_editor(
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        timeout=90,
+        timeout=timeout,
     )
     output = proc.stdout
     assert proc.returncode == 0, output

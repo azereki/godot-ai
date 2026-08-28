@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+import threading
+import time
 import zipfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -47,6 +52,7 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     assert "Self-update smoke fixture ready" in result.stdout
     assert "click Update" in result.stdout
     assert "a new Godot*.ips" in result.stdout
+    assert "/godot-ai/status" in result.stdout
 
     base_cfg = (project / "addons" / "godot_ai" / "plugin.cfg").read_text(encoding="utf-8")
     assert 'version="2.2.0"' in base_cfg
@@ -299,3 +305,163 @@ def test_self_update_smoke_harness_refuses_suspicious_marker(tmp_path: Path) -> 
 
     assert result.returncode != 0
     assert "has a smoke marker but does not look generated" in result.stderr
+
+
+def test_smoke_new_plugin_loaded_after_update_requires_both_markers() -> None:
+    smoke = load_smoke_script()
+    before_reload = [
+        "MCP | started server (PID 123, v2.2.0): godot-ai",
+        "MCP | self-update smoke: staged local zip /tmp/update.zip",
+        "MCP | stopped server (PID [123])",
+        "MCP | update runner enabling new plugin",
+    ]
+    assert not smoke.smoke_new_plugin_loaded_after_update(before_reload)
+    after_reload = before_reload + ["MCP | plugin loaded"]
+    assert smoke.smoke_new_plugin_loaded_after_update(after_reload)
+
+
+def test_status_reports_live_version_requires_name_and_pin() -> None:
+    smoke = load_smoke_script()
+    assert not smoke.status_reports_live_version(None, "3.2.4")
+    assert not smoke.status_reports_live_version(
+        {"name": "other", "server_version": "3.2.4"}, "3.2.4"
+    )
+    assert not smoke.status_reports_live_version(
+        {"name": "godot-ai", "server_version": "3.2.3"}, "3.2.4"
+    )
+    assert smoke.status_reports_live_version(
+        {"name": "godot-ai", "server_version": "3.2.4"}, "3.2.4"
+    )
+
+
+class _StatusHandler(BaseHTTPRequestHandler):
+    payload: dict[str, Any] = {"name": "godot-ai", "server_version": "3.2.4"}
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path != "/godot-ai/status":
+            self.send_error(404)
+            return
+        body = json.dumps(self.payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+def test_fetch_and_wait_for_live_status() -> None:
+    smoke = load_smoke_script()
+    _StatusHandler.payload = {"name": "godot-ai", "server_version": "3.2.4"}
+    server = HTTPServer(("127.0.0.1", 0), _StatusHandler)
+    port = int(server.server_address[1])
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        payload = smoke.fetch_status_payload(port)
+        assert payload == {"name": "godot-ai", "server_version": "3.2.4"}
+        live = smoke.wait_for_live_status(port, "3.2.4", timeout=2.0, poll=0.05)
+        assert live == payload
+        missing = smoke.wait_for_live_status(port, "9.9.9", timeout=0.2, poll=0.05)
+        assert missing == payload
+        assert not smoke.status_reports_live_version(missing, "9.9.9")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_fetch_status_payload_none_when_port_dark() -> None:
+    smoke = load_smoke_script()
+    assert smoke.fetch_status_payload(1, timeout=0.2) is None
+
+
+class _TruncatedStatusHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        body = b'{"name":"godot-ai","server_version":"3.2.4"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body) + 64))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+def test_fetch_status_payload_none_on_truncated_body() -> None:
+    smoke = load_smoke_script()
+    server = HTTPServer(("127.0.0.1", 0), _TruncatedStatusHandler)
+    port = int(server.server_address[1])
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert smoke.fetch_status_payload(port, timeout=1.0) is None
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _minimal_smoke_project(tmp_path: Path, version: str) -> Path:
+    project = tmp_path / "smoke"
+    addon = project / "addons" / "godot_ai"
+    addon.mkdir(parents=True)
+    (addon / "plugin.cfg").write_text(f'version="{version}"\n', encoding="utf-8")
+    marker = project / ".godot-ai-self-update-smoke"
+    marker.mkdir()
+    consumed = tmp_path / "consumed-update-dir"
+    (marker / "user-update-path.txt").write_text(str(consumed), encoding="utf-8")
+    return project
+
+
+def test_verify_post_run_requires_live_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    smoke = load_smoke_script()
+    project = _minimal_smoke_project(tmp_path, "2.2.1-self-update-smoke")
+    lines = [
+        "MCP | started server (PID 123, v2.2.0): godot-ai",
+        "MCP | self-update smoke: staged local zip /tmp/update.zip",
+        "MCP | stopped server (PID [123])",
+        "MCP | update runner enabling new plugin",
+        "MCP | plugin loaded",
+    ]
+    ok = smoke.verify_post_run(
+        project,
+        "2.2.1-self-update-smoke",
+        set(),
+        time.time(),
+        lines,
+        post_update_status=None,
+        next_server_version="2.2.0",
+    )
+    captured = capsys.readouterr().out
+    assert ok is False
+    assert "post-update /godot-ai/status was not live" in captured
+
+
+def test_verify_post_run_accepts_live_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    smoke = load_smoke_script()
+    project = _minimal_smoke_project(tmp_path, "2.2.1-self-update-smoke")
+    lines = [
+        "MCP | started server (PID 123, v2.2.0): godot-ai",
+        "MCP | self-update smoke: staged local zip /tmp/update.zip",
+        "MCP | stopped server (PID [123])",
+        "MCP | update runner enabling new plugin",
+        "MCP | plugin loaded",
+    ]
+    ok = smoke.verify_post_run(
+        project,
+        "2.2.1-self-update-smoke",
+        set(),
+        time.time(),
+        lines,
+        post_update_status={"name": "godot-ai", "server_version": "2.2.0"},
+        next_server_version="2.2.0",
+    )
+    captured = capsys.readouterr().out
+    assert ok is True
+    assert "PASS: post-update /godot-ai/status live v2.2.0" in captured
