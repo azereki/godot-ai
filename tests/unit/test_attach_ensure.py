@@ -766,6 +766,8 @@ async def test_foreign_http_occupant_never_spawns(tmp_path: Path) -> None:
         spawn=lambda *_args: spawns.append(True),  # type: ignore[arg-type,return-value]
         port_check=lambda port: port != 8000,
         runtime_dir=tmp_path,
+        health_timeout_seconds=0.05,
+        poll_seconds=0.001,
     )
 
     with pytest.raises(AttachStartupError) as exc_info:
@@ -773,6 +775,92 @@ async def test_foreign_http_occupant_never_spawns(tmp_path: Path) -> None:
 
     assert exc_info.value.code == "PORT_OCCUPIED"
     assert spawns == []
+
+
+async def test_slow_backend_is_adopted_after_retry(tmp_path: Path) -> None:
+    calls = {"n": 0}
+    spawns: list[bool] = []
+
+    async def probe(_port: int) -> BackendStatus | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return status()
+
+    ensurer = BackendEnsurer(
+        probe=probe,
+        spawn=lambda *_args: spawns.append(True),  # type: ignore[arg-type,return-value]
+        port_check=lambda _port: False,
+        runtime_dir=tmp_path,
+        health_timeout_seconds=1,
+        poll_seconds=0.001,
+    )
+
+    result = await ensurer.ensure()
+
+    assert result.instance_id == "instance-a"
+    assert calls["n"] == 2
+    assert spawns == []
+
+
+async def test_answered_foreign_occupant_is_not_retried(tmp_path: Path) -> None:
+    calls = {"n": 0}
+    spawns: list[bool] = []
+
+    async def probe(_port: int) -> BackendStatus | None:
+        calls["n"] += 1
+        raise ensure_module._foreign_occupant(_port, "status probe returned HTTP 503")
+
+    ensurer = BackendEnsurer(
+        probe=probe,
+        spawn=lambda *_args: spawns.append(True),  # type: ignore[arg-type,return-value]
+        port_check=lambda _port: False,
+        runtime_dir=tmp_path,
+        health_timeout_seconds=1,
+        poll_seconds=0.001,
+    )
+
+    with pytest.raises(AttachStartupError) as exc_info:
+        await ensurer.ensure()
+
+    assert exc_info.value.code == "PORT_OCCUPIED"
+    assert calls["n"] == 1
+    assert spawns == []
+
+
+async def test_bound_http_port_that_frees_falls_through_to_spawn(tmp_path: Path) -> None:
+    calls = {"n": 0}
+    spawns = {"n": 0}
+
+    async def probe(_port: int) -> BackendStatus | None:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return None
+        return status()
+
+    def port_check(port: int) -> bool:
+        if port != 8000:
+            return True
+        return calls["n"] >= 2
+
+    def spawn(_port: int, _ws_port: int, _domains: tuple[str, ...]) -> SpawnedBackend:
+        spawns["n"] += 1
+        return SpawnedBackend(FakeProcess(), tmp_path / "backend.log")
+
+    ensurer = BackendEnsurer(
+        probe=probe,
+        spawn=spawn,
+        port_check=port_check,
+        runtime_dir=tmp_path,
+        health_timeout_seconds=1,
+        poll_seconds=0.001,
+    )
+
+    result = await ensurer.ensure()
+
+    assert result.instance_id == "instance-a"
+    assert calls["n"] == 3
+    assert spawns["n"] == 1
 
 
 async def test_foreign_websocket_occupant_never_spawns(tmp_path: Path) -> None:
