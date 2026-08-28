@@ -542,10 +542,37 @@ class GodotWebSocketServer:
         ## pops on the happy path, so this is a no-op there; on `ws.send`
         ## raise / TimeoutError / cancellation it prevents Futures leaking
         ## into _pending forever.
+        ## The deadline covers the SEND as well as the response wait. When the
+        ## transport is write-paused by TCP backpressure — an editor that has
+        ## stopped reading its socket — `ws.send` blocks for the whole stall, and
+        ## with the timeout wrapped around the future alone it never even
+        ## started: the tool call hung unbounded instead of failing with an
+        ## actionable message. Nothing else bounds it; websockets' own keepalive
+        ## ping queues behind the same paused drain.
+        ##
+        ## The two legs get distinct messages, because they mean opposite things
+        ## to a caller deciding whether to retry. `websockets` hands the COMPLETE
+        ## frame to the transport before awaiting `drain()`, so a send-leg
+        ## timeout leaves a well-formed request buffered — the editor executes it
+        ## in full once it drains. Reporting that as a plain timeout invites a
+        ## retry that duplicates the mutation. A response-leg timeout means the
+        ## request was delivered and the reply did not arrive in budget, which is
+        ## the ordinary case. Conflating the two is the same failure the
+        ## disconnect-vs-timeout split below exists to prevent.
+        sent = False
         try:
-            await ws.send(request.model_dump_json())
-            return await asyncio.wait_for(future, timeout=timeout)
+            async with asyncio.timeout(timeout):
+                await ws.send(request.model_dump_json())
+                sent = True
+                return await future
         except asyncio.TimeoutError:
+            if not sent:
+                raise TimeoutError(
+                    f"Command {command} timed out after {timeout}s on session {session_id} "
+                    "before the request left the socket (transport write-paused). "
+                    "It may still execute when the editor resumes reading — do not "
+                    "retry a mutating command without checking editor state first."
+                )
             raise TimeoutError(
                 f"Command {command} timed out after {timeout}s on session {session_id}"
             )
