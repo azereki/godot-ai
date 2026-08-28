@@ -11,6 +11,7 @@ matters: click Update in the dock.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import re
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -38,6 +40,9 @@ SMOKE_DOWNLOAD_URL = "smoke://local-prestaged"
 DEFAULT_HTTP_PORT = 18000
 DEFAULT_WS_PORT = 19500
 SMOKE_TRIGGER_LOG = "MCP | [self-update-smoke vnext _exit_tree]"
+STATUS_PATH = "/godot-ai/status"
+POST_UPDATE_STATUS_TIMEOUT_SECONDS = 30.0
+POST_UPDATE_STATUS_POLL_SECONDS = 0.25
 
 
 class HarnessError(RuntimeError):
@@ -189,7 +194,14 @@ def main() -> int:
         if args.no_launch:
             return 0
 
-        return launch_and_verify(project_dir, args.godot, next_version, baseline)
+        return launch_and_verify(
+            project_dir,
+            args.godot,
+            next_version,
+            baseline,
+            http_port=args.http_port,
+            next_server_version=next_server_version,
+        )
     except HarnessError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
@@ -907,10 +919,14 @@ def print_instructions(
     print("  3. Confirm the editor stays alive. Do not restart the editor to pass the smoke.")
     print("  4. Close Godot normally when done; this script then checks disk state and .ips files.")
     print("")
+    print("This script also polls /godot-ai/status after the new plugin loads and")
+    print("fails if a server is not listening at the new version.")
+    print("")
     print("Failure signals:")
     print("  - Godot exits or a new Godot*.ips appears.")
     print("  - The update temp dir remains after update.")
     print("  - 'MCP | [self-update-smoke vnext _exit_tree]' prints during the update window.")
+    print("  - /godot-ai/status is down or reports the wrong server_version after update.")
     print("")
     print("Launch command:")
     print(f"  {godot_bin} --editor --path {project_dir}")
@@ -918,7 +934,13 @@ def print_instructions(
 
 
 def launch_and_verify(
-    project_dir: Path, godot_bin: str, next_version: str, baseline: set[Path]
+    project_dir: Path,
+    godot_bin: str,
+    next_version: str,
+    baseline: set[Path],
+    *,
+    http_port: int,
+    next_server_version: str,
 ) -> int:
     godot_path = shutil.which(godot_bin) if os.sep not in godot_bin else godot_bin
     if godot_path is None or not Path(godot_path).exists():
@@ -933,17 +955,36 @@ def launch_and_verify(
         bufsize=1,
     )
     lines: list[str] = []
+    post_update_status: dict | None = None
+    probed_after_reload = False
     assert proc.stdout is not None
     for line in proc.stdout:
         print(line, end="")
-        lines.append(line.rstrip("\n"))
+        stripped = line.rstrip("\n")
+        lines.append(stripped)
+        if not probed_after_reload and smoke_new_plugin_loaded_after_update(lines):
+            probed_after_reload = True
+            post_update_status = wait_for_live_status(
+                http_port,
+                next_server_version,
+                timeout=POST_UPDATE_STATUS_TIMEOUT_SECONDS,
+                poll=POST_UPDATE_STATUS_POLL_SECONDS,
+            )
     code = proc.wait()
     if code != 0:
         print(f"FAIL: Godot exited with code {code}")
         print_new_reports(baseline, started)
         return code or 1
 
-    ok = verify_post_run(project_dir, next_version, baseline, started, lines)
+    ok = verify_post_run(
+        project_dir,
+        next_version,
+        baseline,
+        started,
+        lines,
+        post_update_status=post_update_status,
+        next_server_version=next_server_version,
+    )
     return 0 if ok else 1
 
 
@@ -953,6 +994,9 @@ def verify_post_run(
     baseline: set[Path],
     started: float,
     lines: list[str],
+    *,
+    post_update_status: dict | None,
+    next_server_version: str,
 ) -> bool:
     ok = True
     installed_version = read_plugin_version(project_dir / "addons" / "godot_ai" / "plugin.cfg")
@@ -1003,6 +1047,19 @@ def verify_post_run(
         ok = False
     else:
         print("PASS: no server/plugin version mismatch reported")
+
+    if status_reports_live_version(post_update_status, next_server_version):
+        print(
+            f"PASS: post-update {STATUS_PATH} live "
+            f"v{post_update_status.get('server_version')}"
+        )
+    else:
+        got = None if post_update_status is None else post_update_status.get("server_version")
+        print(
+            f"FAIL: post-update {STATUS_PATH} was not live "
+            f"(got server_version={got!r}, expected {next_server_version!r})"
+        )
+        ok = False
 
     new_reports = new_diagnostic_reports(baseline, started)
     if new_reports:
@@ -1080,6 +1137,70 @@ def smoke_lines_before_update(lines: list[str]) -> list[str]:
             break
         before.append(line)
     return before
+
+
+def smoke_new_plugin_loaded_after_update(lines: list[str]) -> bool:
+    """True once the post-extract plugin-loaded line appears after staging."""
+    staged = False
+    enabling_new_plugin = False
+    for line in lines:
+        if "MCP | self-update smoke: staged local zip" in line:
+            staged = True
+            continue
+        if not staged:
+            continue
+        if "MCP | update runner enabling new plugin" in line:
+            enabling_new_plugin = True
+            continue
+        if enabling_new_plugin and "MCP | plugin loaded" in line:
+            return True
+    return False
+
+
+def status_url(http_port: int) -> str:
+    return f"http://127.0.0.1:{http_port}{STATUS_PATH}"
+
+
+def fetch_status_payload(http_port: int, timeout: float = 2.0) -> dict | None:
+    """GET /godot-ai/status. None if the port is dark or the body is not JSON."""
+    try:
+        with urllib.request.urlopen(status_url(http_port), timeout=timeout) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            payload = json.loads(resp.read().decode())
+    except (OSError, TimeoutError, ValueError, urllib.error.URLError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def status_reports_live_version(payload: dict | None, expected_version: str) -> bool:
+    if not payload:
+        return False
+    if payload.get("name") != "godot-ai":
+        return False
+    version = payload.get("server_version")
+    if not isinstance(version, str) or not version:
+        return False
+    if expected_version and version != expected_version:
+        return False
+    return True
+
+
+def wait_for_live_status(
+    http_port: int,
+    expected_version: str,
+    *,
+    timeout: float = POST_UPDATE_STATUS_TIMEOUT_SECONDS,
+    poll: float = POST_UPDATE_STATUS_POLL_SECONDS,
+) -> dict | None:
+    deadline = time.time() + timeout
+    last: dict | None = None
+    while time.time() < deadline:
+        last = fetch_status_payload(http_port)
+        if status_reports_live_version(last, expected_version):
+            return last
+        time.sleep(poll)
+    return last
 
 
 def print_new_reports(baseline: set[Path], started: float) -> None:
