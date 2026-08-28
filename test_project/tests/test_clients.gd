@@ -2566,10 +2566,11 @@ func test_json_strategy_preserves_integer_fields() -> void:
 
 func test_json_strategy_refuses_to_overwrite_unparseable_file() -> void:
 	## Regression: if the config file exists but we can't parse it (trailing
-	## comma, stray comment, truncated write), `configure()` used to silently
-	## fall back to `{}` and write only the godot-ai entry — wiping every
-	## other MCP the user had configured. Now it must refuse and surface an
-	## error so the user can inspect and recover.
+	## comma, truncated write), `configure()` used to silently fall back to
+	## `{}` and write only the godot-ai entry — wiping every other MCP the
+	## user had configured. Now it must refuse and surface an error so the
+	## user can inspect and recover. JSONC comments are stripped before
+	## parse; this fixture stays unparseable because of the trailing comma.
 	var path := _scratch_dir.path_join("unparseable.json")
 	var bogus := "{\n  \"mcpServers\": {\n    \"someone-else\": {\"url\": \"http://other/\"},  // trailing comment\n  }\n"
 	var f := FileAccess.open(path, FileAccess.WRITE)
@@ -2631,6 +2632,100 @@ func test_json_strategy_tolerates_utf8_bom() -> void:
 	assert_true(parsed is Dictionary and parsed.has("mcpServers"))
 	assert_true(parsed["mcpServers"].has("someone-else"), "Existing entry wiped after BOM parse recovery")
 	assert_true(parsed["mcpServers"].has("godot-ai"), "godot-ai entry not added")
+
+
+func test_json_strategy_tolerates_zed_jsonc_header() -> void:
+	## Zed ships settings.json with a `// Zed settings` comment header.
+	## Godot's JSON.parse rejects comments, so Configure used to refuse
+	## forever on a stock install. Strip JSONC on the parse copy only.
+	var path := _scratch_dir.path_join("zed_jsonc.json")
+	var seed := {"mcpServers": {"someone-else": {"url": "http://other/"}}}
+	var body := "// Zed settings\n" + JSON.stringify(seed)
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(body)
+	f.close()
+
+	var client := _make_test_json_client(path)
+	var result := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	assert_eq(result.get("status"), "ok", "Zed JSONC header should parse after strip: %s" % result.get("message", ""))
+
+	var check_file := FileAccess.open(path, FileAccess.READ)
+	var parsed = JSON.parse_string(check_file.get_as_text())
+	check_file.close()
+	assert_true(parsed is Dictionary and parsed.has("mcpServers"))
+	assert_true(parsed["mcpServers"].has("someone-else"), "Existing entry wiped after JSONC parse recovery")
+	assert_true(parsed["mcpServers"].has("godot-ai"), "godot-ai entry not added")
+
+
+func test_read_file_text_parses_zed_jsonc_header() -> void:
+	## Focused unit path: `_read_file_text` / `_read_or_init` must accept a
+	## file that begins with `// Zed settings` and leave original_text intact.
+	var path := _scratch_dir.path_join("zed_read_jsonc.json")
+	var body := "// Zed settings\n{\"theme\": \"one-dark\", \"context_servers\": {}}\n"
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(body)
+	f.close()
+
+	var read := McpJsonStrategy._read_file_text(path)
+	assert_true(read.get("ok"), "Zed JSONC header must parse: %s" % read.get("error", ""))
+	assert_true(read.get("data") is Dictionary)
+	var data: Dictionary = read.get("data")
+	assert_eq(data.get("theme"), "one-dark")
+	assert_true(data.has("context_servers"), "parsed object must keep context_servers")
+	assert_eq(read.get("original_text"), body, "comments must stay in original_text")
+
+	var init := McpJsonStrategy._read_or_init(path)
+	assert_true(init.get("ok"), "_read_or_init must succeed on Zed JSONC: %s" % init.get("error", ""))
+	assert_eq((init.get("data") as Dictionary).get("theme"), "one-dark")
+
+
+func test_read_file_text_strips_jsonc_block_comments() -> void:
+	## `/* block */` comments (including inner ones) are stripped on the
+	## parse copy; original_text keeps them.
+	var path := _scratch_dir.path_join("jsonc_block.json")
+	var body := "/* block */\n{\"a\": \"keep\", /* inner */ \"b\": \"also\"}\n"
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(body)
+	f.close()
+
+	var read := McpJsonStrategy._read_file_text(path)
+	assert_true(read.get("ok"), "block comments must parse: %s" % read.get("error", ""))
+	var data: Dictionary = read.get("data")
+	assert_eq(data.get("a"), "keep")
+	assert_eq(data.get("b"), "also")
+	assert_eq(read.get("original_text"), body, "block comments must stay in original_text")
+
+
+func test_strip_jsonc_preserves_comment_markers_inside_strings() -> void:
+	## A `//` or `/* */` sequence inside a JSON string is data, not a comment.
+	var src := '{"url": "http://example.com//path", "note": "use /* not */ here"}'
+	var stripped: String = McpJsonStrategy._strip_jsonc(src)
+	assert_eq(stripped, src, "comment markers inside strings must be preserved")
+	var parsed: Variant = JSON.parse_string(stripped)
+	assert_true(parsed is Dictionary, "stripped text must remain valid JSON")
+	assert_eq((parsed as Dictionary).get("url"), "http://example.com//path")
+	assert_eq((parsed as Dictionary).get("note"), "use /* not */ here")
+	var escaped := '{"a": "foo\\" // not a comment"}'
+	assert_eq(McpJsonStrategy._strip_jsonc(escaped), escaped, "escaped quotes must not end the string early")
+
+
+func test_read_file_text_jsonc_still_errors_on_invalid_json() -> void:
+	## Comment stripping is not a license to accept broken JSON. A Zed-style
+	## header in front of invalid JSON must still fail closed.
+	var path := _scratch_dir.path_join("jsonc_invalid.json")
+	var body := "// Zed settings\n{not-valid-json\n"
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(body)
+	f.close()
+
+	var read := McpJsonStrategy._read_file_text(path)
+	assert_false(read.get("ok"), "invalid JSON after comment strip must still error")
+	var err: String = str(read.get("error", ""))
+	assert_true(err.find("JSON parse error") >= 0, "error should mention JSON parse: %s" % err)
+	assert_eq(read.get("original_text"), body, "failed parse must still return original_text")
+
+	var init := McpJsonStrategy._read_or_init(path)
+	assert_false(init.get("ok"), "_read_or_init must also fail on invalid JSONC")
 
 
 func test_json_strategy_remove_refuses_unparseable_file() -> void:

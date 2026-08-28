@@ -433,7 +433,8 @@ static func _arrays_equal(left: Variant, right: Variant) -> bool:
 ## Callers must NOT treat the error path as an empty config — doing so blows
 ## away the user's other MCP entries on the next write. The `original_text`
 ## is the exact captured source so transactional rollback can restore
-## byte-for-byte; the UTF-8 BOM is stripped only from the parsing copy.
+## byte-for-byte; the UTF-8 BOM and JSONC comments are stripped only from
+## the parsing copy.
 static func _read_file_text(path: String) -> Dictionary:
 	if not FileAccess.file_exists(path):
 		return {"exists": false, "ok": true, "data": {}, "original_text": ""}
@@ -451,6 +452,11 @@ static func _read_file_text(path: String) -> Dictionary:
 	# Previously this landed on the "unparseable → wipe" path.
 	if parse_copy.begins_with("﻿"):
 		parse_copy = parse_copy.substr(1)
+	# Zed ships settings.json with a `//` comment header (JSONC). Godot's
+	# JSON.parse has no comment support, so strip line/block comments from
+	# the parse copy only — original_text stays byte-for-byte for rollback
+	# and token-preserving remove.
+	parse_copy = _strip_jsonc(parse_copy)
 	var json := JSON.new()
 	if json.parse(parse_copy) != OK:
 		var msg := "JSON parse error on line %d: %s" % [json.get_error_line(), json.get_error_message()]
@@ -459,6 +465,51 @@ static func _read_file_text(path: String) -> Dictionary:
 	if not (json.data is Dictionary):
 		return {"exists": true, "ok": false, "error": "top-level value is %s, expected object" % type_string(typeof(json.data)), "original_text": content}
 	return {"exists": true, "ok": true, "data": json.data, "original_text": content}
+
+
+## Strip JSONC `//` line comments and `/* */` block comments. Sequences
+## inside JSON strings are left intact. Used only on the parse copy —
+## callers keep `original_text` for byte-for-byte rollback.
+static func _strip_jsonc(text: String) -> String:
+	var out := ""
+	var i := 0
+	var n := text.length()
+	var in_string := false
+	var escape := false
+	while i < n:
+		var c := text[i]
+		if in_string:
+			out += c
+			if escape:
+				escape = false
+			elif c == "\\":
+				escape = true
+			elif c == '"':
+				in_string = false
+			i += 1
+			continue
+		if c == '"':
+			in_string = true
+			out += c
+			i += 1
+			continue
+		if c == "/" and i + 1 < n and text[i + 1] == "/":
+			i += 2
+			while i < n and text[i] != "\n":
+				i += 1
+			continue
+		if c == "/" and i + 1 < n and text[i + 1] == "*":
+			i += 2
+			while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+				i += 1
+			if i + 1 < n:
+				i += 2
+			else:
+				i = n
+			continue
+		out += c
+		i += 1
+	return out
 
 
 ## Returns {"ok": true, "data": Dictionary} when the file is absent or parses
