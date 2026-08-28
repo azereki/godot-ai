@@ -28,6 +28,21 @@ def test_godot_bin_unset_skips(monkeypatch: pytest.MonkeyPatch) -> None:
         godot_bin_or_skip()
 
 
+def test_godot_bin_directory_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GODOT_BIN", str(tmp_path))
+    monkeypatch.delenv("GODOT", raising=False)
+    monkeypatch.delenv("GODOT4", raising=False)
+    monkeypatch.setattr(
+        "tests.integration._self_update_fixture.shutil.which",
+        lambda _name: None,
+    )
+
+    with pytest.raises(pytest.fail.Exception, match="does not resolve"):
+        godot_bin_or_skip()
+
+
 def test_godot_bin_set_but_unresolvable_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GODOT_BIN", "godot-ai-missing-binary-917")
     monkeypatch.delenv("GODOT", raising=False)

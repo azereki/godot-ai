@@ -115,14 +115,14 @@ def godot_bin_or_skip() -> str:
     if not godot_bin:
         pytest.skip("GODOT_BIN is not set; skipping Godot self-update integration test")
     candidate = Path(godot_bin).expanduser()
-    if candidate.exists() or candidate.is_absolute() or "/" in godot_bin or "\\" in godot_bin:
-        resolved = candidate if candidate.exists() else None
+    if _path_is_file(candidate) or candidate.is_absolute() or "/" in godot_bin or "\\" in godot_bin:
+        resolved = candidate if _path_is_file(candidate) else None
     else:
         found = shutil.which(godot_bin)
         resolved = Path(found) if found is not None else None
-        if (resolved is None or not resolved.exists()) and _is_windows():
+        if (resolved is None or not _path_is_file(resolved)) and _is_windows():
             resolved = _windows_godot_fallbacks(godot_bin)
-    if resolved is None or not resolved.exists():
+    if resolved is None or not _path_is_file(resolved):
         # CI sets GODOT_BIN=godot. Skipping here would make pytest exit 0
         # with zero tests run and hide a missing engine (#917).
         pytest.fail(f"GODOT_BIN does not resolve to an executable: {godot_bin}")
