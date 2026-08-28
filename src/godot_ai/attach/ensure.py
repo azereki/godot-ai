@@ -481,13 +481,9 @@ class BackendEnsurer:
             timeout_seconds=self._lock_timeout_seconds,
         )
         async with lock:
-            status = await self._probe(self.port)
+            status = await self._adopt_existing()
             if status is not None:
                 return self._validate(status)
-            if not self._port_check(self.port):
-                raise _foreign_occupant(
-                    self.port, "listener did not answer the godot-ai status probe"
-                )
             if not self._port_check(self.ws_port):
                 raise _foreign_occupant(self.ws_port, "WebSocket port is already occupied")
 
@@ -516,6 +512,27 @@ class BackendEnsurer:
                 retryable=True,
                 data={"log_path": str(spawned.log_path)},
             )
+
+    async def _adopt_existing(self) -> BackendStatus | None:
+        """Retry the status probe while the HTTP port is bound.
+
+        ``None`` from the probe means no answer yet, including a timeout.
+        A raised foreign-occupant error is not retried. If the port frees,
+        return ``None`` so the caller can spawn. After the health deadline
+        with the port still bound, raise ``PORT_OCCUPIED``.
+        """
+        deadline = time.monotonic() + self._health_timeout_seconds
+        while True:
+            status = await self._probe(self.port)
+            if status is not None:
+                return status
+            if self._port_check(self.port):
+                return None
+            if time.monotonic() >= deadline:
+                raise _foreign_occupant(
+                    self.port, "listener did not answer the godot-ai status probe"
+                )
+            await asyncio.sleep(self._poll_seconds)
 
     def _validate(self, status: BackendStatus) -> BackendStatus:
         differences: dict[str, Any] = {}
