@@ -1369,17 +1369,25 @@ def test_direct_runtime_bound_id_missing_returns_none_session():
     assert runtime.get_active_session() is None
 
 
-async def test_direct_runtime_unbound_preserves_active_routing():
+async def test_direct_runtime_unbound_pins_active_for_call_duration():
     registry = SessionRegistry()
     registry.register(_make_session("a"))
+    registry.register(_make_session("b"))
     registry.set_active("a")
     client = StubClient()
     runtime = DirectRuntime(registry=registry, client=client)
 
     await runtime.send_command("get_editor_state")
 
-    ## Unbound runtime passes None so client falls back to registry active.
-    assert client.calls[-1]["session_id"] is None
+    ## Unbound runtime pins the then-active session so a later activate
+    ## cannot retarget this call (#911).
+    assert client.calls[-1]["session_id"] == "a"
+    assert runtime.active_session_id == "a"
+
+    registry.set_active("b")
+    await runtime.send_command("get_editor_state")
+    assert client.calls[-1]["session_id"] == "a"
+    assert runtime.get_active_session().session_id == "a"
 
 
 class _LifespanCtxStub:

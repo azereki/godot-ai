@@ -47,6 +47,22 @@ class DirectRuntime:
     ) -> DirectRuntime:
         return cls(registry=app.registry, client=app.client, session_id=session_id)
 
+    def _pin_active_session_id(self) -> str | None:
+        """Resolve the active session once and keep it for this runtime.
+
+        Unpinned calls used to re-read the process-global active session
+        in both ``require_writable_async`` and ``send_command``. On the
+        readiness slow path that pair can disagree if ``session_activate``
+        interleaves (#911). Per-call ``session_id`` already pinned; the
+        default path must too.
+        """
+        if self._bound_session_id is not None:
+            return self._bound_session_id
+        session = self._registry.get_active()
+        if session is not None:
+            self._bound_session_id = session.session_id
+        return self._bound_session_id
+
     async def send_command(
         self,
         command: str,
@@ -55,7 +71,9 @@ class DirectRuntime:
         timeout: float = 5.0,
         hint_policy: HintPolicy | None = None,
     ) -> dict[str, Any]:
-        resolved_session_id = session_id if session_id is not None else self._bound_session_id
+        resolved_session_id = (
+            session_id if session_id is not None else self._pin_active_session_id()
+        )
         return await self._client.send(
             command=command,
             params=params,
@@ -68,16 +86,18 @@ class DirectRuntime:
         return self._registry.list_all()
 
     def get_active_session(self) -> Session | None:
-        if self._bound_session_id is not None:
-            return self._registry.get(self._bound_session_id)
-        return self._registry.get_active()
+        pinned = self._pin_active_session_id()
+        if pinned is not None:
+            return self._registry.get(pinned)
+        return None
 
     @property
     def active_session_id(self) -> str | None:
-        return self._bound_session_id or self._registry.active_session_id
+        return self._pin_active_session_id()
 
     def set_active_session(self, session_id: str) -> None:
         self._registry.set_active(session_id)
+        self._bound_session_id = session_id
 
     async def wait_for_session(
         self,
