@@ -173,6 +173,78 @@ func test_write_still_rejects_traversal() -> void:
 	assert_false(McpPathValidator.validate_resource_path("res://../etc/passwd", true).is_empty())
 
 
+# ----- write blocklist: separator normalization -----
+#
+# The segment-based clauses split on "/" only. A Windows-style separator would
+# fuse the path into a single segment that matches neither, while Godot's own
+# FileAccess resolves the backslash and performs the write — so the blocklist
+# has to normalize before splitting.
+
+func test_write_rejects_backslash_godot_metadata_dir() -> void:
+	var err := McpPathValidator.validate_resource_path("res://.godot\\uid_cache.bin", true)
+	assert_false(err.is_empty(),
+		"a backslash-separated path into res://.godot/ must be refused for write "
+		+ "just like the forward-slash form")
+	assert_contains(err, ".godot")
+
+
+func test_write_rejects_backslash_loaded_plugin_tree() -> void:
+	var err := McpPathValidator.validate_resource_path("res://addons\\godot_ai\\plugin.gd", true)
+	assert_false(err.is_empty(),
+		"a backslash-separated path into the loaded plugin tree must be refused "
+		+ "for write — overwriting a live .gd can crash the editor")
+	assert_contains(err, "addons/godot_ai")
+
+
+func test_write_rejects_mixed_separators_into_blocked_dirs() -> void:
+	## Real callers on Windows produce mixed forms; both halves of the split
+	## must survive normalization.
+	assert_false(McpPathValidator.validate_resource_path(
+		"res://addons/godot_ai\\utils\\path_validator.gd", true).is_empty(),
+		"a mixed-separator path into the plugin tree must be refused")
+	assert_false(McpPathValidator.validate_resource_path(
+		"res://sub\\.godot\\x.bin", true).is_empty(),
+		"a mixed-separator path into a nested .godot/ must be refused")
+
+
+func test_write_rejects_dot_segments_into_loaded_plugin_tree() -> void:
+	## The plugin-tree clause is ANCHORED on segments[0]/segments[1], so a `.`
+	## segment shifts it out of position. `split("/", false)` only drops EMPTY
+	## segments — `.` survives as a real one. The engine folds it away before
+	## writing, so every form below reaches the live plugin script.
+	assert_false(McpPathValidator.validate_resource_path(
+		"res://./addons/godot_ai/plugin.gd", true).is_empty(),
+		"a leading ./ must not shift the plugin-tree check out of position")
+	assert_false(McpPathValidator.validate_resource_path(
+		"res://addons/./godot_ai/plugin.gd", true).is_empty(),
+		"an interior ./ must not shift the plugin-tree check out of position")
+	assert_false(McpPathValidator.validate_resource_path(
+		"res://.\\addons\\godot_ai\\plugin.gd", true).is_empty(),
+		"the ./ and backslash bypasses must not compose into a hole")
+	assert_false(McpPathValidator.validate_resource_path(
+		"res://addons//godot_ai/plugin.gd", true).is_empty(),
+		"a doubled separator must not shift the check either")
+
+
+func test_write_rejects_backslash_before_the_project_manifest() -> void:
+	## Load-bearing for the fix's scope: the manifest and override.cfg clauses
+	## are filename-based via `String.get_file()`, which already splits on both
+	## separators — which is why they needed no change here. If that ever stops
+	## being true, this fails rather than the gap going unnoticed.
+	assert_false(McpPathValidator.validate_resource_path(
+		"res://sub\\project.godot", true).is_empty(),
+		"get_file() is separator-aware, so the manifest guard covers backslashes")
+
+
+func test_write_still_allows_backslash_paths_outside_the_blocklist() -> void:
+	## Normalization must not turn every backslash path into a rejection —
+	## only the blocked prefixes are affected.
+	assert_eq(McpPathValidator.validate_resource_path("res://scenes\\level.tscn", true), "")
+	assert_eq(McpPathValidator.validate_resource_path("res://addons\\other_addon\\x.gd", true), "")
+
+
+# ----- write blocklist: startup surface and the loaded plugin tree -----
+
 func test_write_rejects_override_cfg() -> void:
 	## override.cfg is applied over project.godot at startup — same takeover
 	## surface as the manifest, so writes must be refused too.
