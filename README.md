@@ -53,6 +53,7 @@ animation, particles, cameras, and environments.
 
 ```bash
 git clone https://github.com/hi-godot/godot-ai.git
+mkdir -p your-project/addons   # without this, cp makes addons/ a copy of godot_ai
 cp -r godot-ai/plugin/addons/godot_ai your-project/addons/
 ```
 
@@ -73,6 +74,11 @@ Marketplace releases may lag behind GitHub.
 In Godot: **Project > Project Settings > Plugins** — enable **Godot AI**.
 
 The plugin will automatically start the MCP server, connect over WebSocket, and show status in the **Godot AI** dock.
+
+> **Not listed under Plugins?** Godot scans each subdirectory of `res://addons/`
+> for a `plugin.cfg`. Check that your project has `addons/godot_ai/plugin.cfg`
+> and not `addons/plugin.cfg` — the latter means the plugin contents were copied
+> one directory too high.
 
 <p align="center"><img src="docs/images/dock.png" alt="Godot AI dock — Clients & Tools button highlighted" width="350"></p>
 
