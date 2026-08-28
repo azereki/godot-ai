@@ -543,9 +543,13 @@ class GodotWebSocketServer:
         ## raise / TimeoutError / cancellation it prevents Futures leaking
         ## into _pending forever.
         try:
-            await ws.send(request.model_dump_json())
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
+            # One deadline for the write and the response wait. A paused
+            # WebSocket drain used to block forever in `ws.send` because
+            # only the recv side was wrapped (#910).
+            async with asyncio.timeout(timeout):
+                await ws.send(request.model_dump_json())
+                return await future
+        except TimeoutError:
             raise TimeoutError(
                 f"Command {command} timed out after {timeout}s on session {session_id}"
             )

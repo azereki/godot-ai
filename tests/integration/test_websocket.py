@@ -1596,6 +1596,33 @@ class TestPendingFutureCleanup:
         assert harness.server._pending == {}, "send-time exception must not leak _pending entries"
         await plugin.close()
 
+    async def test_timeout_covers_write_stall(self, harness):
+        ## A never-completing `ws.send` used to ignore the per-command
+        ## timeout because the deadline started only after the write
+        ## returned (#910).
+        plugin = await harness.connect_plugin(session_id="write-stall")
+        ws = harness.server._connections["write-stall"]
+        stall = asyncio.Event()
+
+        async def hanging_send(_payload: str) -> None:
+            await stall.wait()
+
+        ws.send = hanging_send  # type: ignore[assignment]
+
+        with pytest.raises(TimeoutError, match="timed out after 0.2"):
+            await asyncio.wait_for(
+                harness.server.send_command(
+                    session_id="write-stall",
+                    command="will_stall",
+                    timeout=0.2,
+                ),
+                timeout=1.5,
+            )
+
+        assert harness.server._pending == {}, "write-stall timeout must not leak _pending entries"
+        stall.set()
+        await plugin.close()
+
 
 # --- Issue #262: editor_state self-heals a stale "playing" cache ---
 
