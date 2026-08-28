@@ -227,13 +227,28 @@ func test_write_rejects_dot_segments_into_loaded_plugin_tree() -> void:
 
 
 func test_write_rejects_backslash_before_the_project_manifest() -> void:
-	## Load-bearing for the fix's scope: the manifest and override.cfg clauses
-	## are filename-based via `String.get_file()`, which already splits on both
-	## separators — which is why they needed no change here. If that ever stops
-	## being true, this fails rather than the gap going unnoticed.
+	## Manifest and override.cfg checks run on the normalized path, so a
+	## backslash before the filename cannot hide it from get_file().
 	assert_false(McpPathValidator.validate_resource_path(
 		"res://sub\\project.godot", true).is_empty(),
-		"get_file() is separator-aware, so the manifest guard covers backslashes")
+		"normalization plus get_file() must still refuse the manifest")
+
+
+func test_write_rejects_dot_suffixed_protected_files() -> void:
+	## `res://project.godot/.` has get_file() == "." until simplify_path()
+	## folds the trailing segment. The writer still opens project.godot.
+	assert_false(McpPathValidator.validate_resource_path(
+		"res://project.godot/.", true).is_empty(),
+		"a trailing /. must not bypass the project.godot guard")
+	assert_false(McpPathValidator.validate_resource_path(
+		"res://override.cfg/.", true).is_empty(),
+		"a trailing /. must not bypass the override.cfg guard")
+	assert_false(McpPathValidator.validate_resource_path(
+		"res://project.godot/./", true).is_empty(),
+		"a trailing /./ must not bypass the project.godot guard")
+	assert_false(McpPathValidator.validate_resource_path(
+		"res://override.cfg\\.", true).is_empty(),
+		"a trailing \\. must not bypass the override.cfg guard")
 
 
 func test_write_still_allows_backslash_paths_outside_the_blocklist() -> void:

@@ -153,18 +153,11 @@ static func _confine_under(path: String, root: String, label: String) -> String:
 ## source-controlled). The blocked set is the startup-execution surface only:
 ## the manifest, its `override.cfg` shadow, and the `.godot/` cache dir.
 static func _reject_sensitive_write(path: String) -> String:
-	var file_lower := path.get_file().to_lower()
-	if file_lower == "project.godot":
-		return "Refusing to write res://project.godot (project manifest)"
-	if file_lower == "override.cfg":
-		return "Refusing to write res://override.cfg (startup config override)"
-	# Reject the `.godot/` editor-metadata dir at any depth. Split drops empty
-	# segments so a trailing slash can't hide a segment from the check.
-	#
-	# Normalize the way the engine does before splitting. `FileAccess::fix_path`
-	# rewrites `\` to `/` on EVERY platform, and `FileAccessWindows` additionally
-	# runs `simplify_path()` -- so the writer resolves separators, `//`, and `.`
-	# segments that a raw `split("/")` here would not. Two consequences:
+	# Normalize once, then reuse for filename and segment checks. The writer
+	# (`FileAccess::fix_path` / `FileAccessWindows`) folds `\`, `//`, and `.`
+	# the same way, so `res://project.godot/.` and `res://override.cfg/.` must
+	# not slip past `get_file()` as a trailing `.` while still opening the
+	# protected file.
 	#
 	#   - `res://.godot\uid_cache.bin` used to collapse to one fused segment
 	#     and match neither this check nor the loaded-plugin one below, while the
@@ -173,18 +166,19 @@ static func _reject_sensitive_write(path: String) -> String:
 	#     `res://./addons/godot_ai/plugin.gd` slipped past it even once the
 	#     separators were normalized.
 	#
-	# `simplify_path()` closes both in one call, and matching the engine own
-	# normalizer is what keeps validator and writer agreeing. `..` never reaches
-	# here -- `_confine_under` refuses it first -- so its folding is inert.
-	#
-	# Because the engine normalizes backslashes on Linux too, a POSIX file
-	# literally named `addons\godot_ai\x.gd` is not addressable through
-	# `res://` at all, so normalizing costs no legitimate write.
-	#
-	# The `get_file()` clauses above need no such fix: `String.get_file()` splits
-	# on both separators already, which is why the manifest and override.cfg
-	# guards were never bypassable this way.
-	var segments := path.replace("\\", "/").simplify_path().trim_prefix("res://").split("/", false)
+	# `..` never reaches here -- `_confine_under` refuses it first -- so its
+	# folding is inert. Because the engine normalizes backslashes on Linux too,
+	# a POSIX file literally named `addons\godot_ai\x.gd` is not addressable
+	# through `res://` at all, so normalizing costs no legitimate write.
+	var normalized := path.replace("\\", "/").simplify_path()
+	var file_lower := normalized.get_file().to_lower()
+	if file_lower == "project.godot":
+		return "Refusing to write res://project.godot (project manifest)"
+	if file_lower == "override.cfg":
+		return "Refusing to write res://override.cfg (startup config override)"
+	# Reject the `.godot/` editor-metadata dir at any depth. Split drops empty
+	# segments so a trailing slash can't hide a segment from the check.
+	var segments := normalized.trim_prefix("res://").split("/", false)
 	for segment in segments:
 		if segment.to_lower() == ".godot":
 			return "Refusing to write under res://.godot/ (editor metadata)"
