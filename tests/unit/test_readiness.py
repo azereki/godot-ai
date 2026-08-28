@@ -453,3 +453,58 @@ def test_known_readiness_matches_plugin_get_readiness_source():
         f"gd-only={sorted(emitted - set(KNOWN_READINESS))}, "
         f"py-only={sorted(set(KNOWN_READINESS) - emitted)}"
     )
+
+
+async def test_require_writable_async_pins_session_across_slow_path():
+    """#911: an unpinned write must not retarget if session_activate
+    flips the global active session while the live readiness probe is
+    in flight.
+    """
+    session_a = Session(
+        session_id="sess-a",
+        godot_version="4.4.1",
+        project_path="/tmp/a",
+        plugin_version="0.0.1",
+        readiness="importing",
+    )
+    session_b = Session(
+        session_id="sess-b",
+        godot_version="4.4.1",
+        project_path="/tmp/b",
+        plugin_version="0.0.1",
+        readiness="playing",
+    )
+    registry = SessionRegistry()
+    registry.register(session_a)
+    registry.register(session_b)
+    registry.set_active("sess-a")
+
+    class _FlipOnProbe:
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+
+        async def send(
+            self,
+            command: str,
+            params: dict | None = None,
+            session_id: str | None = None,
+            timeout: float = 5.0,
+            hint_policy=None,
+        ) -> dict:
+            self.calls.append(session_id)
+            registry.set_active("sess-b")
+            return {
+                "current_scene": "res://main.tscn",
+                "project_name": "p",
+                "is_playing": False,
+                "godot_version": "4.4.1",
+                "readiness": "ready",
+            }
+
+    client = _FlipOnProbe()
+    runtime = DirectRuntime(registry=registry, client=client)
+    await require_writable_async(runtime)
+    assert client.calls == ["sess-a"]
+    assert runtime.active_session_id == "sess-a"
+    assert registry.active_session_id == "sess-b"
+    assert session_a.readiness == "ready"
