@@ -1046,11 +1046,10 @@ func test_pi_remove_merged_returns_not_configured_when_no_match() -> void:
 
 func test_pi_load_merge_tiers_accepts_bom_prefixed_valid_object() -> void:
 	var bom_path := _scratch_dir.path_join("pi_bom_merge.json")
-	# A leading U+FEFF must not break the parse path. The captured text is what
-	# rollback would restore; whether Godot's text read surfaces that byte
-	# verbatim or silently strips it is implementation-dependent, so this
-	# assertion concentrates on the strategy contract: parse success plus
-	# non-empty original_text for rollback.
+	# A leading U+FEFF must not break the parse path. `_read_file_text`
+	# restores the marker in `original_text` even though Godot's UTF-8
+	# decoder skips the on-disk EF BB BF, so rollback/configure can write
+	# the BOM back.
 	var bom_text := "\ufeff" + JSON.stringify({"mcpServers": {"unrelated": {"command": "untouched", "args": []}}})
 	var file := FileAccess.open(bom_path, FileAccess.WRITE)
 	assert_true(file != null, "could not write BOM-prefixed fixture: %s" % bom_path)
@@ -1074,6 +1073,7 @@ func test_pi_load_merge_tiers_accepts_bom_prefixed_valid_object() -> void:
 	assert_true(parsed.has("mcpServers"), "parsed data must surface the canonical map")
 	var original_text: String = tiers[0].get("original_text", "")
 	assert_ne(original_text, "", "original_text must capture non-empty source for rollback")
+	assert_true(original_text.begins_with("\uFEFF"), "original_text must restore the on-disk UTF-8 BOM")
 
 
 func test_pi_json_strategy_fails_closed_on_project_override() -> void:

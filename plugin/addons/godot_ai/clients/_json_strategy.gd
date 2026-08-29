@@ -446,8 +446,9 @@ static func _arrays_equal(left: Variant, right: Variant) -> bool:
 ## Callers must NOT treat the error path as an empty config — doing so blows
 ## away the user's other MCP entries on the next write. The `original_text`
 ## is the exact captured source so transactional rollback can restore
-## byte-for-byte; the UTF-8 BOM and JSONC comments are stripped only from
-## the parsing copy.
+## byte-for-byte; the UTF-8 BOM is restored on `original_text` when the
+## decoder skipped the on-disk EF BB BF, and JSONC comments are stripped
+## only from the parsing copy.
 static func _read_file_text(path: String) -> Dictionary:
 	if not FileAccess.file_exists(path):
 		return {"exists": false, "ok": true, "data": {}, "original_text": ""}
@@ -455,16 +456,22 @@ static func _read_file_text(path: String) -> Dictionary:
 	if file == null:
 		var open_err := FileAccess.get_open_error()
 		return {"exists": true, "ok": false, "error": "could not open for reading (error %d)" % open_err, "original_text": ""}
-	var content := file.get_as_text()
+	# Read bytes, not `get_as_text()`. Godot's UTF-8 decoder (both
+	# `get_as_text()` and `PackedByteArray.get_string_from_utf8()`) skips a
+	# leading EF BB BF, so a text-only read would drop the BOM from
+	# `original_text` and the next configure/remove write would strip it
+	# from disk. Detect the marker on the raw buffer and restore U+FEFF
+	# when the decoder ate it (#914 F-3-6 / F5).
+	var buf := file.get_buffer(file.get_length())
 	file.close()
-	if content.strip_edges().is_empty():
+	var had_bom := buf.size() >= 3 and buf[0] == 0xEF and buf[1] == 0xBB and buf[2] == 0xBF
+	var content := buf.get_string_from_utf8()
+	if had_bom and not content.begins_with("\uFEFF"):
+		content = "\uFEFF" + content
+	var body := content.substr(1) if content.begins_with("\uFEFF") else content
+	if body.strip_edges().is_empty():
 		return {"exists": true, "ok": true, "data": {}, "original_text": content}
-	var parse_copy := content
-	# Strip a UTF-8 BOM if present — some editors (notably on Windows) save
-	# JSON with a leading ﻿, which Godot's JSON.parse rejects outright.
-	# Previously this landed on the "unparseable → wipe" path.
-	if parse_copy.begins_with("﻿"):
-		parse_copy = parse_copy.substr(1)
+	var parse_copy := body
 	# Zed ships settings.json with a `//` comment header (JSONC). Godot's
 	# JSON.parse has no comment support, so strip line/block comments from
 	# the parse copy only — original_text stays byte-for-byte for rollback
@@ -916,9 +923,8 @@ static func _write_config_entry(
 	server_name: String,
 	entry: Dictionary,
 ) -> Dictionary:
-	var source := original_text
-	if source.begins_with("﻿"):
-		source = source.substr(1)
+	var had_bom := original_text.begins_with("\uFEFF")
+	var source := original_text.substr(1) if had_bom else original_text
 	if source.strip_edges().is_empty():
 		if _has_lossy_numbers(config):
 			return {
@@ -926,6 +932,8 @@ static func _write_config_entry(
 				"error": "Refusing to rewrite %s: contains integers above 2^53 that Godot's JSON parser would re-emit imprecise. Edit the file by hand." % path,
 			}
 		var serialized := JSON.stringify(_narrow_integral_numbers(config), "\t", false)
+		if had_bom:
+			serialized = "\uFEFF" + serialized
 		if not McpAtomicWrite.write(path, serialized):
 			return {"ok": false, "error": "Cannot write to %s" % path}
 		return {"ok": true}

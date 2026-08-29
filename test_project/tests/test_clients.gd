@@ -2611,6 +2611,24 @@ func test_json_strategy_refuses_to_overwrite_non_object_root() -> void:
 	check_file.close()
 
 
+func test_read_file_text_restores_utf8_bom_in_original_text() -> void:
+	## Godot's UTF-8 decoder skips EF BB BF. `_read_file_text` must still
+	## put U+FEFF back on `original_text` so configure/remove can write it.
+	var path := _scratch_dir.path_join("bom_read.json")
+	var body := "\uFEFF" + JSON.stringify({"mcpServers": {}})
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(body)
+	f.close()
+	var read := McpJsonStrategy._read_file_text(path)
+	assert_true(read.get("ok"), "BOM-prefixed JSON must parse: %s" % read.get("error", ""))
+	assert_true(
+		str(read.get("original_text", "")).begins_with("\uFEFF"),
+		"original_text must restore U+FEFF after Godot skips the on-disk BOM"
+	)
+	assert_true((read.get("data") as Dictionary).has("mcpServers"))
+	_remove_if_exists(path)
+
+
 func test_json_strategy_tolerates_utf8_bom() -> void:
 	## JSON saved with a UTF-8 BOM (common from Windows editors) parses as
 	## invalid under Godot's JSON.parse. Under the old strategy that meant a
@@ -2627,12 +2645,24 @@ func test_json_strategy_tolerates_utf8_bom() -> void:
 	var result := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
 	assert_eq(result.get("status"), "ok", "BOM-prefixed JSON should parse after strip")
 
+	# `get_as_text()` skips EF BB BF, so a string-prefix check cannot prove
+	# the BOM survived on disk. Inspect the raw leading bytes instead.
 	var check_file := FileAccess.open(path, FileAccess.READ)
-	var written := check_file.get_as_text()
+	var written_bytes := check_file.get_buffer(check_file.get_length())
 	check_file.close()
-	assert_true(written.begins_with("﻿"), "UTF-8 BOM must survive configure")
+	assert_true(
+		written_bytes.size() >= 3
+		and written_bytes[0] == 0xEF
+		and written_bytes[1] == 0xBB
+		and written_bytes[2] == 0xBF,
+		"UTF-8 BOM bytes must survive configure"
+	)
 	var reread := McpJsonStrategy._read_file_text(path)
 	assert_true(reread.get("ok"), "BOM-prefixed write must still parse: %s" % reread.get("error", ""))
+	assert_true(
+		str(reread.get("original_text", "")).begins_with("\uFEFF"),
+		"original_text must keep U+FEFF so the next write can round-trip the BOM"
+	)
 	var parsed: Dictionary = reread.get("data")
 	assert_true(parsed.has("mcpServers"))
 	assert_true(parsed["mcpServers"].has("someone-else"), "Existing entry wiped after BOM parse recovery")
