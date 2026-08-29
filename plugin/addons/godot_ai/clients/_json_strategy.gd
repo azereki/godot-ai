@@ -26,14 +26,17 @@ static func configure(
 
 	var seed_path := str(resolution.get("seed_path", ""))
 	var read_path := seed_path if not FileAccess.file_exists(path) and not seed_path.is_empty() else path
-	var read := _read_or_init(read_path)
+	# Token-preserving configure (#914): parse via `_read_file_text` so JSONC
+	# comments stay in `original_text`, then splice only the target entry.
+	var read := _read_file_text(read_path)
 	if not read["ok"]:
 		return {"status": "error", "message": "Refusing to overwrite %s: %s. Fix or move the file, then re-run Configure." % [read_path, read["error"]]}
 	var launch_error := command_launch_error(client, launch)
 	if not launch_error.is_empty():
 		return {"status": "error", "message": launch_error}
 	var config: Dictionary = read["data"]
-	var holder := _ensure_path(config, select_server_key_path(config, client))
+	var key_path := select_server_key_path(config, client)
+	var holder := _ensure_path(config, key_path)
 	## Pass the existing entry through so `build_entry` can preserve user-mutable
 	## state (auto-approval lists, `disabled` toggles) instead of resetting it
 	## to descriptor defaults on every Configure click. See `entry_initial_fields`
@@ -41,13 +44,18 @@ static func configure(
 	var existing: Variant = holder.get(server_name, null)
 	holder[server_name] = build_entry(client, server_url, existing, launch)
 
-	# F5: refuse to re-serialize a file whose parsed integers above 2^53 would
-	# lose precision. Editing by hand keeps those values intact.
-	if _has_lossy_numbers(config):
-		return {"status": "error", "message": "Refusing to rewrite %s: contains integers above 2^53 that Godot's JSON parser would re-emit imprecise. Edit the file by hand." % path}
-	if not McpAtomicWrite.write(path, JSON.stringify(_narrow_integral_numbers(config), "\t", false)):
-		return {"status": "error", "message": "Cannot write to %s" % path}
+	var written := _write_config_entry(
+		path,
+		str(read.get("original_text", "")),
+		config,
+		key_path,
+		server_name,
+		holder[server_name],
+	)
+	if not written.get("ok", false):
+		return {"status": "error", "message": str(written.get("error", "Cannot write to %s" % path))}
 	return {"status": "ok", "message": McpClient.configured_message(client, server_url)}
+
 
 ## Pi-style clients merge several global config files. Update the effective
 ## highest-precedence definition; fail closed when a project override exists
@@ -86,12 +94,17 @@ static func _configure_merged(
 	var existing: Variant = holder.get(server_name, null)
 	holder[server_name] = build_entry(client, server_url, existing, launch)
 	var path := str(tier["path"])
-	# F5: refuse to re-serialize a tier whose parsed integers above 2^53 would
-	# lose precision. The same check guards the simple `configure` path.
-	if _has_lossy_numbers(config):
-		return {"status": "error", "message": "Refusing to rewrite %s: contains integers above 2^53 that Godot's JSON parser would re-emit imprecise. Edit the file by hand." % path}
-	if not McpAtomicWrite.write(path, JSON.stringify(_narrow_integral_numbers(config), "\t", false)):
-		return {"status": "error", "message": "Cannot write to %s" % path}
+	var key_path := select_server_key_path(config, client)
+	var written := _write_config_entry(
+		path,
+		str(tier.get("original_text", "")),
+		config,
+		key_path,
+		server_name,
+		holder[server_name],
+	)
+	if not written.get("ok", false):
+		return {"status": "error", "message": str(written.get("error", "Cannot write to %s" % path))}
 	# Codex F1 caveat: when we wrote a global tier but couldn't find any project
 	# override in the roots we probed AND the user hasn't told us where Pi (or any
 	# external cwd client) actually runs from, we can't prove this write is the
@@ -455,8 +468,14 @@ static func _read_file_text(path: String) -> Dictionary:
 	# Zed ships settings.json with a `//` comment header (JSONC). Godot's
 	# JSON.parse has no comment support, so strip line/block comments from
 	# the parse copy only — original_text stays byte-for-byte for rollback
-	# and token-preserving remove.
-	parse_copy = _strip_jsonc(parse_copy)
+	# and token-preserving configure/remove. Unterminated block comments
+	# fail closed so we never treat leftover source as valid JSON (#914).
+	var stripped := _strip_jsonc(parse_copy)
+	if not stripped.get("ok", false):
+		var strip_msg := str(stripped.get("error", "invalid JSONC"))
+		push_warning("MCP | %s in %s" % [strip_msg, path])
+		return {"exists": true, "ok": false, "error": strip_msg, "original_text": content}
+	parse_copy = str(stripped.get("text", ""))
 	var json := JSON.new()
 	if json.parse(parse_copy) != OK:
 		var msg := "JSON parse error on line %d: %s" % [json.get_error_line(), json.get_error_message()]
@@ -470,7 +489,8 @@ static func _read_file_text(path: String) -> Dictionary:
 ## Strip JSONC `//` line comments and `/* */` block comments. Sequences
 ## inside JSON strings are left intact. Used only on the parse copy —
 ## callers keep `original_text` for byte-for-byte rollback.
-static func _strip_jsonc(text: String) -> String:
+## Returns `{"ok": true, "text": String}` or `{"ok": false, "error": String}`.
+static func _strip_jsonc(text: String) -> Dictionary:
 	var out := ""
 	var i := 0
 	var n := text.length()
@@ -493,23 +513,58 @@ static func _strip_jsonc(text: String) -> String:
 			out += c
 			i += 1
 			continue
-		if c == "/" and i + 1 < n and text[i + 1] == "/":
-			i += 2
-			while i < n and text[i] != "\n":
-				i += 1
-			continue
-		if c == "/" and i + 1 < n and text[i + 1] == "*":
-			i += 2
-			while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
-				i += 1
-			if i + 1 < n:
-				i += 2
-			else:
-				i = n
+		var skipped := _skip_jsonc_comment_at(text, i)
+		if skipped < 0:
+			return {"ok": false, "error": "unterminated block comment"}
+		if skipped != i:
+			i = skipped
 			continue
 		out += c
 		i += 1
-	return out
+	if in_string:
+		return {"ok": false, "error": "unterminated string"}
+	return {"ok": true, "text": out}
+
+
+## Skip a JSONC comment starting at `i`. Returns `i` unchanged when `i` is
+## not a comment opener, the index after a consumed comment, or -1 when a
+## block comment runs to EOF without `*/`.
+static func _skip_jsonc_comment_at(text: String, i: int) -> int:
+	var n := text.length()
+	if i + 1 >= n or text[i] != "/":
+		return i
+	if text[i + 1] == "/":
+		i += 2
+		while i < n and text[i] != "\n":
+			i += 1
+		return i
+	if text[i + 1] == "*":
+		i += 2
+		while i + 1 < n:
+			if text[i] == "*" and text[i + 1] == "/":
+				return i + 2
+			i += 1
+		return -1
+	return i
+
+
+## Skip JSON whitespace and JSONC comments. Returns -1 on an unterminated
+## block comment (callers that already parsed the file treat that as a
+## scanner failure rather than swallowing source).
+static func _skip_jsonc_trivia(text: String, i: int) -> int:
+	var n := text.length()
+	while i < n:
+		if _is_json_ws(text[i]):
+			i += 1
+			continue
+		var skipped := _skip_jsonc_comment_at(text, i)
+		if skipped < 0:
+			return -1
+		if skipped != i:
+			i = skipped
+			continue
+		break
+	return i
 
 
 ## Returns {"ok": true, "data": Dictionary} when the file is absent or parses
@@ -819,9 +874,8 @@ static func _narrow_integral_numbers(value: Variant) -> Variant:
 
 ## True when `value` contains any float outside the IEEE-754 exact-int range
 ## (`abs(f) > 2^53`) that would lose precision when JSON.stringify re-emits it.
-## The configure path refuses such files instead of silently mutating unrelated
-## integers; the remove path never needs this check because it does
-## token-preserving surgery (F5).
+## Only the empty-file stringify path consults this: token-preserving
+## configure/remove splice a single entry and leave unrelated literals intact (F5).
 static func _has_lossy_numbers(value: Variant) -> bool:
 	match typeof(value):
 		TYPE_FLOAT:
@@ -843,6 +897,149 @@ static func _has_lossy_numbers(value: Variant) -> bool:
 	return false
 
 
+## Write `entry` under `key_path[server_name]`. Existing files are patched in
+## place so comments, formatting, and unrelated literals stay byte-for-byte
+## (#914). Empty files still stringify the whole object.
+static func _write_config_entry(
+	path: String,
+	original_text: String,
+	config: Dictionary,
+	key_path: PackedStringArray,
+	server_name: String,
+	entry: Dictionary,
+) -> Dictionary:
+	var source := original_text
+	if source.begins_with("﻿"):
+		source = source.substr(1)
+	if source.strip_edges().is_empty():
+		if _has_lossy_numbers(config):
+			return {
+				"ok": false,
+				"error": "Refusing to rewrite %s: contains integers above 2^53 that Godot's JSON parser would re-emit imprecise. Edit the file by hand." % path,
+			}
+		var serialized := JSON.stringify(_narrow_integral_numbers(config), "\t", false)
+		if not McpAtomicWrite.write(path, serialized):
+			return {"ok": false, "error": "Cannot write to %s" % path}
+		return {"ok": true}
+	var patched := _text_upsert_server_entry(original_text, key_path, server_name, entry)
+	if not patched.get("ok", false):
+		return {
+			"ok": false,
+			"error": "Refusing to rewrite %s: %s. Fix or move the file, then re-run Configure." % [
+				path, patched.get("error", "could not update entry in place"),
+			],
+		}
+	if not McpAtomicWrite.write(path, str(patched.get("text", ""))):
+		return {"ok": false, "error": "Cannot write to %s" % path}
+	return {"ok": true}
+
+
+## Token-preserving entry upsert. Locates `key_path[server_name]` in `text`
+## and replaces just that value, or inserts the key (and any missing parent
+## objects) so unrelated comments and formatting survive Configure (#914).
+static func _text_upsert_server_entry(
+	text: String,
+	key_path: PackedStringArray,
+	server_name: String,
+	entry: Dictionary,
+) -> Dictionary:
+	var entry_json := JSON.stringify(_narrow_integral_numbers(entry.duplicate(true)))
+	var root_open := _root_object_open(text)
+	if root_open < 0:
+		return {"ok": false, "error": "no top-level object to patch"}
+	var container_open := root_open
+	var inner_start := root_open + 1
+	var path_keys: Array[String] = []
+	for key in key_path:
+		path_keys.append(String(key))
+	for ki in range(path_keys.size()):
+		var key := path_keys[ki]
+		var found := _find_key_at_container_depth(text, inner_start, JSON.stringify(key))
+		if found.is_empty():
+			var nested: Dictionary = {}
+			nested[server_name] = entry.duplicate(true)
+			for rj in range(path_keys.size() - 1, ki, -1):
+				var wrap: Dictionary = {}
+				wrap[path_keys[rj]] = nested
+				nested = wrap
+			var value_json := JSON.stringify(_narrow_integral_numbers(nested))
+			return _insert_object_property(text, container_open, key, value_json)
+		var child_start: int = found["value_start"]
+		if child_start >= text.length() or text[child_start] != "{":
+			return {"ok": false, "error": "key '%s' is not an object" % key}
+		container_open = child_start
+		inner_start = child_start + 1
+	var existing := _find_key_at_container_depth(text, inner_start, JSON.stringify(server_name))
+	if existing.is_empty():
+		return _insert_object_property(text, container_open, server_name, entry_json)
+	var value_start: int = existing["value_start"]
+	var value_end: int = existing["value_end"]
+	return {"ok": true, "text": text.substr(0, value_start) + entry_json + text.substr(value_end)}
+
+
+## Index of the root `{`, skipping a leading BOM and JSONC trivia. -1 when
+## the file has no top-level object.
+static func _root_object_open(text: String) -> int:
+	var cursor := 0
+	if cursor < text.length() and text[cursor] == "﻿":
+		cursor += 1
+	cursor = _skip_jsonc_trivia(text, cursor)
+	if cursor < 0 or cursor >= text.length() or text[cursor] != "{":
+		return -1
+	return cursor
+
+
+## Insert `"key": value_json` into the object that opens at `obj_open`.
+static func _insert_object_property(
+	text: String, obj_open: int, key: String, value_json: String
+) -> Dictionary:
+	if obj_open < 0 or obj_open >= text.length() or text[obj_open] != "{":
+		return {"ok": false, "error": "insert target is not an object"}
+	var span_end := _json_value_span_end(text, obj_open)
+	if span_end < 0:
+		return {"ok": false, "error": "unterminated object"}
+	var close := span_end - 1
+	var rendered := JSON.stringify(key) + ": " + value_json
+	var inner := _skip_jsonc_trivia(text, obj_open + 1)
+	if inner < 0:
+		return {"ok": false, "error": "unterminated block comment"}
+	if inner == close:
+		return {"ok": true, "text": text.substr(0, obj_open + 1) + rendered + text.substr(close)}
+	var i := inner
+	var saw_trailing_comma := false
+	while i < close:
+		i = _skip_jsonc_trivia(text, i)
+		if i < 0:
+			return {"ok": false, "error": "unterminated block comment"}
+		if i >= close:
+			break
+		if text[i] != '"':
+			return {"ok": false, "error": "object is not a sequence of properties"}
+		var key_end := _json_value_span_end(text, i)
+		if key_end < 0:
+			return {"ok": false, "error": "unterminated property name"}
+		var after_key := _skip_jsonc_trivia(text, key_end)
+		if after_key < 0 or after_key >= text.length() or text[after_key] != ":":
+			return {"ok": false, "error": "missing colon in object"}
+		var value_start := _skip_jsonc_trivia(text, after_key + 1)
+		if value_start < 0:
+			return {"ok": false, "error": "unterminated block comment"}
+		var value_end := _json_value_span_end(text, value_start)
+		if value_end < 0:
+			return {"ok": false, "error": "unterminated property value"}
+		i = _skip_jsonc_trivia(text, value_end)
+		if i < 0:
+			return {"ok": false, "error": "unterminated block comment"}
+		if i < close and text[i] == ",":
+			saw_trailing_comma = true
+			i += 1
+		else:
+			saw_trailing_comma = false
+			break
+	var comma := "" if saw_trailing_comma else ","
+	return {"ok": true, "text": text.substr(0, close) + comma + rendered + text.substr(close)}
+
+
 ## Token-preserving entry removal. Walks the JSON text with a brace-balanced
 ## scanner to locate the entry at `key_path[0]/.../[server_name]` and returns
 ## `text` with that entry's bytes deleted (along with the surrounding
@@ -856,21 +1053,21 @@ static func _text_remove_server_entry(text: String, key_path: PackedStringArray,
 	# After the loop, `cursor` is positioned just past the opening bracket of the
 	# container that holds our entry, and `container_depth` tracks how deeply
 	# nested that container is from the root (0 = root object/array).
-	var cursor := 0
-	# Skip past the root's opening `{` or `[` (and any leading whitespace or
-	# UTF-8 BOM) so `_find_key_at_container_depth` starts scanning from
-	# inside the root container with `inner_depth == 0`. Without this step,
-	# the first character encountered is the root's `{`, which bumps
-	# `inner_depth` to 1 and makes the top-level key check fail. The BOM
-	# skip mirrors `_read_file_text`'s parse_copy BOM-strip above so the
-	# scanner sees the same view of the file the parser does; the BOM
+	# Skip past the root's opening `{` or `[` (and any leading whitespace,
+	# JSONC comments, or UTF-8 BOM) so `_find_key_at_container_depth`
+	# starts scanning from inside the root container with `inner_depth == 0`.
+	# The BOM skip mirrors `_read_file_text`'s parse_copy BOM-strip above so
+	# the scanner sees the same view of the file the parser does; the BOM
 	# itself stays in `text` so the byte-survival F5 contract still holds
-	# (codex round 3, F-3-6 — without it, files saved with a Windows BOM
-	# left the entry in place after Remove).
-	while cursor < text.length() and _is_json_ws(text[cursor]):
-		cursor += 1
+	# (codex round 3, F-3-6). JSONC trivia (#914) must be skipped too —
+	# otherwise a Zed `//` header leaves the cursor on `/` and the root `{`
+	# is treated as nested.
+	var cursor := 0
 	if cursor < text.length() and text[cursor] == "﻿":
 		cursor += 1
+	cursor = _skip_jsonc_trivia(text, cursor)
+	if cursor < 0:
+		return text
 	if cursor < text.length() and (text[cursor] == "{" or text[cursor] == "["):
 		cursor += 1
 	var container_depth := 0
@@ -899,18 +1096,19 @@ static func _text_remove_server_entry(text: String, key_path: PackedStringArray,
 	# middle-position entry into `"x"}"y"` with no separator — codex-review
 	# finding F5 (regression after the initial round).
 	var remove_end := value_end
-	# Skip JSON whitespace before checking for the trailing comma — valid
-	# (if unusual) formats like `"godot-ai":{}   ,"other":{}` put whitespace
-	# between the value and its separator. codex round 4 finding.
-	var trailing_scan := remove_end
-	while trailing_scan < text.length() and _is_json_ws(text[trailing_scan]):
-		trailing_scan += 1
+	# Skip JSON whitespace and JSONC comments before checking for the trailing
+	# comma — valid formats like `"godot-ai":{}   ,"other":{}` put trivia
+	# between the value and its separator.
+	var trailing_scan := _skip_jsonc_trivia(text, remove_end)
+	if trailing_scan < 0:
+		return text
 	var had_trailing_comma := trailing_scan < text.length() and text[trailing_scan] == ","
 	if had_trailing_comma:
-		# Jump past the comma (and any whitespace before it we just skipped).
 		remove_end = trailing_scan + 1
-	while remove_end < text.length() and _is_json_ws(text[remove_end]):
-		remove_end += 1
+	var after_comma := _skip_jsonc_trivia(text, remove_end)
+	if after_comma < 0:
+		return text
+	remove_end = after_comma
 	var remove_start := key_start
 	if not had_trailing_comma:
 		while remove_start > 0 and _is_json_ws(text[remove_start - 1]):
@@ -949,18 +1147,24 @@ static func _find_key_at_container_depth(text: String, start: int, key_bytes: St
 			continue
 		if c == '"':
 			if text.substr(i, key_bytes.length()) == key_bytes:
-				var after_key := i + key_bytes.length()
-				while after_key < text.length() and _is_json_ws(text[after_key]):
-					after_key += 1
+				var after_key := _skip_jsonc_trivia(text, i + key_bytes.length())
+				if after_key < 0:
+					return {}
 				if after_key < text.length() and text[after_key] == ":":
-					var value_start := after_key + 1
-					while value_start < text.length() and _is_json_ws(text[value_start]):
-						value_start += 1
+					var value_start := _skip_jsonc_trivia(text, after_key + 1)
+					if value_start < 0:
+						return {}
 					var value_end := _json_value_span_end(text, value_start)
 					if value_end >= 0 and inner_depth == 0:
 						return {"key_start": i, "value_start": value_start, "value_end": value_end}
 			in_string = true
 			i += 1
+			continue
+		var skipped := _skip_jsonc_comment_at(text, i)
+		if skipped < 0:
+			return {}
+		if skipped != i:
+			i = skipped
 			continue
 		if c == "{" or c == "[":
 			inner_depth += 1
@@ -1006,10 +1210,17 @@ static func _json_value_span_end(text: String, value_start: int) -> int:
 				continue
 			if ch == '"':
 				in_string = true
-			elif ch == open_char:
-				depth += 1
-			elif ch == close_char:
-				depth -= 1
+			else:
+				var skipped := _skip_jsonc_comment_at(text, i)
+				if skipped < 0:
+					return -1
+				if skipped != i:
+					i = skipped
+					continue
+				if ch == open_char:
+					depth += 1
+				elif ch == close_char:
+					depth -= 1
 			i += 1
 		return i if depth == 0 else -1
 	if c == '"':

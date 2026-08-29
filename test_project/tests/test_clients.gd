@@ -2550,14 +2550,15 @@ func test_json_strategy_preserves_integer_fields() -> void:
 	var content := content_file.get_as_text()
 	content_file.close()
 	# Integers must survive as integers — not be floatified to "8080.0".
-	assert_true(content.contains('"port": 8080'), "port int must be present")
-	assert_false(content.contains('"port": 8080.0'), "port must not become 8080.0")
-	assert_false(content.contains('"retries": 3.0'), "retries must not be floatified")
-	assert_false(content.contains('"numStartups": 47.0'), "top-level int must not be floatified")
-	# Check each element regardless of trailing comma/newline so a floatified
-	# last element ("3.0" with no comma) is also caught.
-	for floatified in ["1.0", "2.0", "3.0"]:
-		assert_false(content.contains(floatified), "array int must not be floatified (%s)" % floatified)
+	# Token-preserving configure keeps the original literals, which may be
+	# compact (`"port":8080`) or spaced (`"port": 8080`).
+	assert_false(content.contains("8080.0"), "port must not become 8080.0")
+	assert_false(content.contains("1.0"), "array int must not be floatified (1.0)")
+	assert_false(content.contains("2.0"), "array int must not be floatified (2.0)")
+	assert_false(content.contains("3.0"), "retries / array ints must not be floatified")
+	assert_false(content.contains("47.0"), "top-level int must not be floatified")
+	assert_true(content.contains("8080"), "port int must be present")
+	assert_true(content.contains("47"), "top-level int must be present")
 	# Still valid JSON, other entry preserved, our entry added.
 	var parsed = JSON.parse_string(content)
 	assert_true(parsed["mcpServers"].has("someone-else"))
@@ -2627,9 +2628,13 @@ func test_json_strategy_tolerates_utf8_bom() -> void:
 	assert_eq(result.get("status"), "ok", "BOM-prefixed JSON should parse after strip")
 
 	var check_file := FileAccess.open(path, FileAccess.READ)
-	var parsed = JSON.parse_string(check_file.get_as_text())
+	var written := check_file.get_as_text()
 	check_file.close()
-	assert_true(parsed is Dictionary and parsed.has("mcpServers"))
+	assert_true(written.begins_with("﻿"), "UTF-8 BOM must survive configure")
+	var reread := McpJsonStrategy._read_file_text(path)
+	assert_true(reread.get("ok"), "BOM-prefixed write must still parse: %s" % reread.get("error", ""))
+	var parsed: Dictionary = reread.get("data")
+	assert_true(parsed.has("mcpServers"))
 	assert_true(parsed["mcpServers"].has("someone-else"), "Existing entry wiped after BOM parse recovery")
 	assert_true(parsed["mcpServers"].has("godot-ai"), "godot-ai entry not added")
 
@@ -2650,9 +2655,13 @@ func test_json_strategy_tolerates_zed_jsonc_header() -> void:
 	assert_eq(result.get("status"), "ok", "Zed JSONC header should parse after strip: %s" % result.get("message", ""))
 
 	var check_file := FileAccess.open(path, FileAccess.READ)
-	var parsed = JSON.parse_string(check_file.get_as_text())
+	var written := check_file.get_as_text()
 	check_file.close()
-	assert_true(parsed is Dictionary and parsed.has("mcpServers"))
+	assert_true(written.begins_with("// Zed settings\n"), "Zed header must survive configure; got: %s" % written)
+	var reread := McpJsonStrategy._read_file_text(path)
+	assert_true(reread.get("ok"), "written JSONC must still parse: %s" % reread.get("error", ""))
+	var parsed: Dictionary = reread.get("data")
+	assert_true(parsed.has("mcpServers"))
 	assert_true(parsed["mcpServers"].has("someone-else"), "Existing entry wiped after JSONC parse recovery")
 	assert_true(parsed["mcpServers"].has("godot-ai"), "godot-ai entry not added")
 
@@ -2699,14 +2708,17 @@ func test_read_file_text_strips_jsonc_block_comments() -> void:
 func test_strip_jsonc_preserves_comment_markers_inside_strings() -> void:
 	## A `//` or `/* */` sequence inside a JSON string is data, not a comment.
 	var src := '{"url": "http://example.com//path", "note": "use /* not */ here"}'
-	var stripped: String = McpJsonStrategy._strip_jsonc(src)
-	assert_eq(stripped, src, "comment markers inside strings must be preserved")
-	var parsed: Variant = JSON.parse_string(stripped)
+	var stripped: Dictionary = McpJsonStrategy._strip_jsonc(src)
+	assert_true(stripped.get("ok"), "valid JSON with in-string markers must strip: %s" % stripped.get("error", ""))
+	assert_eq(str(stripped.get("text")), src, "comment markers inside strings must be preserved")
+	var parsed: Variant = JSON.parse_string(str(stripped.get("text")))
 	assert_true(parsed is Dictionary, "stripped text must remain valid JSON")
 	assert_eq((parsed as Dictionary).get("url"), "http://example.com//path")
 	assert_eq((parsed as Dictionary).get("note"), "use /* not */ here")
 	var escaped := '{"a": "foo\\" // not a comment"}'
-	assert_eq(McpJsonStrategy._strip_jsonc(escaped), escaped, "escaped quotes must not end the string early")
+	var escaped_stripped: Dictionary = McpJsonStrategy._strip_jsonc(escaped)
+	assert_true(escaped_stripped.get("ok"))
+	assert_eq(str(escaped_stripped.get("text")), escaped, "escaped quotes must not end the string early")
 
 
 func test_read_file_text_jsonc_still_errors_on_invalid_json() -> void:
@@ -2726,6 +2738,70 @@ func test_read_file_text_jsonc_still_errors_on_invalid_json() -> void:
 
 	var init := McpJsonStrategy._read_or_init(path)
 	assert_false(init.get("ok"), "_read_or_init must also fail on invalid JSONC")
+
+
+func test_read_file_text_rejects_unterminated_block_comment() -> void:
+	## Fail-closed: `{"theme":"x"} /* unfinished` must not strip-to-EOF and
+	## parse as valid JSON (#914 review).
+	var path := _scratch_dir.path_join("jsonc_unterminated.json")
+	var body := "{\"theme\": \"x\"} /* unfinished"
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(body)
+	f.close()
+
+	var stripped: Dictionary = McpJsonStrategy._strip_jsonc(body)
+	assert_false(stripped.get("ok"), "unterminated block comment must fail strip")
+	assert_true(str(stripped.get("error", "")).contains("unterminated block comment"))
+
+	var read := McpJsonStrategy._read_file_text(path)
+	assert_false(read.get("ok"), "unterminated block comment must fail read")
+	assert_true(str(read.get("error", "")).contains("unterminated block comment"))
+	assert_eq(read.get("original_text"), body, "failed read must still return original_text")
+
+	var client := _make_test_json_client(path)
+	var result := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	assert_eq(result.get("status"), "error", "configure must refuse unterminated JSONC")
+	var check_file := FileAccess.open(path, FileAccess.READ)
+	assert_eq(check_file.get_as_text(), body, "unterminated JSONC must not be mutated")
+	check_file.close()
+
+
+func test_json_strategy_configure_preserves_unrelated_jsonc_byte_for_byte() -> void:
+	## Configure must splice only the target server entry. The Zed header,
+	## inner comments, and unrelated keys stay byte-for-byte (#914 review).
+	var path := _scratch_dir.path_join("jsonc_preserve.json")
+	var body := (
+		"// Zed settings\n"
+		+ "// keep this header\n"
+		+ "{\n"
+		+ "\t\"theme\": \"one-dark\", /* keep inner */\n"
+		+ "\t\"mcpServers\": {\n"
+		+ "\t\t\"someone-else\": {\"url\": \"http://other/\"}\n"
+		+ "\t}\n"
+		+ "}\n"
+	)
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(body)
+	f.close()
+
+	var client := _make_test_json_client(path)
+	var result := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	assert_eq(result.get("status"), "ok", "JSONC configure should succeed: %s" % result.get("message", ""))
+
+	var check_file := FileAccess.open(path, FileAccess.READ)
+	var written := check_file.get_as_text()
+	check_file.close()
+	assert_true(written.begins_with("// Zed settings\n// keep this header\n"), "header comments must survive; got: %s" % written)
+	assert_true(written.contains("\t\"theme\": \"one-dark\", /* keep inner */\n"), "unrelated key and inner comment must survive; got: %s" % written)
+	assert_true(written.contains("\t\t\"someone-else\": {\"url\": \"http://other/\"}"), "unrelated server entry must survive verbatim; got: %s" % written)
+	assert_true(written.contains("godot-ai"), "godot-ai entry must be inserted")
+
+	var reread := McpJsonStrategy._read_file_text(path)
+	assert_true(reread.get("ok"), "preserved JSONC must still parse: %s" % reread.get("error", ""))
+	var servers: Dictionary = (reread.get("data") as Dictionary).get("mcpServers")
+	assert_true(servers.has("someone-else"))
+	assert_true(servers.has("godot-ai"))
+	assert_eq((servers["godot-ai"] as Dictionary).get("url"), "http://127.0.0.1:8000/mcp")
 
 
 func test_json_strategy_remove_refuses_unparseable_file() -> void:
@@ -5680,10 +5756,10 @@ func test_json_strategy_pi_merge_remove_omits_only_target_entry() -> void:
 	assert_false(after.contains(McpClientConfigurator.SERVER_NAME), "our server entry must be gone")
 
 
-func test_json_strategy_configure_refuses_when_file_has_lossy_numbers() -> void:
-	## F5 (simple path): configure must fail closed when the file contains an
-	## integer above 2^53, and the file must be byte-for-byte unchanged.
-	var scratch := _scratch_dir.path_join("f5_simple_refuse")
+func test_json_strategy_configure_preserves_lossy_numbers() -> void:
+	## F5 (simple path): token-preserving configure must leave integers above
+	## 2^53 byte-for-byte while still updating the target entry.
+	var scratch := _scratch_dir.path_join("f5_simple_preserve")
 	DirAccess.make_dir_recursive_absolute(scratch)
 	var path := scratch.path_join("lossy.json")
 	var body := (
@@ -5697,17 +5773,16 @@ func test_json_strategy_configure_refuses_when_file_has_lossy_numbers() -> void:
 	_write_raw_json(path, body)
 	var client := _make_test_json_client(path)
 	var result := McpJsonStrategy.configure(client, McpClientConfigurator.SERVER_NAME, "http://127.0.0.1:8000/mcp")
-	assert_eq(result.get("status"), "error", "configure must refuse a lossy file; got %s" % result.get("message", ""))
-	assert_true(
-		str(result.get("message", "")).contains("2^53") or str(result.get("message", "")).contains("imprecise"),
-		"refusal message must explain why; got: %s" % result.get("message", ""),
-	)
-	assert_eq(_read_raw_json(path), body, "the file must NOT be mutated on refusal")
+	assert_eq(result.get("status"), "ok", "configure must patch in place; got %s" % result.get("message", ""))
+	var after := _read_raw_json(path)
+	assert_true(after.contains('"bigId": 9007199254740993'), "lossy integer literal must survive; got: %s" % after)
+	assert_true(after.contains("http://127.0.0.1:8000/mcp"), "target URL must update; got: %s" % after)
+	assert_false(after.contains("http://127.0.0.1:9000/mcp"), "old URL must be replaced")
 
 
-func test_json_strategy_pi_merge_configure_refuses_when_file_has_lossy_numbers() -> void:
-	## F5 (merge path): same refusal contract as the simple path.
-	var scratch := _scratch_dir.path_join("f5_merge_refuse")
+func test_json_strategy_pi_merge_configure_preserves_lossy_numbers() -> void:
+	## F5 (merge path): same token-preserving contract as the simple path.
+	var scratch := _scratch_dir.path_join("f5_merge_preserve")
 	DirAccess.make_dir_recursive_absolute(scratch)
 	var tier := scratch.path_join("lossy.json")
 	var body := (
@@ -5721,8 +5796,10 @@ func test_json_strategy_pi_merge_configure_refuses_when_file_has_lossy_numbers()
 	_write_raw_json(tier, body)
 	var client := _make_merged_json_client(PackedStringArray([tier]))
 	var result := McpJsonStrategy.configure(client, McpClientConfigurator.SERVER_NAME, "http://127.0.0.1:8000/mcp")
-	assert_eq(result.get("status"), "error", "merge-configure must refuse a lossy tier; got %s" % result.get("message", ""))
-	assert_eq(_read_raw_json(tier), body, "the tier must NOT be mutated on refusal")
+	assert_eq(result.get("status"), "ok", "merge-configure must patch in place; got %s" % result.get("message", ""))
+	var after := _read_raw_json(tier)
+	assert_true(after.contains('"bigId": 9007199254740993'), "lossy integer literal must survive; got: %s" % after)
+	assert_true(after.contains("http://127.0.0.1:8000/mcp"), "target URL must update; got: %s" % after)
 
 
 func test_text_remove_server_entry_is_byte_for_byte_outside_target() -> void:
@@ -5747,6 +5824,81 @@ func test_text_remove_server_entry_is_byte_for_byte_outside_target() -> void:
 	var parsed = JSON.parse_string(updated)
 	assert_true(parsed is Dictionary, "result must remain valid JSON")
 	assert_false((parsed as Dictionary)["mcpServers"].has(McpClientConfigurator.SERVER_NAME), "our server must not appear")
+
+
+func test_text_upsert_server_entry_preserves_unrelated_jsonc() -> void:
+	## Direct coverage of configure's splice helper (#914). Header comments,
+	## inner comments, and unrelated keys must survive byte-for-byte.
+	var helper := McpJsonStrategy
+	var body := (
+		"// Zed settings\n"
+		+ "{\n"
+		+ "\t\"theme\": \"one-dark\", /* keep */\n"
+		+ "\t\"mcpServers\": {\n"
+		+ "\t\t\"keep\": {\"url\": \"http://other/\"}\n"
+		+ "\t}\n"
+		+ "}\n"
+	)
+	var patched: Dictionary = helper._text_upsert_server_entry(
+		body,
+		PackedStringArray(["mcpServers"]),
+		McpClientConfigurator.SERVER_NAME,
+		{"url": "http://127.0.0.1:8000/mcp"},
+	)
+	assert_true(patched.get("ok"), "upsert must succeed: %s" % patched.get("error", ""))
+	var updated: String = str(patched.get("text"))
+	assert_true(updated.begins_with("// Zed settings\n"), "header must survive")
+	assert_true(updated.contains("\t\"theme\": \"one-dark\", /* keep */\n"), "inner comment must survive")
+	assert_true(updated.contains("\t\t\"keep\": {\"url\": \"http://other/\"}"), "unrelated entry must survive verbatim")
+	assert_true(updated.contains(McpClientConfigurator.SERVER_NAME), "target entry must be inserted")
+	var stripped: Dictionary = helper._strip_jsonc(updated)
+	assert_true(stripped.get("ok"))
+	var parsed = JSON.parse_string(str(stripped.get("text")))
+	assert_true(parsed is Dictionary)
+	assert_true((parsed as Dictionary)["mcpServers"].has("keep"))
+	assert_true((parsed as Dictionary)["mcpServers"].has(McpClientConfigurator.SERVER_NAME))
+
+
+func test_text_upsert_replaces_existing_entry_only() -> void:
+	var helper := McpJsonStrategy
+	var body := (
+		"{\n"
+		+ "\t\"mcpServers\": {\n"
+		+ "\t\t\"keep\": {\"url\": \"http://other/\"},\n"
+		+ "\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {\"url\": \"http://old/\"}\n"
+		+ "\t}\n"
+		+ "}\n"
+	)
+	var patched: Dictionary = helper._text_upsert_server_entry(
+		body,
+		PackedStringArray(["mcpServers"]),
+		McpClientConfigurator.SERVER_NAME,
+		{"url": "http://new/"},
+	)
+	assert_true(patched.get("ok"), "upsert must succeed: %s" % patched.get("error", ""))
+	var updated: String = str(patched.get("text"))
+	assert_true(updated.contains("\t\t\"keep\": {\"url\": \"http://other/\"}"), "unrelated entry must survive")
+	assert_true(updated.contains("http://new/"))
+	assert_false(updated.contains("http://old/"))
+
+
+func test_text_remove_server_entry_preserves_jsonc_header() -> void:
+	var helper := McpJsonStrategy
+	var body := (
+		"// Zed settings\n"
+		+ "{\n"
+		+ "\t\"mcpServers\": {\n"
+		+ "\t\t\"keep\": {\"url\": \"http://other/\"},\n"
+		+ "\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {\"url\": \"http://127.0.0.1:8000/mcp\"}\n"
+		+ "\t}\n"
+		+ "}\n"
+	)
+	var updated: String = helper._text_remove_server_entry(
+		body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME
+	)
+	assert_true(updated.begins_with("// Zed settings\n"), "JSONC header must survive remove")
+	assert_false(updated.contains(McpClientConfigurator.SERVER_NAME), "entry must be removed")
+	assert_true(updated.contains("\t\t\"keep\": {\"url\": \"http://other/\"}"), "unrelated entry must survive")
 
 
 # ----- F5 scanner regression: middle-position + sibling-collision coverage -----
