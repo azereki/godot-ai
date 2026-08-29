@@ -37,8 +37,11 @@ mcp_call() {
   echo "$raw" | python3 -c "
 import json, sys
 raw = sys.stdin.read()
-for line in raw.splitlines():
-    line = line.lstrip('\ufeff').rstrip('\r')
+# SSE records are delimited by CR/LF only. str.splitlines() also splits on
+# U+0085/U+2028/U+2029, which are legal inside JSON strings.
+normalized = raw.replace('\r\n', '\n').replace('\r', '\n')
+for line in normalized.split('\n'):
+    line = line.lstrip('\ufeff')
     # SSE comments / keepalives (`: ping - ...`) are not payload.
     if not line or line.startswith(':'):
         continue

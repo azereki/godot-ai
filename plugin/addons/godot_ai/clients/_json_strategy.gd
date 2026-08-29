@@ -491,15 +491,15 @@ static func _read_file_text(path: String) -> Dictionary:
 ## callers keep `original_text` for byte-for-byte rollback.
 ## Returns `{"ok": true, "text": String}` or `{"ok": false, "error": String}`.
 static func _strip_jsonc(text: String) -> Dictionary:
-	var out := ""
+	var parts: PackedStringArray = PackedStringArray()
 	var i := 0
 	var n := text.length()
 	var in_string := false
 	var escape := false
+	var run_start := 0
 	while i < n:
 		var c := text[i]
 		if in_string:
-			out += c
 			if escape:
 				escape = false
 			elif c == "\\":
@@ -510,20 +510,28 @@ static func _strip_jsonc(text: String) -> Dictionary:
 			continue
 		if c == '"':
 			in_string = true
-			out += c
 			i += 1
 			continue
 		var skipped := _skip_jsonc_comment_at(text, i)
 		if skipped < 0:
 			return {"ok": false, "error": "unterminated block comment"}
 		if skipped != i:
+			if i > run_start:
+				parts.append(text.substr(run_start, i - run_start))
+			## Keep block-comment newlines so JSON.parse error lines still
+			## match the source file (`/*\n*/{"a": }` errors on line 2).
+			for j in range(i, skipped):
+				if text[j] == "\n":
+					parts.append("\n")
 			i = skipped
+			run_start = i
 			continue
-		out += c
 		i += 1
 	if in_string:
 		return {"ok": false, "error": "unterminated string"}
-	return {"ok": true, "text": out}
+	if n > run_start:
+		parts.append(text.substr(run_start, n - run_start))
+	return {"ok": true, "text": "".join(parts)}
 
 
 ## Skip a JSONC comment starting at `i`. Returns `i` unchanged when `i` is
@@ -965,8 +973,25 @@ static func _text_upsert_server_entry(
 			var value_json := JSON.stringify(_narrow_integral_numbers(nested))
 			return _insert_object_property(text, container_open, key, value_json)
 		var child_start: int = found["value_start"]
-		if child_start >= text.length() or text[child_start] != "{":
+		if child_start >= text.length():
 			return {"ok": false, "error": "key '%s' is not an object" % key}
+		if text[child_start] != "{":
+			## Mirror `_ensure_path`: a scalar/array holder is replaced by
+			## the object that carries our entry (`select_server_key_path`).
+			var repaired: Dictionary = {}
+			repaired[server_name] = entry.duplicate(true)
+			for rj in range(path_keys.size() - 1, ki, -1):
+				var repaired_wrap: Dictionary = {}
+				repaired_wrap[path_keys[rj]] = repaired
+				repaired = repaired_wrap
+			var child_end: int = found["value_end"]
+			if child_end < child_start:
+				return {"ok": false, "error": "key '%s' is not an object" % key}
+			var repaired_json := JSON.stringify(_narrow_integral_numbers(repaired))
+			return {
+				"ok": true,
+				"text": text.substr(0, child_start) + repaired_json + text.substr(child_end),
+			}
 		container_open = child_start
 		inner_start = child_start + 1
 	var existing := _find_key_at_container_depth(text, inner_start, JSON.stringify(server_name))
@@ -1109,10 +1134,10 @@ static func _text_remove_server_entry(text: String, key_path: PackedStringArray,
 	var had_trailing_comma := trailing_scan < text.length() and text[trailing_scan] == ","
 	if had_trailing_comma:
 		remove_end = trailing_scan + 1
-	var after_comma := _skip_jsonc_trivia(text, remove_end)
-	if after_comma < 0:
-		return text
-	remove_end = after_comma
+	# Whitespace only after the comma: a comment there documents the NEXT
+	# entry (`"godot-ai": {},\n// note about other\n"other": {}`).
+	while remove_end < text.length() and _is_json_ws(text[remove_end]):
+		remove_end += 1
 	var remove_start := key_start
 	if not had_trailing_comma:
 		while remove_start > 0 and _is_json_ws(text[remove_start - 1]):

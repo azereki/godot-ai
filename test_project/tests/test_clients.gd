@@ -5900,6 +5900,73 @@ func test_json_value_span_end_stops_before_glued_comment() -> void:
 	assert_true(body.substr(value_end).begins_with("/* keep */"), "span must stop before the glued comment")
 
 
+func test_text_upsert_repairs_scalar_server_map() -> void:
+	## `_ensure_path` replaces a non-object holder. Token-preserving
+	## configure must do the same instead of refusing the splice.
+	var helper := McpJsonStrategy
+	var body := "// header\n{\"theme\": \"x\", \"mcpServers\": 5}\n"
+	var patched: Dictionary = helper._text_upsert_server_entry(
+		body,
+		PackedStringArray(["mcpServers"]),
+		McpClientConfigurator.SERVER_NAME,
+		{"url": "http://127.0.0.1:8000/mcp"},
+	)
+	assert_true(patched.get("ok"), "scalar holder must be repaired: %s" % patched.get("error", ""))
+	var updated: String = str(patched.get("text"))
+	assert_true(updated.begins_with("// header\n"), "header must survive scalar repair")
+	assert_true(updated.contains("\"theme\": \"x\""), "unrelated key must survive")
+	assert_false(updated.contains("\"mcpServers\": 5"), "scalar holder must be replaced")
+	var stripped: Dictionary = helper._strip_jsonc(updated)
+	assert_true(stripped.get("ok"))
+	var parsed = JSON.parse_string(str(stripped.get("text")))
+	assert_true(parsed is Dictionary)
+	assert_true((parsed as Dictionary)["mcpServers"].has(McpClientConfigurator.SERVER_NAME))
+
+
+func test_json_strategy_configure_repairs_scalar_server_map() -> void:
+	var path := _scratch_dir.path_join("scalar_map.json")
+	var body := "{\"mcpServers\": 5, \"keep\": true}\n"
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(body)
+	f.close()
+	var client := _make_test_json_client(path)
+	var result := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	assert_eq(result.get("status"), "ok", "scalar mcpServers must be repairable: %s" % result.get("message", ""))
+	var reread := McpJsonStrategy._read_file_text(path)
+	assert_true(reread.get("ok"), "repaired file must parse: %s" % reread.get("error", ""))
+	var data: Dictionary = reread.get("data")
+	assert_eq(data.get("keep"), true)
+	assert_true((data.get("mcpServers") as Dictionary).has("godot-ai"))
+
+
+func test_text_remove_keeps_comment_documenting_next_entry() -> void:
+	## A comment after the target's trailing comma belongs to the next
+	## entry and must not be consumed with the removed property.
+	var helper := McpJsonStrategy
+	var body := (
+		"{\n"
+		+ "\t\"mcpServers\": {\n"
+		+ "\t\t\"" + McpClientConfigurator.SERVER_NAME + "\": {},\n"
+		+ "\t\t// note about other\n"
+		+ "\t\t\"other\": {\"url\": \"http://other/\"}\n"
+		+ "\t}\n"
+		+ "}\n"
+	)
+	var updated: String = helper._text_remove_server_entry(
+		body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME
+	)
+	assert_false(updated.contains(McpClientConfigurator.SERVER_NAME), "entry must be removed")
+	assert_true(updated.contains("// note about other"), "next-entry comment must survive; got: %s" % updated)
+	assert_true(updated.contains("\"other\": {\"url\": \"http://other/\"}"), "next entry must survive")
+
+
+func test_strip_jsonc_preserves_newlines_inside_block_comments() -> void:
+	var src := "/*\n\n*/{\"a\": true}\n"
+	var stripped: Dictionary = McpJsonStrategy._strip_jsonc(src)
+	assert_true(stripped.get("ok"), "multiline block comment must strip: %s" % stripped.get("error", ""))
+	assert_true(str(stripped.get("text")).begins_with("\n\n{"), "block-comment newlines must remain for parse line numbers")
+
+
 func test_text_upsert_server_entry_preserves_unrelated_jsonc() -> void:
 	## Direct coverage of configure's splice helper (#914). Header comments,
 	## inner comments, and unrelated keys must survive byte-for-byte.
