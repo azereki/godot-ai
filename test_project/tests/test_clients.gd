@@ -5997,6 +5997,31 @@ func test_strip_jsonc_preserves_newlines_inside_block_comments() -> void:
 	assert_true(str(stripped.get("text")).begins_with("\n\n{"), "block-comment newlines must remain for parse line numbers")
 
 
+func test_strip_jsonc_does_not_glue_literal_fragments() -> void:
+	## Comments inside `true`/`false`/`null`/numbers must not splice the
+	## fragments into a different token. `_strip_jsonc` inserts a space so
+	## the later JSON.parse fails closed instead of accepting `tru/*x*/e`
+	## as `true`.
+	var helper := McpJsonStrategy
+	var glued := [
+		'{"enabled": tru/* x */e}',
+		'{"enabled": fal/* x */se}',
+		'{"v": nu/* x */ll}',
+		'{"n": 12/* x */34}',
+	]
+	for src in glued:
+		var stripped: Dictionary = helper._strip_jsonc(src)
+		assert_true(stripped.get("ok"), "strip itself must succeed: %s -> %s" % [src, stripped.get("error", "")])
+		var json := JSON.new()
+		assert_ne(json.parse(str(stripped.get("text"))), OK, "glued literal must not parse: %s -> %s" % [src, stripped.get("text")])
+	var trailing := '{"enabled": true/* x */, "n": 1}'
+	var keep: Dictionary = helper._strip_jsonc(trailing)
+	assert_true(keep.get("ok"), "comment after a complete token must strip: %s" % keep.get("error", ""))
+	var keep_json := JSON.new()
+	assert_eq(keep_json.parse(str(keep.get("text"))), OK, "true/* x */ must still parse: %s" % keep.get("text"))
+	assert_eq((keep_json.data as Dictionary).get("enabled"), true)
+
+
 func test_text_upsert_server_entry_preserves_unrelated_jsonc() -> void:
 	## Direct coverage of configure's splice helper (#914). Header comments,
 	## inner comments, and unrelated keys must survive byte-for-byte.

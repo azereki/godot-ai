@@ -527,9 +527,16 @@ static func _strip_jsonc(text: String) -> Dictionary:
 				parts.append(text.substr(run_start, i - run_start))
 			## Keep block-comment newlines so JSON.parse error lines still
 			## match the source file (`/*\n*/{"a": }` errors on line 2).
+			var emitted_nl := false
 			for j in range(i, skipped):
 				if text[j] == "\n":
 					parts.append("\n")
+					emitted_nl = true
+			## A comment must not glue the tokens on either side
+			## (`tru/* x */e` must not parse as `true`). A newline already
+			## splits tokens; otherwise insert one space.
+			if not emitted_nl:
+				parts.append(" ")
 			i = skipped
 			run_start = i
 			continue
