@@ -1004,7 +1004,11 @@ static func _insert_object_property(
 	if inner < 0:
 		return {"ok": false, "error": "unterminated block comment"}
 	if inner == close:
-		return {"ok": true, "text": text.substr(0, obj_open + 1) + rendered + text.substr(close)}
+		## Comments-only (or whitespace-only) objects still have no
+		## properties, but replacing the inner span would drop them.
+		## Insert the new property just before `}` so `{ /* keep */ }`
+		## becomes `{ /* keep */ "key": ...}` instead of `{"key": ...}`.
+		return {"ok": true, "text": text.substr(0, close) + rendered + text.substr(close)}
 	var i := inner
 	var saw_trailing_comma := false
 	while i < close:
@@ -1237,11 +1241,13 @@ static func _json_value_span_end(text: String, value_start: int) -> int:
 			i += 1
 		return -1
 	# Bare literal: number / true / false / null. Walk until a JSON-significant
-	# delimiter (`,`, `}`, `]`, or whitespace).
+	# delimiter (`,`, `}`, `]`, whitespace, or a glued JSONC comment opener).
 	var i := value_start
 	while i < text.length():
 		var ch := text[i]
 		if ch == "," or ch == "}" or ch == "]" or _is_json_ws(ch):
+			break
+		if ch == "/" and i + 1 < text.length() and (text[i + 1] == "/" or text[i + 1] == "*"):
 			break
 		i += 1
 	return i

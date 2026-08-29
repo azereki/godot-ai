@@ -2804,6 +2804,39 @@ func test_json_strategy_configure_preserves_unrelated_jsonc_byte_for_byte() -> v
 	assert_eq((servers["godot-ai"] as Dictionary).get("url"), "http://127.0.0.1:8000/mcp")
 
 
+func test_json_strategy_configure_preserves_comment_in_empty_server_map() -> void:
+	## Empty `mcpServers: { /* keep */ }` is the stock "no servers yet"
+	## shape. Inserting our entry must not drop the inner comment.
+	var path := _scratch_dir.path_join("jsonc_empty_map.json")
+	var body := (
+		"// Zed settings\n"
+		+ "{\n"
+		+ "\t\"theme\": \"one-dark\",\n"
+		+ "\t\"mcpServers\": { /* keep inner */ }\n"
+		+ "}\n"
+	)
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	f.store_string(body)
+	f.close()
+
+	var client := _make_test_json_client(path)
+	var result := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	assert_eq(result.get("status"), "ok", "empty-map JSONC configure should succeed: %s" % result.get("message", ""))
+
+	var check_file := FileAccess.open(path, FileAccess.READ)
+	var written := check_file.get_as_text()
+	check_file.close()
+	assert_true(written.begins_with("// Zed settings\n"), "header must survive; got: %s" % written)
+	assert_true(written.contains("/* keep inner */"), "inner empty-object comment must survive; got: %s" % written)
+	assert_true(written.contains("\t\"theme\": \"one-dark\",\n"), "unrelated key must survive; got: %s" % written)
+
+	var reread := McpJsonStrategy._read_file_text(path)
+	assert_true(reread.get("ok"), "preserved JSONC must still parse: %s" % reread.get("error", ""))
+	var servers: Dictionary = (reread.get("data") as Dictionary).get("mcpServers")
+	assert_true(servers.has("godot-ai"))
+	assert_eq((servers["godot-ai"] as Dictionary).get("url"), "http://127.0.0.1:8000/mcp")
+
+
 func test_json_strategy_remove_refuses_unparseable_file() -> void:
 	## remove() has the same wipe-risk as configure() — it also round-trips
 	## through _read_or_init and writes back. Must refuse on bad input.
@@ -5824,6 +5857,47 @@ func test_text_remove_server_entry_is_byte_for_byte_outside_target() -> void:
 	var parsed = JSON.parse_string(updated)
 	assert_true(parsed is Dictionary, "result must remain valid JSON")
 	assert_false((parsed as Dictionary)["mcpServers"].has(McpClientConfigurator.SERVER_NAME), "our server must not appear")
+
+
+func test_text_upsert_preserves_comments_inside_empty_object() -> void:
+	## `{ /* keep */ }` has no properties, so the insert path used to treat
+	## the object as empty and rewrite from `{` to `}`, dropping the comment.
+	var helper := McpJsonStrategy
+	var body := (
+		"// Zed settings\n"
+		+ "{\n"
+		+ "\t\"mcpServers\": { /* keep inner */ }\n"
+		+ "}\n"
+	)
+	var patched: Dictionary = helper._text_upsert_server_entry(
+		body,
+		PackedStringArray(["mcpServers"]),
+		McpClientConfigurator.SERVER_NAME,
+		{"url": "http://127.0.0.1:8000/mcp"},
+	)
+	assert_true(patched.get("ok"), "upsert into comments-only object must succeed: %s" % patched.get("error", ""))
+	var updated: String = str(patched.get("text"))
+	assert_true(updated.begins_with("// Zed settings\n"), "header must survive")
+	assert_true(updated.contains("/* keep inner */"), "comment inside empty object must survive; got: %s" % updated)
+	var stripped: Dictionary = helper._strip_jsonc(updated)
+	assert_true(stripped.get("ok"), "result must still strip: %s" % stripped.get("error", ""))
+	var parsed = JSON.parse_string(str(stripped.get("text")))
+	assert_true(parsed is Dictionary)
+	assert_true((parsed as Dictionary)["mcpServers"].has(McpClientConfigurator.SERVER_NAME))
+
+
+func test_json_value_span_end_stops_before_glued_comment() -> void:
+	## `9007199254740993/* keep */` must not swallow the comment into the
+	## literal span, or a later splice would rewrite it away.
+	var helper := McpJsonStrategy
+	var body := "{\"bigId\": 9007199254740993/* keep */, \"ok\": true}"
+	var found: Dictionary = helper._find_key_at_container_depth(
+		body, 1, JSON.stringify("bigId")
+	)
+	assert_false(found.is_empty(), "bigId key must be found")
+	var value_end: int = found["value_end"]
+	assert_eq(body.substr(int(found["value_start"]), value_end - int(found["value_start"])), "9007199254740993")
+	assert_true(body.substr(value_end).begins_with("/* keep */"), "span must stop before the glued comment")
 
 
 func test_text_upsert_server_entry_preserves_unrelated_jsonc() -> void:
