@@ -98,6 +98,18 @@ async def project_settings_set(runtime: DirectRuntime, key: str, value: Any) -> 
     return await runtime.send_command("set_project_setting", {"key": key, "value": value})
 
 
+async def project_set_main_scene(runtime: DirectRuntime, path: str) -> dict:
+    """Point ``application/run/main_scene`` at an existing scene.
+
+    ``settings_set`` refuses that key — it is part of the startup-execution
+    surface a generic setter can't validate — which left a scaffolded project
+    unbootable through MCP alone (#915). The plugin-side op accepts only a
+    ``res://`` path inside the project that loads as a ``PackedScene``.
+    """
+    await require_writable_async(runtime)
+    return await runtime.send_command("set_main_scene", {"path": path})
+
+
 def project_info_resource_data(runtime: DirectRuntime) -> dict:
     session = runtime.get_active_session()
     if session is None:

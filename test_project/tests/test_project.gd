@@ -128,6 +128,93 @@ func test_set_project_setting_refuses_startup_execution_keys() -> void:
 		)
 
 
+func test_set_project_setting_main_scene_refusal_names_the_validated_route() -> void:
+	## #915: settings_get on application/run/main_scene works, so an agent can
+	## read the value it needs to change and then be refused the write. Without
+	## a pointer to set_main_scene that asymmetry reads as "this workflow is
+	## closed" and the project is handed back unbootable.
+	var result := _handler.set_project_setting({
+		"key": "application/run/main_scene",
+		"value": "res://main.tscn",
+	})
+	assert_is_error(result, ErrorCodes.VALUE_OUT_OF_RANGE)
+	assert_contains(String(result.error.message), "set_main_scene")
+
+
+# ----- set_main_scene -----
+
+func test_set_main_scene_roundtrip() -> void:
+	## The whole point of the op: the key settings_set refuses must actually be
+	## writable through this route, and the STORED value must change — not just
+	## the response echo. Uses a scene that is NOT the current main scene so a
+	## no-op write can't pass this.
+	var original := _handler.get_project_setting({"key": "application/run/main_scene"})
+	var old_scene = original.data.value
+	var target := "res://snowman.tscn"
+	if old_scene == target:
+		skip("test project already boots %s; pick a different fixture scene" % target)
+		return
+
+	var result := _handler.set_main_scene({"path": target})
+	var readback := _handler.get_project_setting({"key": "application/run/main_scene"})
+
+	## Restore BEFORE asserting so a failed assert can't leak the override into
+	## the tracked project.godot (same pattern as test_runner's main_scene test).
+	_handler.set_main_scene({"path": old_scene})
+
+	assert_has_key(result, "data")
+	assert_eq(result.data.key, "application/run/main_scene")
+	assert_eq(result.data.path, target)
+	assert_eq(result.data.old_value, old_scene)
+	assert_eq(result.data.undoable, false)
+	assert_eq(readback.data.value, target,
+		"stored main scene must reflect the write, not just the response echo")
+
+
+func test_set_main_scene_missing_path() -> void:
+	var result := _handler.set_main_scene({})
+	assert_is_error(result, ErrorCodes.MISSING_REQUIRED_PARAM)
+
+
+func test_set_main_scene_rejects_traversal_and_absolute_paths() -> void:
+	## The op is the narrow exception to the startup-execution blocklist, so
+	## the containment check is what keeps it narrow.
+	for path in [
+		"res://../../etc/passwd.tscn",
+		"res://../outside.tscn",
+		"/etc/passwd.tscn",
+		"user://elsewhere.tscn",
+		"uid://abc123",
+	]:
+		var result := _handler.set_main_scene({"path": path})
+		assert_is_error(result, ErrorCodes.VALUE_OUT_OF_RANGE,
+			"non-confined res:// path must be refused: %s" % path)
+
+
+func test_set_main_scene_rejects_missing_scene() -> void:
+	var result := _handler.set_main_scene({"path": "res://zzz_no_such_scene.tscn"})
+	assert_is_error(result, ErrorCodes.RESOURCE_NOT_FOUND)
+
+
+func test_set_main_scene_rejects_non_packed_scene() -> void:
+	## A path that loads fine but isn't a scene would leave the project
+	## unbootable in a way project_run can only report as a mystery.
+	var script_path := "res://addons/godot_ai/handlers/project_handler.gd"
+	assert_true(ResourceLoader.exists(script_path), "precondition: the plugin script is loadable")
+	var result := _handler.set_main_scene({"path": script_path})
+	assert_is_error(result, ErrorCodes.WRONG_TYPE)
+	assert_contains(String(result.error.message), "PackedScene")
+
+
+func test_set_main_scene_refusal_leaves_setting_untouched() -> void:
+	var before := _handler.get_project_setting({"key": "application/run/main_scene"})
+	var result := _handler.set_main_scene({"path": "res://zzz_no_such_scene.tscn"})
+	assert_is_error(result)
+	var after := _handler.get_project_setting({"key": "application/run/main_scene"})
+	assert_eq(after.data.value, before.data.value,
+		"a refused path must never reach ProjectSettings")
+
+
 func test_startup_execution_key_refusal_is_case_folded() -> void:
 	## macOS/Windows users and LLM-generated calls both produce case variants.
 	assert_false(
