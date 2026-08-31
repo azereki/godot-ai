@@ -249,6 +249,13 @@ class StubClient:
                 "type": type(value).__name__,
                 "undoable": False,
             }
+        if command == "set_main_scene":
+            return {
+                "key": "application/run/main_scene",
+                "path": params.get("path", ""),
+                "old_value": "res://old.tscn",
+                "undoable": False,
+            }
         if command == "get_editor_state":
             return {
                 "current_scene": "res://main.tscn",
@@ -2981,6 +2988,18 @@ async def test_project_settings_set_handler():
         "key": "display/window/size/viewport_width",
         "value": 1920,
     }
+
+
+async def test_project_set_main_scene_handler():
+    ## #915: settings_set refuses application/run/main_scene, so the only way
+    ## to make a scaffolded project bootable is this dedicated plugin command.
+    client = StubClient()
+    runtime = DirectRuntime(registry=SessionRegistry(), client=client)
+    result = await project_handlers.project_set_main_scene(runtime, path="res://main.tscn")
+    assert result["key"] == "application/run/main_scene"
+    assert result["path"] == "res://main.tscn"
+    assert client.calls[-1]["command"] == "set_main_scene"
+    assert client.calls[-1]["params"] == {"path": "res://main.tscn"}
 
 
 # ---------------------------------------------------------------------------

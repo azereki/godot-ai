@@ -406,6 +406,7 @@ func _enter_tree() -> void:
 	_dispatcher.register_lazy("game_command", "editor", &"game_command")
 	_dispatcher.register_lazy("get_project_setting", "project", &"get_project_setting")
 	_dispatcher.register_lazy("set_project_setting", "project", &"set_project_setting")
+	_dispatcher.register_lazy("set_main_scene", "project", &"set_main_scene")
 	_dispatcher.register_lazy("run_project", "project", &"run_project")
 	_dispatcher.register_lazy("stop_project", "project", &"stop_project")
 	_dispatcher.register_lazy("search_filesystem", "project", &"search_filesystem")

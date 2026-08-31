@@ -87,6 +87,56 @@ class TestProjectSettingsSet:
         await plugin.close()
 
 
+class TestProjectSetMainScene:
+    async def test_set_main_scene_roundtrip(self, harness):
+        plugin = await harness.connect_plugin()
+        client = GodotClient(harness.server, harness.registry)
+
+        async def mock_handler():
+            cmd = await plugin.recv_command()
+            assert cmd["command"] == "set_main_scene"
+            assert cmd["params"] == {"path": "res://levels/level1.tscn"}
+            await plugin.send_response(
+                cmd["request_id"],
+                {
+                    "key": "application/run/main_scene",
+                    "path": "res://levels/level1.tscn",
+                    "old_value": "res://main.tscn",
+                    "undoable": False,
+                },
+            )
+
+        handler_task = asyncio.create_task(mock_handler())
+        result = await client.send("set_main_scene", {"path": "res://levels/level1.tscn"})
+        await handler_task
+
+        assert result["key"] == "application/run/main_scene"
+        assert result["path"] == "res://levels/level1.tscn"
+        assert result["old_value"] == "res://main.tscn"
+        await plugin.close()
+
+    async def test_set_main_scene_non_scene_error_propagates(self, harness):
+        plugin = await harness.connect_plugin()
+        client = GodotClient(harness.server, harness.registry)
+
+        async def mock_handler():
+            cmd = await plugin.recv_command()
+            await plugin.send_error(
+                cmd["request_id"],
+                "WRONG_TYPE",
+                "path must be a PackedScene, got GDScript: res://main.gd",
+            )
+
+        handler_task = asyncio.create_task(mock_handler())
+        with pytest.raises(GodotCommandError) as exc_info:
+            await client.send("set_main_scene", {"path": "res://main.gd"})
+        await handler_task
+
+        assert exc_info.value.code == "WRONG_TYPE"
+        assert "PackedScene" in exc_info.value.message
+        await plugin.close()
+
+
 class TestFilesystemSearch:
     async def test_search_by_name(self, harness):
         plugin = await harness.connect_plugin()

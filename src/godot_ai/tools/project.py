@@ -32,6 +32,18 @@ Ops:
         Read a ProjectSettings key (e.g. "application/config/name").
   • settings_set(key, value)
         Write a ProjectSettings key and persist to project.godot.
+        Refuses the startup-execution keys (``autoload/*``,
+        ``editor_plugins/*``, ``application/run/main_scene``,
+        ``editor/run/main_run_args``, ``editor/script/templates_search_path``);
+        use ``set_main_scene`` / ``autoload_manage(op="add")`` for the two
+        that have a validated route.
+  • set_main_scene(path)
+        Set the project's main scene — the scene ``project_run(mode="main")``
+        boots and the engine loads at startup. Writes
+        ``application/run/main_scene`` and persists to project.godot. ``path``
+        must be a ``res://`` scene inside the project that already exists and
+        loads as a PackedScene, so a scaffolded project can be made runnable
+        without opening the generic startup-execution surface.
 """
 
 
@@ -96,6 +108,7 @@ def register_project_tools(mcp: FastMCP) -> None:
             "stop": project_handlers.project_stop,
             "settings_get": project_handlers.project_settings_get,
             "settings_set": project_handlers.project_settings_set,
+            "set_main_scene": project_handlers.project_set_main_scene,
         },
         read_resource_forms={
             ## stop ends a play session; not a read in the URI sense.

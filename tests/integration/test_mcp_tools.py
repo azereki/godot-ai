@@ -1209,6 +1209,44 @@ class TestProjectSettingsSetTool:
 
 
 # ---------------------------------------------------------------------------
+# project_set_main_scene
+# ---------------------------------------------------------------------------
+
+
+class TestProjectSetMainSceneTool:
+    async def test_set_main_scene(self, mcp_stack):
+        ## #915: the op exists because settings_set refuses
+        ## application/run/main_scene, which left an agent-scaffolded project
+        ## with nothing for project_run(mode="main") to launch.
+        client, plugin = mcp_stack
+
+        async def respond():
+            cmd = await plugin.recv_command()
+            assert cmd["command"] == "set_main_scene"
+            assert cmd["params"] == {"path": "res://levels/level1.tscn"}
+            await plugin.send_response(
+                cmd["request_id"],
+                {
+                    "key": "application/run/main_scene",
+                    "path": "res://levels/level1.tscn",
+                    "old_value": "res://main.tscn",
+                    "undoable": False,
+                },
+            )
+
+        task = asyncio.create_task(respond())
+        result = await client.call_tool(
+            "project_manage",
+            {"op": "set_main_scene", "params": {"path": "res://levels/level1.tscn"}},
+        )
+        await task
+
+        assert result.data["key"] == "application/run/main_scene"
+        assert result.data["path"] == "res://levels/level1.tscn"
+        assert result.data["old_value"] == "res://main.tscn"
+
+
+# ---------------------------------------------------------------------------
 # filesystem_search
 # ---------------------------------------------------------------------------
 
