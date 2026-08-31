@@ -237,13 +237,28 @@ through in [docs/plugin-architecture.md](docs/plugin-architecture.md#undo-contra
 - **Godot-side tests** (`test_project/tests/`): handlers exercised against the live editor
 
 
-## Audit follow-up work
+## v4 architecture work
 
-A whole-codebase audit's Tier-1 cleanup merged as PR #684. The remaining work — issues #685–#691 plus a 115-item backlog — is tracked in [docs/audit-tier2-plan.md](docs/audit-tier2-plan.md). When picking up any of it, follow that file's workflow: one PR per theme, the full test gauntlet before every commit, verify each finding against current code before touching anything, and ask the maintainer before the flagged design decisions.
+The active rebuild is governed by
+[docs/architecture-simplification-plan.md](docs/architecture-simplification-plan.md)
+and its
+[verification companion](docs/architecture-simplification-verification-plan.md).
+The maximal hardening tree is preserved separately at
+`checkpoint/architecture-hardening-2026-08-30-draft1` as an oracle, not as the
+implementation base. The earlier [docs/audit-tier2-plan.md](docs/audit-tier2-plan.md)
+is archived point-in-time evidence, not a live backlog. Never implement or
+re-file one of its findings without verifying it against current code; paths,
+severity, and proposed fixes may already be stale or superseded. The full test
+gauntlet remains required before every commit.
 
 ## Godot version support (4.5+)
 
 The plugin supports **Godot 4.5+** (4.7+ recommended). 4.5 is exercised by a CI canary (`Godot tests / Linux (Godot 4.5)` in `ci.yml`, pinned to `4.5.0`) so the parse-cascade class of regression cannot recur unnoticed at the documented floor.
+
+The clean v4 rebuild raises the eventual release floor to Godot 4.7. Keep the
+4.5 baseline gates intact until the version/package tranche changes code, CI,
+and public documentation together; do not let an intermediate architecture
+commit silently change the currently executable 3.2.4 contract.
 
 - **Forward-compat engine APIs go through `Engine.call(...)` / `OS.call(...)` when they are newer than the supported floor.** A direct call to a method that only exists in a newer Godot is type-checked by the older engine's GDScript parser against the native class and rejected at parse time, even when guarded by `has_method(...)` at runtime. That parse failure can cascade through preloads and brick the whole plugin. This was the #476 regression for `Engine.capture_script_backtraces()` on 4.3. The current floor makes that specific call safe, but the pattern still applies to future 4.6+ APIs until the floor moves again.
 - **CI GDScript validation**: `script/ci-check-gdscript` runs before Godot tests in CI. It scans the `--import` log for `SCRIPT ERROR` / `Parse Error` lines and fails the build early if any GDScript has syntax errors, before the test runner even starts. Strict on every supported Godot version, including the 4.5 canary.
