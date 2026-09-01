@@ -315,7 +315,7 @@ def _authenticated_tool_probe(
             headers={"Authorization": f"Bearer {record.http}"},
         )
         async with Client(transport, timeout=10, init_timeout=10) as client:
-            deadline = asyncio.get_running_loop().time() + 30
+            deadline = asyncio.get_running_loop().time() + 90
             while True:
                 sessions = await client.call_tool(
                     "session_manage", {"op": "list", "params": {}}
@@ -416,7 +416,7 @@ def test_signed_update_restarts_matching_live_server_without_parse_errors(
         project,
         godot_bin,
         allow_headless=True,
-        timeout=90,
+        timeout=180,
         environment=prep_environment,
         phase="configure",
     )

@@ -193,7 +193,11 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
         vnext_plugin = zf.read("addons/godot_ai/plugin.gd").decode()
         vnext_dock = zf.read("addons/godot_ai/mcp_dock.gd").decode()
         vnext_manager = zf.read("addons/godot_ai/utils/update_manager.gd").decode()
-        vnext_configurator = zf.read("addons/godot_ai/client_configurator.gd").decode()
+        vnext_configurator = (
+            zf.read("addons/godot_ai/client_configurator.gd")
+            .decode()
+            .replace("\r\n", "\n")
+        )
         vnext_settings = zf.read("addons/godot_ai/utils/settings.gd").decode()
         vnext_base = zf.read("addons/godot_ai/utils/self_update_smoke_base.gd").decode()
         vnext_child = zf.read("addons/godot_ai/utils/self_update_smoke_child.gd").decode()

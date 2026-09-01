@@ -1045,7 +1045,7 @@ def run_godot_editor(
         map(str, sorted(new_crashes))
     )
     if failure is not None:
-        raise failure
+        raise AssertionError(f"{failure}\n{output}") from failure
     if live_probe is not None:
         assert probe_ran, output
     assert proc.returncode == expected_exit_code, output
