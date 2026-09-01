@@ -328,7 +328,6 @@ def _authenticated_tool_probe(
                     raise AssertionError("editor session stayed unavailable")
                 # Do not monopolize the server's event loop while the editor's
                 # WebSocket reconnect and authenticated handshake are pending.
-                await asyncio.sleep(0.05)
                 await asyncio.sleep(0.2)
             while True:
                 state = await client.call_tool("editor_state", {}, raise_on_error=False)

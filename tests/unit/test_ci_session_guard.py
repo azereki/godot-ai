@@ -287,8 +287,11 @@ def test_quit_runner_fails_closed_when_session_status_query_fails() -> None:
     assert "if ! SESSIONS=$(mcp_call session_manage" in source
     assert "A failed registry query is not proof" in source
     failed_query = source[source.index("if ! SESSIONS=$(mcp_call session_manage") :]
-    assert "if ! editor_process_is_alive" in failed_query
-    assert failed_query.index("if ! editor_process_is_alive") < failed_query.index(
+    assert "if editor_process_is_alive" in failed_query
+    assert "LIVENESS=$?" in failed_query
+    assert 'if [ "$LIVENESS" -eq 1 ]' in failed_query
+    assert "raise SystemExit(2)" in source
+    assert failed_query.index("if editor_process_is_alive") < failed_query.index(
         "Session status check failed"
     )
     assert "sessions = payload.get('sessions')" in source

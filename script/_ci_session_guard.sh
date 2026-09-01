@@ -34,7 +34,7 @@ ci_select_replacement_session() { # sessions-json expected-project old-session-i
     "$_CI_SESSION_GUARD_DIR/_ci_session_guard.py" select-replacement \
     --expected-project "$expected_project" \
     --old-session-id "$old_session_id" \
-    "${diagnose_args[@]}"
+    ${diagnose_args[@]+"${diagnose_args[@]}"}
 }
 
 ci_pin_tool_args() { # arguments-json selected-session-id

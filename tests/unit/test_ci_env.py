@@ -70,8 +70,9 @@ def test_ci_env_uses_current_capability_api() -> None:
     source = CI_ENV.read_text(encoding="utf-8")
 
     assert "capability_from_env" not in source
-    assert "record = read_capabilities(port)" in source
-    assert 'validate_capability(os.environ.get(HTTP_CAPABILITY_ENV, ""))' in source
+    assert "from _transport_auth import raw_capability" in source
+    assert "read_capabilities" not in source
+    assert "validate_capability" not in source
 
 
 @pytest.mark.parametrize(

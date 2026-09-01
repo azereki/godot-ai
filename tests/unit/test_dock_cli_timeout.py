@@ -432,7 +432,9 @@ def test_manual_major_marker_is_deny_only_and_removed_before_server_start() -> N
     assert "def complete_manual_migration(" in actor_source
     assert '"complete-manual-migration" if manual else "complete-migration"' in start
     completion_poll = process.index('job == "migration_completion"')
-    assert process.index('_release_normal_startup()', completion_poll) > completion_poll
+    assert process.index('get("ok", false)', completion_poll) < process.index(
+        "_release_normal_startup()", completion_poll
+    )
 
 
 def test_hot_update_migration_is_durably_acknowledged_before_normal_start() -> None:

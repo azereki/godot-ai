@@ -598,7 +598,12 @@ func _process(_delta: float) -> void:
 \tif _validated:
 \t\tif not _repin_observed:
 \t\t\t_observe_automatic_repin()
-\t\t\treturn
+\t\t\tif not _repin_observed:
+\t\t\t\tif Time.get_ticks_msec() - _status_wait_started_ms > STATUS_WAIT_MS:
+\t\t\t\t\tpush_error("SELF_UPDATE_TEST | automatic Codex repin timed out")
+\t\t\t\t\t_finished = true
+\t\t\t\t\tget_tree().quit(15)
+\t\t\t\treturn
 \t\tif not _tool_probe_ready and _try_write_status():
 \t\t\t_tool_probe_ready = true
 \t\t\treturn

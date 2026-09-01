@@ -17,30 +17,17 @@ export MCP_SERVER_URL="${MCP_SERVER_URL:-http://127.0.0.1:8000/mcp}"
 
 ci_load_http_auth() {
   local capability
-  capability=$("${PYTHON_CMD:-python}" - "$MCP_SERVER_URL" <<'PY'
-import os
+  capability=$("${PYTHON_CMD:-python}" - "$MCP_SERVER_URL" \
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" <<'PY'
 import sys
-from urllib.parse import urlsplit
 
-from godot_ai.transport.capability import (
-    HTTP_CAPABILITY_ENV,
-    read_capabilities,
-    validate_capability,
-)
+sys.path.insert(0, sys.argv[2])
+from _transport_auth import raw_capability
 
-target = urlsplit(sys.argv[1])
-if target.hostname in {"127.0.0.1", "localhost", "::1"}:
-    port = target.port or (443 if target.scheme == "https" else 80)
-    record = read_capabilities(port)
-    if record is None:
-        raise SystemExit("missing Godot AI HTTP capability record")
-    capability = record.http
-else:
-    try:
-        capability = validate_capability(os.environ.get(HTTP_CAPABILITY_ENV, ""))
-    except ValueError as exc:
-        raise SystemExit(f"invalid {HTTP_CAPABILITY_ENV}: {exc}") from None
-print(capability)
+try:
+    print(raw_capability(sys.argv[1]))
+except (RuntimeError, ValueError) as exc:
+    raise SystemExit(str(exc)) from None
 PY
   ) || return 1
   HTTP_AUTH_CAPABILITY="$capability"

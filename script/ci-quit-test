@@ -93,29 +93,35 @@ print(pid)
 " <<< "$SESSIONS")
 
 editor_process_is_alive() {
-  "${PYTHON_CMD:-python}" - "$TARGET_EDITOR_PID" <<'PY'
+  python3 - "$TARGET_EDITOR_PID" <<'PY'
 import os
 import subprocess
 import sys
 
 pid = int(sys.argv[1])
-if os.name == "nt":
-    completed = subprocess.run(
-        ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    alive = completed.returncode == 0 and f'"{pid}"' in completed.stdout
-else:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        alive = False
-    except PermissionError:
-        alive = True
+try:
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise OSError("tasklist failed")
+        alive = f'"{pid}"' in completed.stdout
     else:
-        alive = True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True
+        else:
+            alive = True
+except Exception as exc:
+    print(f"liveness probe failed: {exc}", file=sys.stderr)
+    raise SystemExit(2) from exc
 raise SystemExit(0 if alive else 1)
 PY
 }
@@ -144,7 +150,12 @@ for i in $(seq 1 20); do
   # server exits with its editor, so that process proof is the only available
   # success signal after the server has correctly shut down too.
   if ! SESSIONS=$(mcp_call session_manage '{"op":"list"}'); then
-    if ! editor_process_is_alive; then
+    if editor_process_is_alive; then
+      LIVENESS=0
+    else
+      LIVENESS=$?
+    fi
+    if [ "$LIVENESS" -eq 1 ]; then
       TARGET_PRESENT=0
       echo "Editor process $TARGET_EDITOR_PID exited with its managed server"
       break

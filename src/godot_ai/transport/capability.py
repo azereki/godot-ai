@@ -229,7 +229,13 @@ def _prepare_directory(directory: Path) -> None:
             raise ValueError("capability directory must be an absolute path")
         _reject_unsafe_posix_ancestors(directory)
     _reject_link_components(directory)
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    missing: list[Path] = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for path in reversed(missing):
+        path.mkdir(mode=0o700, exist_ok=True)
     if os.name != "nt":
         _reject_unsafe_posix_ancestors(directory)
     _reject_link_components(directory)

@@ -14,6 +14,7 @@ func test_wire_values_and_names_remain_stable() -> void:
 	assert_eq(McpServerState.READY, 3)
 	assert_eq(McpServerState.name_of(McpServerState.READY), "ready")
 	assert_eq(McpServerState.name_of(McpServerState.INCOMPATIBLE), "incompatible")
+	assert_eq(McpServerState.name_of(McpServerState.PORT_EXCLUDED), "port_excluded")
 	assert_eq(McpServerState.name_of(999), "unknown(999)")
 
 
@@ -40,3 +41,4 @@ func test_only_incompatible_blocks_client_health_projection() -> void:
 	assert_true(McpServerState.blocks_client_health(McpServerState.INCOMPATIBLE))
 	assert_false(McpServerState.blocks_client_health(McpServerState.READY))
 	assert_false(McpServerState.blocks_client_health(McpServerState.FOREIGN_PORT))
+	assert_false(McpServerState.blocks_client_health(McpServerState.CRASHED))

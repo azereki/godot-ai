@@ -74,7 +74,9 @@ Built-in guardrails:
 
 - **Zero-assertion detection**: the runner flags any test that completes with 0 assertions as a failure. This catches tests that silently `return` early (e.g. when `scene_root == null`) without exercising any logic.
 - **Resilient discovery**: if a `.gd` file fails to parse (duplicate methods, syntax errors, wrong base class), the remaining suites still load and run. Failing files are reported in `load_errors` with a reason string.
-- **Suite isolation**: each suite receives a fresh deep `ctx.duplicate(true)` so `suite_setup()` mutations cannot leak between suites.
+- **Suite isolation**: each suite receives `ctx.duplicate(true)`, isolating nested
+  Dictionary and Array mutations. Object references in the context remain shared,
+  so suites must not retain mutations to the undo manager or log buffer.
 - **CI static check**: `script/ci-check-gdscript` scans a single `godot --headless --import` run's log for `SCRIPT ERROR` / `Parse Error` lines before the editor test run, catching parse errors at the gate (it fails rather than passes when the import log is empty or the binary is missing).
 
 ### End-to-end and release-smoke tests

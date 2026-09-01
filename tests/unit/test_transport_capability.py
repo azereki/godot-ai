@@ -40,6 +40,25 @@ def test_generated_capabilities_are_distinct_and_valid() -> None:
     assert generated.http != generated.websocket
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-mode contract")
+def test_missing_capability_ancestors_are_created_private(tmp_path) -> None:
+    directory = tmp_path / "first" / "second"
+    previous_umask = os.umask(0)
+    try:
+        write_capabilities(
+            8122,
+            HTTP,
+            WEBSOCKET,
+            instance_nonce=NONCE,
+            directory=directory,
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE((tmp_path / "first").stat().st_mode) == 0o700
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX ancestor mode contract")
 def test_only_root_owned_sticky_directory_is_safe_as_writable_ancestor() -> None:
     root_sticky = SimpleNamespace(st_mode=stat.S_IFDIR | 0o1777, st_uid=0)
@@ -141,7 +160,7 @@ def test_record_path_rejects_invalid_ports(port: int, tmp_path) -> None:
         f'{{"version":1,"http":"{HTTP}","websocket":"{WEBSOCKET}","instance_nonce":"{NONCE}","extra":1}}',
         f'{{"version":1,"version":1,"http":"{HTTP}","websocket":"{WEBSOCKET}","instance_nonce":"{NONCE}"}}',
         f'{{"version":true,"http":"{HTTP}","websocket":"{WEBSOCKET}","instance_nonce":"{NONCE}"}}',
-        f'{{"version":1,"http":"{HTTP}","websocket":"{HTTP}","instance_nonce":"{NONCE}"}}',
+        f'{{"version":1,"http":"{WEBSOCKET}","websocket":"{WEBSOCKET}","instance_nonce":"{NONCE}"}}',
         f'{{"version":1,"http":"{HTTP}","websocket":"{WEBSOCKET}","instance_nonce":"not-hex"}}',
     ],
     ids=["missing", "extra", "duplicate", "boolean", "shared", "nonce"],
@@ -151,6 +170,11 @@ def test_record_rejects_partial_or_ambiguous_schema(raw: str, tmp_path) -> None:
     path.write_text(raw, encoding="ascii")
 
     assert read_capabilities(8124, tmp_path) is None
+
+
+def test_launch_capabilities_must_be_independent() -> None:
+    with pytest.raises(ValueError, match="independent"):
+        validate_launch_capabilities(WEBSOCKET, WEBSOCKET)
 
 
 def test_record_rejects_oversize_and_non_ascii(tmp_path) -> None:

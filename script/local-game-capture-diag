@@ -42,6 +42,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -54,8 +55,37 @@ HEADERS = {
     "Accept": "application/json, text/event-stream",
 }
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _validated_loopback_url(url: str) -> str:
+    """Keep this credential-bearing local diagnostic on one loopback origin."""
+
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in _LOOPBACK_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("--url must be an unauthenticated http:// loopback URL")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid --url port: {exc}") from None
+    return url
+
 
 def _post(url: str, session_id: str | None, body: dict, timeout: float = 10.0) -> dict:
+    url = _validated_loopback_url(url)
     headers = dict(HEADERS)
     headers["Authorization"] = authorization_header(url)
     if session_id:
@@ -63,7 +93,7 @@ def _post(url: str, session_id: str | None, body: dict, timeout: float = 10.0) -
     req = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _OPENER.open(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8")
         new_session = resp.headers.get("mcp-session-id")
     result: dict = {"_session_id": new_session, "_raw": raw}

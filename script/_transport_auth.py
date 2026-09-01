@@ -13,13 +13,22 @@ from godot_ai.transport.capability import (
 
 
 def authorization_header(url: str) -> str:
+    return f"Bearer {raw_capability(url)}"
+
+
+def raw_capability(url: str) -> str:
+    """Resolve and validate a raw HTTP capability for a target URL."""
+
     parsed = urlsplit(url)
     if parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         record = read_capabilities(port)
         if record is None:
-            raise RuntimeError(f"no valid Godot AI capability record for HTTP port {port}")
+            raise RuntimeError(f"missing Godot AI HTTP capability record for port {port}")
         capability = record.http
     else:
-        capability = validate_capability(os.environ.get(HTTP_CAPABILITY_ENV, ""))
-    return f"Bearer {capability}"
+        try:
+            capability = validate_capability(os.environ.get(HTTP_CAPABILITY_ENV, ""))
+        except ValueError as exc:
+            raise ValueError(f"invalid {HTTP_CAPABILITY_ENV}: {exc}") from None
+    return capability

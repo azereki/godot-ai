@@ -47,9 +47,19 @@ func suite_teardown() -> void:
 			OS.unset_environment(name)
 		else:
 			OS.set_environment(name, str(_saved_environment[name]))
-	for file_name in DirAccess.get_files_at(_scratch_dir):
-		DirAccess.remove_absolute(_scratch_dir.path_join(file_name))
-	DirAccess.remove_absolute(_scratch_dir)
+	assert_eq(_remove_dir_recursive(_scratch_dir), OK)
+
+
+func _remove_dir_recursive(path: String) -> Error:
+	for file_name in DirAccess.get_files_at(path):
+		var file_error := DirAccess.remove_absolute(path.path_join(file_name))
+		if file_error != OK:
+			return file_error
+	for dir_name in DirAccess.get_directories_at(path):
+		var dir_error := _remove_dir_recursive(path.path_join(dir_name))
+		if dir_error != OK:
+			return dir_error
+	return DirAccess.remove_absolute(path)
 
 
 func test_spawn_failure_reenables_old_plugin_and_leaves_bounded_recovery() -> void:

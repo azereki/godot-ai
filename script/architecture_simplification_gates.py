@@ -167,10 +167,10 @@ def _dock_client_worker_fields(root: Path) -> dict[str, Any]:
 def _non_owner_client_thread_spawns(root: Path) -> dict[str, Any]:
     spawns: list[dict[str, Any]] = []
     for path in (DOCK_PATH, CLIENT_HANDLER_PATH):
-        source = _read(root, path)
-        for match in re.finditer(r"\bThread\.new\s*\(", _gdscript_code(source)):
+        code = _gdscript_code(_read(root, path))
+        for match in re.finditer(r"\bThread\.new\s*\(", code):
             spawns.append(
-                {"path": path.as_posix(), "line": _line_number(source, match.start())}
+                {"path": path.as_posix(), "line": _line_number(code, match.start())}
             )
     return _gate(
         "client-work Thread creation outside the one ClientJobOwner",

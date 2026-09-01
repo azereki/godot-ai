@@ -132,15 +132,19 @@ func test_proof_helpers_match_python_wire_vectors() -> void:
 
 
 func test_client_proof_binds_every_metadata_field() -> void:
-	var baseline := McpConnection._client_proof(
+	var fields: Array = [
 		_TEST_CAPABILITY, _TEST_CLIENT_NONCE, _TEST_SERVER_NONCE, "4.0.0",
 		"game@a3f2", "4.7.0", "/tmp/game", "4.0.0", "ready", 123, "dev_venv",
-	)
-	var changed_path := McpConnection._client_proof(
-		_TEST_CAPABILITY, _TEST_CLIENT_NONCE, _TEST_SERVER_NONCE, "4.0.0",
-		"game@a3f2", "4.7.0", "/tmp/other", "4.0.0", "ready", 123, "dev_venv",
-	)
-	assert_ne(baseline, changed_path, "transcript changes must change the proof")
+	]
+	var replacements: Array = [
+		"d".repeat(64), "e".repeat(32), "f".repeat(32), "4.0.1",
+		"game@other", "4.7.1", "/tmp/other", "4.0.1", "busy", 124, "uvx",
+	]
+	var baseline := _client_proof_from_fields(fields)
+	for index in fields.size():
+		var changed := fields.duplicate()
+		changed[index] = replacements[index]
+		assert_ne(baseline, _client_proof_from_fields(changed), "input %d must bind proof" % index)
 
 
 func test_capability_and_proof_shapes_are_strict() -> void:
@@ -183,6 +187,25 @@ func test_simple_ack_only_completes_after_verified_challenge_and_response() -> v
 	assert_true(conn._handshake_complete)
 	assert_eq(conn.server_version, "4.0.0")
 	conn.free()
+	for state in [[false, true], [true, false]]:
+		conn = McpConnection.new()
+		conn._server_verified = state[0]
+		conn._auth_response_sent = state[1]
+		conn._challenged_server_version = "4.0.0"
+		conn._handle_handshake_ack({
+			"type": "handshake_ack",
+			"protocol_version": 2,
+			"server_version": "4.0.0",
+		})
+		assert_false(conn._handshake_complete)
+		conn.free()
+
+
+func _client_proof_from_fields(fields: Array) -> String:
+	return McpConnection._client_proof(
+		fields[0], fields[1], fields[2], fields[3], fields[4], fields[5],
+		fields[6], fields[7], fields[8], fields[9], fields[10],
+	)
 
 
 func test_ack_requires_no_final_hmac_but_rejects_extra_fields() -> void:

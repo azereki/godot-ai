@@ -363,7 +363,7 @@ async def harness():
     port = allocate_free_port()
     server = GodotWebSocketServer(registry, port=port, auth_token=TEST_WS_CAPABILITY)
     task = asyncio.create_task(server.start())
-    await asyncio.sleep(0.1)  # let server bind
+    await server.wait_until_ready()
 
     h = ServerHarness(
         registry=registry,

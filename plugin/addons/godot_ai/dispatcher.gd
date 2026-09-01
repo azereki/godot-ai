@@ -93,14 +93,20 @@ func unregister(command_name: String, handler_key: String) -> void:
 ## replaced. A handler that cannot prove quiescence keeps the dispatcher live
 ## and makes the caller fail closed.
 func quiesce_for_script_swap() -> Dictionary:
-	for instance in _lazy_handler_cache.values():
+	for handler_key in _lazy_handler_cache:
+		var instance: Variant = _lazy_handler_cache[handler_key]
 		if not is_instance_valid(instance) or not instance.has_method("quiesce_for_script_swap"):
-			continue
+			return {
+				"ok": false,
+				"error": "Command handler '%s' cannot prove quiescence for script replacement." % handler_key,
+			}
 		var result: Variant = instance.call("quiesce_for_script_swap")
 		if not result is Dictionary or not bool(result.get("ok", false)):
 			return {
 				"ok": false,
-				"error": "A command handler could not quiesce for script replacement.",
+				"error": "Command handler '%s' could not quiesce for script replacement: %s" % [
+					handler_key, result,
+				],
 			}
 	return {"ok": true}
 

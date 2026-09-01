@@ -3,8 +3,8 @@
 - Recorded: 2026-08-31
 - Repository: `hi-godot/godot-ai`
 - Rebuild branch: `v4/architecture-simplification`
-- Rebuild worktree:
-  `/Users/davidsarno/Documents/godot-ai/v4-simplification-rebuild`
+- Rebuild worktree: local disposable worktree for
+  `v4/architecture-simplification`
 - Landing commit: `a468a7eedd7dcbbeb0221a297f7e7c50f5ab2b4e`
 - Landing tree: `508149f3ca1f79fa1b60c23cc922e7ff7caa0c9b`
 - Landing tag: `checkpoint/v4-rebuild-landing-2026-08-31` (local)
