@@ -26,6 +26,7 @@ import json
 import secrets
 import socket
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 import websockets
@@ -48,14 +49,16 @@ TEST_TRANSPORT_CAPABILITIES = LaunchCapabilities(
 TEST_HTTP_AUTH_HEADERS = {"Authorization": f"Bearer {TEST_HTTP_CAPABILITY}"}
 
 
-def isolate_capability_directory(monkeypatch, root) -> None:
+def isolate_capability_directory(monkeypatch, root) -> Path:
     """Point capability records at test-owned storage on every platform."""
 
+    root = Path(root)
     if os.name == "nt":
         monkeypatch.delenv("GODOT_AI_CAPABILITY_DIR", raising=False)
         monkeypatch.setenv("LOCALAPPDATA", str(root))
-    else:
-        monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(root))
+        return root / "godot-ai" / "capabilities"
+    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(root))
+    return root
 
 
 def create_test_server(**kwargs):

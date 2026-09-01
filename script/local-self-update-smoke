@@ -917,7 +917,6 @@ def create_signed_v4_bundle(
 ) -> None:
     release = _load_v4_release()
     release.PUBLIC_KEY_PEM = public
-    release._verify.PUBLIC_KEY_PEM = public
     archive = output / SMOKE_ARCHIVE_NAME
     manifest_path = output / SMOKE_MANIFEST_NAME
     signature = output / SMOKE_SIGNATURE_NAME

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import runpy
 import stat
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from godot_ai.transport.capability import record_path
 from tests.unit._gdscript_text import get_func_block
@@ -21,6 +24,7 @@ def _lifecycle() -> str:
     return LIFECYCLE.read_text(encoding="utf-8")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX temporary-root contract")
 def test_stale_server_smoke_uses_a_capability_safe_temp_root() -> None:
     module = runpy.run_path(str(STALE_SERVER_SMOKE))
     parent = module["secure_capability_temp_parent"]()

@@ -18,6 +18,7 @@ from tests.conftest import (
     TEST_HTTP_AUTH_HEADERS,
     TEST_TRANSPORT_CAPABILITIES,
     TEST_WS_CAPABILITY,
+    isolate_capability_directory,
 )
 from tests.conftest import (
     create_test_server as create_server,
@@ -186,7 +187,7 @@ async def test_attach_owned_lifespan_wires_lease_count_into_idle_reaper(
     monkeypatch.setattr(server_module, "should_arm_attach_idle_exit", lambda: True)
     monkeypatch.setattr(server_module, "watch_idle", fake_watch_idle)
     monkeypatch.setattr(server_module, "shutdown_if_initialized", lambda: None)
-    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path))
+    isolate_capability_directory(monkeypatch, tmp_path)
 
     server = create_server(ws_port=9561)
     async with server._lifespan(server):
@@ -292,7 +293,7 @@ async def test_plugin_owned_lifespan_wires_lease_count_into_both_reapers(
     monkeypatch.setattr(server_module, "watch_owner", fake_watch_owner)
     monkeypatch.setattr(server_module, "watch_idle", fake_watch_idle)
     monkeypatch.setattr(server_module, "shutdown_if_initialized", lambda: None)
-    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path))
+    isolate_capability_directory(monkeypatch, tmp_path)
 
     server = create_server(ws_port=9562, owner_pid=4242)
     async with server._lifespan(server):

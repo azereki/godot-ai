@@ -59,6 +59,13 @@ def _load_http_auth(environment: dict[str, str]) -> subprocess.CompletedProcess[
     )
 
 
+def _capability_fixture(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    if os.name == "nt":
+        return tmp_path / "godot-ai" / "capabilities", {"LOCALAPPDATA": str(tmp_path)}
+    directory = tmp_path / "capabilities"
+    return directory, {CAPABILITY_DIR_ENV: str(directory)}
+
+
 def test_ci_env_uses_current_capability_api() -> None:
     source = CI_ENV.read_text(encoding="utf-8")
 
@@ -79,7 +86,7 @@ def test_ci_env_reads_loopback_capability_record_and_ignores_environment(
     tmp_path: Path,
     url: str,
 ) -> None:
-    capability_dir = tmp_path / "capabilities"
+    capability_dir, capability_environment = _capability_fixture(tmp_path)
     write_capabilities(
         18123,
         LOCAL_HTTP_CAPABILITY,
@@ -91,7 +98,7 @@ def test_ci_env_reads_loopback_capability_record_and_ignores_environment(
         _environment(
             **{
                 "MCP_SERVER_URL": url,
-                CAPABILITY_DIR_ENV: str(capability_dir),
+                **capability_environment,
                 HTTP_CAPABILITY_ENV: REMOTE_HTTP_CAPABILITY,
             }
         )
@@ -139,11 +146,12 @@ def test_ci_env_rejects_missing_or_invalid_remote_http_capability(
 def test_ci_env_does_not_fall_back_to_environment_for_missing_loopback_record(
     tmp_path: Path,
 ) -> None:
+    _capability_dir, capability_environment = _capability_fixture(tmp_path)
     result = _load_http_auth(
         _environment(
             **{
                 "MCP_SERVER_URL": "http://127.0.0.1:18124/mcp",
-                CAPABILITY_DIR_ENV: str(tmp_path / "missing-capabilities"),
+                **capability_environment,
                 HTTP_CAPABILITY_ENV: REMOTE_HTTP_CAPABILITY,
             }
         )

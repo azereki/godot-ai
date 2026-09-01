@@ -41,7 +41,13 @@ from godot_ai.transport.capability import (
     generate_capabilities,
     read_capabilities,
 )
-from tests.conftest import allocate_free_ports
+from tests.conftest import allocate_free_ports, isolate_capability_directory
+
+
+def _runtime_capability_dir(runtime_dir: Path) -> Path:
+    if os.name == "nt":
+        return runtime_dir / "godot-ai" / "capabilities"
+    return runtime_dir / "capabilities"
 
 
 def _port_open(port: int) -> bool:
@@ -119,7 +125,11 @@ def _bridge_transport(
         part for part in (str(repo_root / "src"), existing_pythonpath) if part
     )
     env["GODOT_AI_RUNTIME_DIR"] = str(runtime_dir)
-    env[CAPABILITY_DIR_ENV] = str(runtime_dir / "capabilities")
+    if os.name == "nt":
+        env.pop(CAPABILITY_DIR_ENV, None)
+        env["LOCALAPPDATA"] = str(runtime_dir)
+    else:
+        env[CAPABILITY_DIR_ENV] = str(_runtime_capability_dir(runtime_dir))
     env["GODOT_AI_DISABLE_TELEMETRY"] = "true"
     env[POLL_SECONDS_ENV] = "0.05"
     env[BOOT_GRACE_ENV] = "2"
@@ -212,7 +222,9 @@ async def test_cold_start_discovers_tools_and_explains_how_to_open_editor(
                 status = (
                     await http.get(
                         f"http://127.0.0.1:{http_port}/godot-ai/status",
-                        headers=_http_headers(http_port, tmp_path / "runtime" / "capabilities"),
+                        headers=_http_headers(
+                            http_port, _runtime_capability_dir(tmp_path / "runtime")
+                        ),
                     )
                 ).json()
             assert status["name"] == "godot-ai"
@@ -243,7 +255,9 @@ async def test_cold_start_discovers_tools_and_explains_how_to_open_editor(
                 recovered_status = (
                     await http.get(
                         f"http://127.0.0.1:{http_port}/godot-ai/status",
-                        headers=_http_headers(http_port, tmp_path / "runtime" / "capabilities"),
+                        headers=_http_headers(
+                            http_port, _runtime_capability_dir(tmp_path / "runtime")
+                        ),
                     )
                 ).json()
             assert recovered_status["instance_id"] != first_instance
@@ -475,9 +489,8 @@ async def test_loopback_status_lease_and_mcp_ignore_proxy_environment(
 ) -> None:
     http_port, ws_port, bogus_proxy_port = allocate_free_ports(3)
     backend_log = (tmp_path / "loopback-backend.log").open("wb")
-    capability_dir = tmp_path / "capabilities"
+    capability_dir = isolate_capability_directory(monkeypatch, tmp_path / "capability-home")
     capabilities = generate_capabilities()
-    monkeypatch.setenv(CAPABILITY_DIR_ENV, str(capability_dir))
     env = dict(os.environ)
     env["GODOT_AI_DISABLE_TELEMETRY"] = "true"
     env[HTTP_CAPABILITY_ENV] = capabilities.http

@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from godot_ai.transport.capability import CAPABILITY_DIR_ENV, write_capabilities
+from tests.conftest import isolate_capability_directory
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "script" / "local-self-update-smoke"
@@ -61,7 +62,8 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     assert "a new Godot*.ips" in result.stdout
     assert "/godot-ai/status" in result.stdout
     assert "--log-file" in result.stdout
-    assert ".godot-ai-self-update-smoke/godot-editor.log" in result.stdout
+    assert ".godot-ai-self-update-smoke" in result.stdout
+    assert "godot-editor.log" in result.stdout
 
     base_cfg = (project / "addons" / "godot_ai" / "plugin.cfg").read_text(encoding="utf-8")
     assert 'version="4.0.0"' in base_cfg
@@ -672,21 +674,26 @@ def test_fetch_and_wait_for_live_status(tmp_path: Path, monkeypatch: pytest.Monk
     }
     server = HTTPServer(("127.0.0.1", 0), _StatusHandler)
     port = int(server.server_address[1])
-    monkeypatch.setenv(CAPABILITY_DIR_ENV, str(tmp_path))
+    capability_dir = isolate_capability_directory(monkeypatch, tmp_path)
     write_capabilities(
         port,
         HTTP_CAPABILITY,
         WS_CAPABILITY,
         instance_nonce=INSTANCE_NONCE,
+        directory=capability_dir,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        payload = smoke.fetch_status_payload(port)
+        payload = smoke.fetch_status_payload(port, capability_dir=capability_dir)
         assert payload == _StatusHandler.payload
-        live = smoke.wait_for_live_status(port, "3.2.4", timeout=2.0, poll=0.05)
+        live = smoke.wait_for_live_status(
+            port, "3.2.4", capability_dir=capability_dir, timeout=2.0, poll=0.05
+        )
         assert live == payload
-        missing = smoke.wait_for_live_status(port, "9.9.9", timeout=0.2, poll=0.05)
+        missing = smoke.wait_for_live_status(
+            port, "9.9.9", capability_dir=capability_dir, timeout=0.2, poll=0.05
+        )
         assert missing == payload
         assert not smoke.status_reports_live_version(missing, "9.9.9")
     finally:
@@ -718,17 +725,20 @@ def test_fetch_status_payload_none_on_truncated_body(
     smoke = load_smoke_script()
     server = HTTPServer(("127.0.0.1", 0), _TruncatedStatusHandler)
     port = int(server.server_address[1])
-    monkeypatch.setenv(CAPABILITY_DIR_ENV, str(tmp_path))
+    capability_dir = isolate_capability_directory(monkeypatch, tmp_path)
     write_capabilities(
         port,
         HTTP_CAPABILITY,
         WS_CAPABILITY,
         instance_nonce=INSTANCE_NONCE,
+        directory=capability_dir,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        assert smoke.fetch_status_payload(port, timeout=1.0) is None
+        assert smoke.fetch_status_payload(
+            port, capability_dir=capability_dir, timeout=1.0
+        ) is None
     finally:
         server.shutdown()
         server.server_close()

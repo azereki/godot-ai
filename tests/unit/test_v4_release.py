@@ -275,6 +275,7 @@ def signed_release(tmp_path_factory):
     private, public = _keys(root)
     repo, source = _repository(root, public)
     original_key = v4_release.PUBLIC_KEY_PEM
+    original_verify_key = v4_release._verify.PUBLIC_KEY_PEM
     v4_release.PUBLIC_KEY_PEM = public
     first, second = root / "first", root / "second"
     try:
@@ -292,6 +293,7 @@ def signed_release(tmp_path_factory):
         }
     finally:
         v4_release.PUBLIC_KEY_PEM = original_key
+        v4_release._verify.PUBLIC_KEY_PEM = original_verify_key
 
 
 def test_build_is_deterministic_and_emits_one_archive_shape(signed_release):
@@ -377,7 +379,9 @@ def test_interrupted_package_publication_leaves_unmixable_immutable_evidence(
 
 
 def test_standalone_verify_accepts_exact_explicit_identity(signed_release):
+    underlying_key = v4_release._verify.PUBLIC_KEY_PEM
     v4_release.verify_release(*signed_release["outputs"], signed_release["expected"])
+    assert v4_release._verify.PUBLIC_KEY_PEM == underlying_key
 
 
 def test_release_limits_match_every_self_update_acceptor():

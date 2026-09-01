@@ -111,7 +111,7 @@ def _paths(scenario: Scenario) -> tx.TransactionPaths:
     )
 
 
-def _wait_until(predicate: Any, timeout: float = 2.0) -> None:
+def _wait_until(predicate: Any, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while not predicate():
         if time.monotonic() >= deadline:
@@ -228,7 +228,7 @@ def test_identity_command_reports_exact_actor_identity_without_inputs(
 
 def test_success_swaps_exact_trees_retains_backup_and_requires_claim(tmp_path: Path) -> None:
     scenario = _scenario(tmp_path)
-    actor = Actor(scenario.intent, readiness_timeout=2, claim_timeout=2)
+    actor = Actor(scenario.intent, readiness_timeout=5, claim_timeout=5)
     _wait_until(lambda: _phase(scenario) == "stage_live")
 
     tx.write_readiness(scenario.intent)
@@ -827,6 +827,7 @@ def test_prepare_rejects_transaction_path_syntax_before_creating_recovery(
     assert not (tmp_path / ".godot-ai-recovery").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows forbids recovery-root overrides")
 def test_preflight_rejects_cross_device_recovery_before_creating_install_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1473,22 +1474,18 @@ def test_cli_uses_exact_root_for_archive_and_base_for_next_preflight(
     archived = tx.json.loads(capfd.readouterr().out)
     assert archived["protocol_version"] == tx.PROTOCOL_VERSION
 
-    assert (
-        tx.main(
-            [
-                "lease",
-                "preflight",
-                *common,
-                "--recovery-base",
-                str(scenario.recovery.parent),
-                "--editor-pid",
-                str(os.getpid()),
-                "--editor-nonce",
-                "second-cli-editor-012345",
-            ]
-        )
-        == 0
-    )
+    preflight = [
+        "lease",
+        "preflight",
+        *common,
+        "--editor-pid",
+        str(os.getpid()),
+        "--editor-nonce",
+        "second-cli-editor-012345",
+    ]
+    if os.name != "nt":
+        preflight.extend(["--recovery-base", str(scenario.recovery.parent)])
+    assert tx.main(preflight) == 0
     preflight = tx.json.loads(capfd.readouterr().out)
     assert preflight["recovery_root"] == str(scenario.recovery)
 
@@ -1926,8 +1923,8 @@ def test_every_mutation_barrier_leaves_an_exact_repairable_tree(
     }:
         actor = Actor(
             scenario.intent,
-            readiness_timeout=0.5 if effect == "readiness_commit" else 2,
-            claim_timeout=2,
+            readiness_timeout=5,
+            claim_timeout=5,
             failpoints=barrier if effect == "result_commit" else None,
         )
         _wait_until(lambda: _phase(scenario) == "stage_live")

@@ -193,15 +193,23 @@ def _prewarm_update_actor(version: str) -> None:
 
 def verify_release(archive: Path, manifest: Path, signature: Path, expected: tuple[str, ...]):
     """Delegate while allowing tests to replace the pinned key explicitly."""
+    previous = _verify.PUBLIC_KEY_PEM
     _verify.PUBLIC_KEY_PEM = PUBLIC_KEY_PEM
-    return _verify.verify_release(archive, manifest, signature, expected)
+    try:
+        return _verify.verify_release(archive, manifest, signature, expected)
+    finally:
+        _verify.PUBLIC_KEY_PEM = previous
 
 
 def _load_verified_release(
     archive: Path, manifest: Path, signature: Path, expected: tuple[str, ...]
 ):
+    previous = _verify.PUBLIC_KEY_PEM
     _verify.PUBLIC_KEY_PEM = PUBLIC_KEY_PEM
-    return _verify._load_verified_release(archive, manifest, signature, expected)
+    try:
+        return _verify._load_verified_release(archive, manifest, signature, expected)
+    finally:
+        _verify.PUBLIC_KEY_PEM = previous
 
 
 def _snapshot_tree(plugin_root: Path, version: str) -> list[tuple[str, bytes]]:
