@@ -107,7 +107,10 @@ def test_owned_launch_waits_boundedly_for_a_stable_branded_process_grant() -> No
     assert "const LAUNCH_FINGERPRINT_TIMEOUT_MS := 15_000" in source
     assert "Time.get_ticks_msec() + LAUNCH_FINGERPRINT_TIMEOUT_MS" in launch
     assert "capture_process_kill_grant(pid, true)" in launch
-    assert "while exact_grant.is_empty()" in launch
+    assert (
+        "while exact_grant.is_empty() and Time.get_ticks_msec() < fingerprint_deadline:"
+        in launch
+    )
     assert '"reason": "launch_unproven" if fingerprint.is_empty() else ""' in launch
     assert "kill_exact_processes" not in launch
 

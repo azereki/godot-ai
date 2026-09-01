@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import runpy
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -38,3 +39,20 @@ def test_diagnostic_rejects_urls_that_could_expose_the_capability(url: str) -> N
 def test_diagnostic_disables_redirect_following() -> None:
     handler = MODULE["_NoRedirectHandler"]()
     assert handler.redirect_request(None, None, 302, "Found", {}, "http://example.com") is None
+
+
+def test_diagnostic_disables_environment_proxies(monkeypatch: pytest.MonkeyPatch) -> None:
+    configured_proxies = []
+    proxy_handler = urllib.request.ProxyHandler
+
+    class TrackingProxyHandler(proxy_handler):
+        def __init__(self, proxies=None):
+            configured_proxies.append(proxies)
+            super().__init__(proxies)
+
+    monkeypatch.setenv("http_proxy", "http://proxy.invalid:8080")
+    monkeypatch.setattr(urllib.request, "ProxyHandler", TrackingProxyHandler)
+
+    runpy.run_path(str(SCRIPT))
+
+    assert configured_proxies == [{}]
