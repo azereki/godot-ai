@@ -802,7 +802,10 @@ def prepare_local_server_runtime(
         f'[project]\nname="godot-ai-smoke-{name}"\nversion="{version}"\n',
         encoding="utf-8",
     )
-    launcher = runtime / "run.py"
+    # The lifecycle intentionally refuses process authority for an unbranded
+    # command line. Mirror the production console script in this frozen local
+    # runtime instead of relying on a generic run.py fixture name.
+    launcher = runtime / "godot-ai-server.py"
     launcher.write_text(
         f"import sys\nsys.path.insert(0, {str(source)!r})\nfrom godot_ai import main\nmain()\n",
         encoding="utf-8",

@@ -136,7 +136,7 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     )
     assert "]\n\nstatic func update_actor_requires_uv_environment_isolation" in base_configurator
     for name, version in (("server-a", "4.0.0"), ("server-b", "4.0.1")):
-        launcher = marker / name / "run.py"
+        launcher = marker / name / "godot-ai-server.py"
         assert launcher.is_file()
         assert (marker / name / "src/godot_ai/server.py").is_file()
         reported = subprocess.run(

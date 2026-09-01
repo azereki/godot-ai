@@ -1717,11 +1717,7 @@ func _on_lifecycle_transport_ready(ws_port: int, ws_capability: String) -> void:
 		_client_jobs.set_client_health_blocked(false)
 		_client_jobs.request_status_refresh(ClientConfigurator.client_ids(), true)
 	if _connection != null:
-		_connection.auth_token = ws_capability
-		_connection.connect_blocked = false
-		_connection.connect_block_reason = ""
-		_connection.server_version = ""
-		_connection.set_process(true)
+		_connection.authorize_transport(ws_port, ws_capability)
 	_publish_dock_status_snapshots()
 
 

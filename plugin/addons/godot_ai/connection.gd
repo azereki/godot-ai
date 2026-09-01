@@ -297,6 +297,21 @@ func revoke_transport(reason: String) -> void:
 	disconnect_from_server("Transport authority revoked")
 
 
+## Apply one proven lifecycle grant and dial immediately. Keeping the copied
+## authority transition here makes revoke/authorize symmetric and avoids
+## depending on a later CLOSED-peer frame after a plugin reload.
+func authorize_transport(p_ws_port: int, p_auth_token: String) -> void:
+	ws_port = p_ws_port
+	auth_token = p_auth_token
+	connect_blocked = false
+	connect_block_reason = ""
+	server_version = ""
+	_reconnect_timer = 0.0
+	set_process(true)
+	if is_inside_tree():
+		_attempt_reconnect()
+
+
 ## Reset per-connection state that was filled in by the previous server
 ## and must NOT bleed into the next one. `force_restart_server` swaps
 ## servers without reloading the plugin, so without this reset the dock

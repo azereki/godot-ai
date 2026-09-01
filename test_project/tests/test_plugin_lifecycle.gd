@@ -20,6 +20,15 @@ class FakeConnection:
 	var connect_block_reason := ""
 	var server_version := ""
 	var revoked_reasons: Array[String] = []
+	var authorize_calls := 0
+
+	func authorize_transport(p_ws_port: int, p_auth_token: String) -> void:
+		authorize_calls += 1
+		ws_port = p_ws_port
+		auth_token = p_auth_token
+		connect_blocked = false
+		connect_block_reason = ""
+		server_version = ""
 
 	func revoke_transport(reason: String) -> void:
 		revoked_reasons.append(reason)
@@ -144,6 +153,7 @@ func test_root_applies_transport_values_without_retaining_connection_in_manager(
 	assert_eq(connection.ws_port, 9555)
 	assert_eq(connection.auth_token, WS)
 	assert_false(connection.connect_blocked)
+	assert_eq(connection.authorize_calls, 1)
 	assert_eq(plugin.get_resolved_ws_port(), 9555)
 	assert_eq(plugin._endpoint_policy.ws_port, 9555)
 	assert_eq(McpClientConfigurator.capture_launch_context().ws_port, 9555,
