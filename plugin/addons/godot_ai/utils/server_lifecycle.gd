@@ -623,17 +623,15 @@ func _effect_launch(payload: Dictionary) -> Dictionary:
 	var pid := int(spawned.pid)
 	if pid <= 1:
 		return {"ok": false, "reason": "launch_failed", "message": "The server process could not be launched."}
-	var fingerprint := PortResolver.process_fingerprint(pid)
+	## OS.create_process can return before POSIX exec replaces the child image.
+	## Capture only after the command is branded and its exact fingerprint is
+	## stable across two reads; otherwise a legitimate exec looks like PID reuse.
+	var exact_grant := PortResolver.capture_process_kill_grant(pid, true)
 	var fingerprint_deadline := Time.get_ticks_msec() + LAUNCH_FINGERPRINT_TIMEOUT_MS
-	while fingerprint.is_empty() and Time.get_ticks_msec() < fingerprint_deadline:
+	while exact_grant.is_empty() and Time.get_ticks_msec() < fingerprint_deadline:
 		OS.delay_msec(100)
-		fingerprint = PortResolver.process_fingerprint(pid)
-	if fingerprint.is_empty():
-		# Best-effort cleanup still needs an exact, branded process grant. If
-		# identity cannot be captured, fail closed instead of killing by PID.
-		var cleanup_grant := PortResolver.capture_process_kill_grant(pid, true)
-		if not cleanup_grant.is_empty():
-			PortResolver.kill_exact_processes([cleanup_grant], true)
+		exact_grant = PortResolver.capture_process_kill_grant(pid, true)
+	var fingerprint := str(exact_grant.get("fingerprint", ""))
 	return {
 		"ok": not fingerprint.is_empty(),
 		"reason": "launch_unproven" if fingerprint.is_empty() else "",
