@@ -48,6 +48,16 @@ TEST_TRANSPORT_CAPABILITIES = LaunchCapabilities(
 TEST_HTTP_AUTH_HEADERS = {"Authorization": f"Bearer {TEST_HTTP_CAPABILITY}"}
 
 
+def isolate_capability_directory(monkeypatch, root) -> None:
+    """Point capability records at test-owned storage on every platform."""
+
+    if os.name == "nt":
+        monkeypatch.delenv("GODOT_AI_CAPABILITY_DIR", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", str(root))
+    else:
+        monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(root))
+
+
 def create_test_server(**kwargs):
     """Build a server with the suite's explicit, instance-bound capabilities."""
 
@@ -329,7 +339,7 @@ async def mcp_stack(mcp_ws_port, monkeypatch, tmp_path):
     from godot_ai.server import create_server
 
     port = mcp_ws_port
-    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path / "capabilities"))
+    isolate_capability_directory(monkeypatch, tmp_path / "capabilities")
     mcp = create_server(
         ws_port=port,
         http_port=allocate_free_port(),

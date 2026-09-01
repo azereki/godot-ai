@@ -27,6 +27,7 @@ from tests.conftest import (
     allocate_free_ports,
     build_auth_response,
     create_test_server,
+    isolate_capability_directory,
     perform_v4_handshake,
     receive_auth_challenge,
     send_auth_hello,
@@ -1688,7 +1689,7 @@ class TestSecureV4Handshake:
         from fastmcp import Client
 
         http_port, port = allocate_free_ports(2)
-        monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path))
+        isolate_capability_directory(monkeypatch, tmp_path)
         mcp = create_test_server(ws_port=port, http_port=http_port)
         assert mcp._transport_capabilities == TEST_TRANSPORT_CAPABILITIES
         async with Client(mcp):

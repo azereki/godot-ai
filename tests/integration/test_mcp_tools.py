@@ -8,7 +8,11 @@ import json
 import pytest
 import websockets
 
-from tests.conftest import allocate_free_ports, create_test_server
+from tests.conftest import (
+    allocate_free_ports,
+    create_test_server,
+    isolate_capability_directory,
+)
 
 
 class TestNoActiveSessionDiagnostics:
@@ -16,7 +20,7 @@ class TestNoActiveSessionDiagnostics:
         from fastmcp import Client
 
         http_port, ws_port = allocate_free_ports(2)
-        monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path))
+        isolate_capability_directory(monkeypatch, tmp_path)
         mcp = create_test_server(ws_port=ws_port, http_port=http_port)
         async with Client(mcp) as client:
             result = await client.call_tool("editor_state", {}, raise_on_error=False)
@@ -34,7 +38,7 @@ class TestNoActiveSessionDiagnostics:
         from fastmcp import Client
 
         http_port, ws_port = allocate_free_ports(2)
-        monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path))
+        isolate_capability_directory(monkeypatch, tmp_path)
         mcp = create_test_server(ws_port=ws_port, http_port=http_port)
         async with Client(mcp) as client:
             result = await client.call_tool(

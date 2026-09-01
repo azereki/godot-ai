@@ -5,7 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 
-from tests.conftest import allocate_free_ports, create_test_server
+from tests.conftest import (
+    allocate_free_ports,
+    create_test_server,
+    isolate_capability_directory,
+)
 
 
 def _parse_resource(result) -> dict:
@@ -22,7 +26,7 @@ class TestNoActiveSessionResource:
         from fastmcp import Client
 
         http_port, ws_port = allocate_free_ports(2)
-        monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path))
+        isolate_capability_directory(monkeypatch, tmp_path)
         mcp = create_test_server(ws_port=ws_port, http_port=http_port)
         async with Client(mcp) as client:
             result = await client.read_resource("godot://project/info")

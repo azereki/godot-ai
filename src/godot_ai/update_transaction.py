@@ -346,7 +346,10 @@ def _private_dir(path: Path, *, create: bool = False) -> Path:
     path = _canonical_path(path, must_exist=False)
     _private_ancestors(path)
     if create and not _lexists(path):
-        path.mkdir(mode=0o700)
+        ## Another same-user actor may create the shared recovery directory
+        ## after our lstat but before mkdir. Treat that as an ordinary race;
+        ## the lstat/owner/mode checks below still reject links or unsafe dirs.
+        path.mkdir(mode=0o700, exist_ok=True)
         _private_ancestors(path)
     info = _lstat(path)
     _posix_private(info, path=path, directory=True)

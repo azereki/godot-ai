@@ -145,6 +145,8 @@ jobs:
   godot-tests:
     name: Godot tests / ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    env:
+      GODOT_AI_MODE: dev
     strategy:
       fail-fast: false
       matrix:
@@ -264,6 +266,8 @@ jobs:
   stale-server-smoke:
     name: Stale server smoke / ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    env:
+      GODOT_AI_MODE: dev
     strategy:
       fail-fast: false
       matrix:
@@ -325,6 +329,8 @@ jobs:
   stale-compatible-reload-smoke:
     name: Stale compatible reload smoke / ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    env:
+      GODOT_AI_MODE: dev
     strategy:
       fail-fast: false
       matrix:
@@ -392,6 +398,8 @@ jobs:
   foreign-server-smoke:
     name: Foreign server smoke / ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    env:
+      GODOT_AI_MODE: dev
     strategy:
       fail-fast: false
       matrix:
@@ -455,6 +463,8 @@ jobs:
   game-capture-smoke:
     name: Game capture smoke / ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
+    env:
+      GODOT_AI_MODE: dev
     strategy:
       fail-fast: false
       matrix:
