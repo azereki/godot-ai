@@ -21,12 +21,23 @@ separate cryptographic identity; the GitHub owner/provider remain trusted.
 `release-signing` now requires `dsarno` approval, disallows administrator
 bypass, and permits only the `main` and `v4/architecture-simplification`
 branches. Self-review is allowed because the owner may dispatch and approve.
-The existing key is still repository-scoped. The opt-in transfer in
-`verify-signing.yml` needs the operator's short-lived environment-write token;
-no key was rotated, retrieved, or copied during setup. The source secret must
-remain until the destination copy passes a fresh signing verification.
-Afterward remove the source fallback, delete/revoke the temporary credential,
-and retire the transfer step. See the [operator runbook](releasing.md#operator-setup-before-candidate-signing).
+The existing key was copied directly within Actions in
+[run 33562599392](https://github.com/hi-godot/godot-ai/actions/runs/33562599392),
+then the protected copy passed a fresh synthetic signing verification with
+copying disabled in
+[run 33562781557](https://github.com/hi-godot/godot-ai/actions/runs/33562781557).
+Both ran source `18bcb11` after explicit `dsarno` approval. No private key was
+rotated or retrieved into the workspace, chat, logs, or artifacts.
+
+After that success, the repository-scoped `RELEASE_SIGNING_KEY_PEM` and the
+environment's temporary `RELEASE_KEY_MIGRATION_TOKEN` secret were deleted.
+Metadata readback confirmed neither exists at repository scope and the sole
+remaining environment secret is `RELEASE_SIGNING_KEY_PEM`. The one-time transfer
+input, shell step, and obsolete transfer tests are retired; the permanent
+workflow remains a read-only, human-gated synthetic signing check. Operator
+revocation of the temporary fine-grained token at GitHub is still awaiting
+confirmation; deleting its Actions secret alone does not revoke it. See the
+[operator runbook](releasing.md#operator-setup-before-candidate-signing).
 
 The prior occurrence-selector commit `531f1bf` passed **32/32 hosted CI jobs**
 in [run 33556567537](https://github.com/hi-godot/godot-ai/actions/runs/33556567537).
@@ -35,8 +46,44 @@ Godot-backed updater **12 passed**; isolated live Godot **2,128 passed,
 24 platform/environment skips, 0 failed**. The first Python run caught two
 missing explicit UTF-8 encodings in the new test; both were fixed and the
 complete suite rerun successfully. These are development checks, not immutable
-release-candidate qualification. The live signing transfer is still pending.
+release-candidate qualification. The live transfer and fresh signing check
+subsequently passed as recorded above.
 No final A/B candidates, release approval, or publication exist yet.
+
+The setup commit's [CI run 33560671963](https://github.com/hi-godot/godot-ai/actions/runs/33560671963)
+failed only Python 3.13/macOS: the CLI failpoint test parsed canonical filesystem
+identity while the actor was renaming the live directory. Cleanup moves that
+test's full intent/journal validation after the `stage_live` polling boundary;
+production path checks are unchanged. The six retired tests belonged solely
+to the deleted one-time transfer mechanism, not updater coverage.
+
+Cleanup validation: Ruff clean; Python **2,260 passed, 9 skipped**; updater
+integration **12 passed**; live Godot **2,128 passed, 24 skips, 0 failed**;
+the three CLI failpoint cases passed ten consecutive runs (**30/30**).
+The first live harness attempt could not connect because a separate client
+occupied its inherited ports. The successful run used an intact self-contained
+Godot 4.7.2 app copy with isolated settings and ports; no existing client was
+stopped and no production source was patched for that run.
+
+### Review follow-up still open
+
+The latest review was inspected during signing cleanup, not silently marked
+addressed. Four inline threads remain open: CI checkout credential persistence,
+end-to-end six-asset discovery in the manual smoke, the Cherry Studio exception
+in the migration introduction, and the repin argument assertion. The parser
+already has separate six-asset coverage; the smoke gap is integration coverage.
+The older out-of-diff non-loopback HTTP capability finding still matches
+`script/_transport_auth.py`. The resolved bridge-timeout thread also needs
+reassessment: `_process()` discards the `termination_unproven` flag before the
+plugin exposes Retry. Neither issue was changed by signing cleanup.
+
+The [Windows qualification report](https://github.com/hi-godot/godot-ai/pull/943#issuecomment-5498715882)
+also needs disposition: nested signing paths and the privilege-dependent
+symlink fixture still match current code. Check the capsule/autoload report
+against the supported overlay update path before adding a compatibility stub;
+the capsule is not a standalone final install. Its missing failure-log report
+matches the dock-only bridge error presentation. These observations are review
+follow-up, not completed fixes or exact-candidate qualification.
 
 ## Qualification preparation — occurrence selector and operator preflight
 

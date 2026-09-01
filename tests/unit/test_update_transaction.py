@@ -3042,13 +3042,12 @@ def test_activate_cli_uses_authenticated_environment_failpoint_without_secret_le
 
         paths = _paths(scenario)
         _wait_until(lambda: os.path.lexists(paths.intent), timeout=30)
-        actual_intent = tx.load_intent(paths)
 
         def stage_is_live() -> bool:
             if not os.path.lexists(paths.journal):
                 return False
             try:
-                return tx.load_journal(paths, actual_intent)["phase"] == "stage_live"
+                return tx.load_record(paths.journal)["phase"] == "stage_live"
             except PermissionError:
                 # Windows can briefly deny a read while the actor atomically
                 # replaces the journal. Poll through that sharing window; a
@@ -3060,6 +3059,10 @@ def test_activate_cli_uses_authenticated_environment_failpoint_without_secret_le
                 raise
 
         _wait_until(stage_is_live, timeout=30)
+        # Intent parsing checks filesystem identity. Wait until the actor has
+        # finished both renames, then validate the intent and journal together.
+        actual_intent = tx.load_intent(paths)
+        assert tx.load_journal(paths, actual_intent)["phase"] == "stage_live"
         tx.write_readiness(actual_intent)
         _wait_until(lambda: os.path.lexists(paths.result), timeout=30)
         claimed = tx.claim_result(actual_intent)

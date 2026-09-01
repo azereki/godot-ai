@@ -34,14 +34,12 @@ not establish that it is protected. The release operator must:
 1. Configure `release-signing` with a designated required reviewer and an
    explicit allowed release-source branch/tag policy. Resolve who dispatches
    and who approves before enabling prevention of self-review.
-2. Add the **existing** `RELEASE_SIGNING_KEY_PEM` as an environment secret,
-   from secure custody or the approved transfer below. Do not rotate the key:
-   released v3 updaters already trust its public half. GitHub's UI/API returns
-   secret metadata, not the stored value; an authorized Actions job can use it.
-3. After verifying the environment copy against the embedded key, remove the
-   repository-scoped copy so jobs cannot bypass the environment approval gate.
-   Retain the original key in secure custody; do not place it in chat, logs,
-   source, or build artifacts.
+2. Confirm the **existing** `RELEASE_SIGNING_KEY_PEM` is an environment secret
+   and run the synthetic signing check against the embedded key. Do not rotate
+   the key: released v3 updaters already trust its public half. Do not place
+   private-key material in chat, logs, source, or build artifacts.
+3. Confirm no repository-scoped signing-key fallback exists: jobs must not be
+   able to obtain the key without the environment approval gate.
 4. Verify the separately permissioned attestation channel below before freezing
    A. A reviewer on the release repository alone does not establish that boundary.
 
@@ -51,18 +49,13 @@ candidate hashes or waive qualification. The environment-copy check must not be
 mistaken for proof that the repository-scoped fallback has been removed; inspect
 both secret-name lists after the change.
 
-When the only available copy is the repository secret, use the opt-in
-`copy_key_to_environment` input of `verify-signing.yml`. Supply a short-lived
-fine-grained token for **hi-godot/godot-ai only**, with **Environments: write**,
-as the `release-signing` environment secret `RELEASE_KEY_MIGRATION_TOKEN`.
-Never copy a broad account token into the workflow. The transfer runs only after
-human environment approval and successful synthetic signature verification;
-it passes the PEM on standard input to GitHub's secret writer, refuses to
-overwrite an existing environment key, and uploads no artifacts. It does not
-delete the source key. Run verification again with the copy option off before
-removing the repository fallback. Then delete the temporary token secret,
-revoke the token at its issuer, and retire the transfer step. No release is
-signed or approved by this bootstrap operation.
+The one-time repository-to-environment transfer completed on 2026-09-01;
+the protected copy passed a fresh signing check before the repository fallback
+was removed. The temporary token secret and transfer code have been removed.
+The operator must also revoke the temporary token at its issuer; deleting an
+Actions secret does not revoke the credential. See the
+[setup checkpoint](v4-pr-head-checkpoint.md#signing-and-attestation-setup--owner-approved-boundary)
+for run links and the revocation status. No bootstrap operation approves a release.
 
 ### Attestation channel and approved threat boundary
 

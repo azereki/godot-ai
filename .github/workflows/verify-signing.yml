@@ -8,11 +8,6 @@ name: Verify signing secret
 # build, qualify, predict, authorize, or publish a release.
 on:
   workflow_dispatch:
-    inputs:
-      copy_key_to_environment:
-        description: "One-time copy of the verified existing key into release-signing"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -69,29 +64,3 @@ jobs:
           openssl dgst -sha256 -verify embedded_public_key.pem \
             -signature payload.sig payload.txt
           echo "OK: the stored secret signs payloads the plugin's embedded key verifies."
-
-      # Temporary bootstrap only. Remove after the environment-only signing
-      # check succeeds and the repository-scoped fallback has been removed.
-      - name: Copy verified key to the protected environment
-        if: ${{ inputs.copy_key_to_environment && github.repository == 'hi-godot/godot-ai' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_KEY_MIGRATION_TOKEN }}
-          RELEASE_SIGNING_KEY_PEM: ${{ secrets.RELEASE_SIGNING_KEY_PEM }}
-        run: |
-          set +x
-          set -euo pipefail
-          unset GH_DEBUG GH_HOST
-          if [ -z "$GH_TOKEN" ] || [ -z "$RELEASE_SIGNING_KEY_PEM" ]; then
-            echo "ERROR: temporary environment-write credential or existing signing key is missing." >&2
-            exit 1
-          fi
-          existing=$(gh secret list --repo hi-godot/godot-ai --env release-signing \
-            --json name --jq 'map(select(.name == "RELEASE_SIGNING_KEY_PEM")) | length')
-          if [ "$existing" != "0" ]; then
-            echo "ERROR: refusing to overwrite an existing environment signing key." >&2
-            exit 1
-          fi
-          printf '%s' "$RELEASE_SIGNING_KEY_PEM" | gh secret set RELEASE_SIGNING_KEY_PEM \
-            --repo hi-godot/godot-ai --env release-signing
-          echo "Key copied. Verify in a new run before removing the repository-scoped fallback."
