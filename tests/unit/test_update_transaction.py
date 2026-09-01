@@ -2945,6 +2945,11 @@ def test_activate_cli_uses_authenticated_environment_failpoint_without_secret_le
                 return False
             try:
                 return tx.load_journal(paths, actual_intent)["phase"] == "stage_live"
+            except PermissionError:
+                # Windows can briefly deny a read while the actor atomically
+                # replaces the journal. Poll through that sharing window; a
+                # durable denial still fails at the enclosing deadline.
+                return False
             except tx.TransactionError as exc:
                 if str(exc).endswith("record changed before reading"):
                     return False
