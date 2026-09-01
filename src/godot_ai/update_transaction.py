@@ -279,6 +279,15 @@ def _canonical_path(path: os.PathLike[str] | str, *, must_exist: bool) -> Path:
                 matches: list[str] = []
                 with os.scandir(current) as entries:
                     for entry in entries:
+                        if _windows():
+                            # Windows directory st_ino values are not reliably
+                            # unique (some filesystems report zero for every
+                            # entry).  Names are unique case-insensitively on
+                            # the supported Windows filesystems, and lstat
+                            # above already proved this spelling resolves.
+                            if entry.name.casefold() == part.casefold():
+                                matches.append(entry.name)
+                            continue
                         try:
                             entry_info = entry.stat(follow_symlinks=False)
                         except OSError:

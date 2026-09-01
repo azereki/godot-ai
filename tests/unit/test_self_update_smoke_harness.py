@@ -806,3 +806,21 @@ def test_verify_post_run_accepts_live_status(
     captured = capsys.readouterr().out
     assert ok is True
     assert "PASS: post-update /godot-ai/status live v4.0.0" in captured
+
+
+def test_crash_report_filter_ignores_an_unrelated_godot_binary(tmp_path: Path) -> None:
+    smoke = load_smoke_script()
+    launched = tmp_path / "Godot-4.7"
+    unrelated = tmp_path / "Godot-4.6"
+    launched.touch()
+    unrelated.touch()
+    report = tmp_path / "Godot-test.ips"
+    report.write_text(
+        json.dumps({"app_name": "Godot"})
+        + "\n"
+        + json.dumps({"procPath": str(unrelated)}),
+        encoding="utf-8",
+    )
+
+    assert smoke._report_matches_executable(report, launched) is False
+    assert smoke._report_matches_executable(report, unrelated) is True

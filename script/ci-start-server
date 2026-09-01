@@ -20,6 +20,9 @@ if [ -z "${GODOT_AI_HTTP_CAPABILITY:-}" ] && [ -z "${GODOT_AI_WS_TOKEN:-}" ]; th
   IFS=$'\t' read -r GODOT_AI_HTTP_CAPABILITY GODOT_AI_WS_TOKEN < <(
     "$PYTHON_CMD" -c 'from godot_ai.transport.capability import generate_capabilities; c = generate_capabilities(); print(c.http, c.websocket, sep="\t")'
   )
+  # Python writes CRLF on Windows; bash read removes LF but retains CR.
+  GODOT_AI_HTTP_CAPABILITY="${GODOT_AI_HTTP_CAPABILITY%$'\r'}"
+  GODOT_AI_WS_TOKEN="${GODOT_AI_WS_TOKEN%$'\r'}"
 elif [ -z "${GODOT_AI_HTTP_CAPABILITY:-}" ] || [ -z "${GODOT_AI_WS_TOKEN:-}" ]; then
   echo "ERROR: HTTP and WebSocket capabilities must be supplied together" >&2
   exit 1

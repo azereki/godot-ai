@@ -1267,7 +1267,7 @@ def launch_and_verify(
     code = proc.wait()
     if code != 0:
         print(f"FAIL: Godot exited with code {code}")
-        print_new_reports(baseline, started)
+        print_new_reports(baseline, started, Path(godot_path))
         return code or 1
 
     ok = verify_post_run(
@@ -1278,6 +1278,7 @@ def launch_and_verify(
         lines,
         post_update_status=post_update_status,
         next_server_version=next_server_version,
+        godot_path=Path(godot_path),
     )
     return 0 if ok else 1
 
@@ -1291,6 +1292,7 @@ def verify_post_run(
     *,
     post_update_status: dict | None,
     next_server_version: str,
+    godot_path: Path | None = None,
 ) -> bool:
     ok = True
     installed_version = read_plugin_version(project_dir / "addons" / "godot_ai" / "plugin.cfg")
@@ -1350,7 +1352,7 @@ def verify_post_run(
         )
         ok = False
 
-    new_reports = new_diagnostic_reports(baseline, started)
+    new_reports = new_diagnostic_reports(baseline, started, godot_path)
     if new_reports:
         print("FAIL: new Godot crash reports:")
         for report in new_reports:
@@ -1551,21 +1553,38 @@ def wait_for_live_status(
     return last
 
 
-def print_new_reports(baseline: set[Path], started: float) -> None:
-    reports = new_diagnostic_reports(baseline, started)
+def print_new_reports(baseline: set[Path], started: float, godot_path: Path) -> None:
+    reports = new_diagnostic_reports(baseline, started, godot_path)
     if reports:
         print("New Godot crash reports:")
         for report in reports:
             print(f"  {report}")
 
 
-def new_diagnostic_reports(baseline: set[Path], started: float) -> list[Path]:
+def _report_matches_executable(report: Path, godot_path: Path | None) -> bool:
+    if godot_path is None:
+        return True
+    try:
+        with report.open(encoding="utf-8") as source:
+            source.readline()
+            payload = json.load(source)
+        reported = payload.get("procPath")
+        return isinstance(reported, str) and Path(reported).resolve() == godot_path.resolve()
+    except (OSError, ValueError, TypeError):
+        # An unreadable report cannot be proven unrelated to this smoke.
+        return True
+
+
+def new_diagnostic_reports(
+    baseline: set[Path], started: float, godot_path: Path | None = None
+) -> list[Path]:
     current = diagnostic_reports_snapshot()
     return sorted(
         (
             path
             for path in current - baseline
             if path.exists() and path.stat().st_mtime >= started - 2
+            and _report_matches_executable(path, godot_path)
         ),
         key=lambda path: path.stat().st_mtime,
     )
