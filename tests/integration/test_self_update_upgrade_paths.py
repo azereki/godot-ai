@@ -557,6 +557,11 @@ def test_clean_major_installer_holds_first_start_until_client_confirmation(
     probe_resource = "res://_test_clean_major_authenticated_probe.txt"
     probe_content = "clean-major authenticated write\n"
     wedged = prewarm_mode == "wedged"
+    # Windows owns and terminates the entire cmd.exe process tree, so a
+    # timed-out prewarm may safely continue once that exact tree is proven
+    # dead. POSIX can kill only the captured launcher PID and must retain the
+    # migration barrier because possible descendants remain unproven.
+    requires_retry = wedged and os.name != "nt"
     log = run_godot_editor(
         project,
         godot_bin,
@@ -565,7 +570,7 @@ def test_clean_major_installer_holds_first_start_until_client_confirmation(
         environment=environment,
         live_probe=(
             None
-            if wedged
+            if requires_retry
             else lambda: _authenticated_tool_probe(
                 http_port,
                 capability_dir,
@@ -575,7 +580,7 @@ def test_clean_major_installer_holds_first_start_until_client_confirmation(
         ),
         probe_ready_file=CLEAN_MAJOR_STATUS_FILE,
         probe_done_file=CLEAN_MAJOR_TOOL_PROBE_FILE,
-        expected_exit_code=23 if wedged else 0,
+        expected_exit_code=23 if requires_retry else 0,
     )
 
     client_config = (codex_home / "config.toml").read_text(encoding="utf-8")
@@ -596,6 +601,7 @@ def test_clean_major_installer_holds_first_start_until_client_confirmation(
     assert len(prewarm_records) == 2
     if wedged:
         assert "CLEAN_MAJOR_TEST | editor remained responsive during wedged prewarm" in log
+    if requires_retry:
         assert "Post-update package pre-warm could not be proven stopped" in log
         assert "CLEAN_MAJOR_TEST | client migration requested retry" in log
         assert "MCP | client migration durably completed" not in log
