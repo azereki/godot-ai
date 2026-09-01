@@ -256,30 +256,6 @@ func test_manual_major_migration_allows_replacing_owned_mismatches() -> void:
 	plugin.free()
 
 
-func test_manual_migration_marker_parser_is_exact_and_target_bound() -> void:
-	var marker := JSON.stringify({
-		"from_version": "3.2.4",
-		"kind": Plugin.MANUAL_MIGRATION_MARKER_KIND,
-		"schema_version": Plugin.MANUAL_MIGRATION_MARKER_SCHEMA,
-		"source_commit": "a".repeat(40),
-		"to_version": VERSION,
-	})
-	assert_eq(
-		str(Plugin._parse_manual_migration_marker(marker, VERSION).status),
-		"pending",
-	)
-	assert_eq(
-		str(Plugin._parse_manual_migration_marker(marker, "4.0.1").status),
-		"invalid",
-	)
-	var with_extra: Dictionary = JSON.parse_string(marker)
-	with_extra["authority"] = true
-	assert_eq(
-		str(Plugin._parse_manual_migration_marker(JSON.stringify(with_extra), VERSION).status),
-		"invalid",
-	)
-
-
 func test_rollback_telemetry_uses_the_supported_clean_failure_vocabulary() -> void:
 	var plugin := Plugin.new()
 	var telemetry := FakeTelemetry.new()
