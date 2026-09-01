@@ -1564,6 +1564,7 @@ func test_resolved_ws_port_is_one_published_launch_policy() -> void:
 	var worker_context: Dictionary = thread.wait_to_finish()
 	var attach := McpClientConfigurator.resolve_attach_launch(refreshed, {
 		"venv_python": "/tmp/godot-ai-test-python",
+		"consoleless_python": "C:/Python313/pythonw.exe",
 	})
 	var server_flags := McpServerLifecycleManager._server_flags({
 		"http_port": refreshed.http_port,
