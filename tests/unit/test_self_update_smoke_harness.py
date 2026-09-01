@@ -214,8 +214,8 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     assert "class_name McpSelfUpdateSmokeBase" in vnext_base
     assert "class_name McpSelfUpdateSmokeChild" in vnext_child
     assert "extends McpSelfUpdateSmokeBase" in vnext_child
-    assert vnext_base_uid == "uid://m5waxbfff4ud\n"
-    assert vnext_child_uid == "uid://bm2056w0qvj7x\n"
+    assert vnext_base_uid.strip() == "uid://m5waxbfff4ud"
+    assert vnext_child_uid.strip() == "uid://bm2056w0qvj7x"
     assert "const DEFAULT_HTTP_PORT := 18000" in vnext_configurator
     assert ".godot-ai-self-update-smoke/server-selector.py" in vnext_configurator
     def server_command_block(text: str) -> str:

@@ -315,7 +315,16 @@ def _authenticated_tool_probe(
             headers={"Authorization": f"Bearer {record.http}"},
         )
         async with Client(transport, timeout=10, init_timeout=10) as client:
-            deadline = asyncio.get_running_loop().time() + 10
+            deadline = asyncio.get_running_loop().time() + 30
+            while True:
+                sessions = await client.call_tool(
+                    "session_manage", {"op": "list", "params": {}}
+                )
+                if int(sessions.data.get("count", 0)) > 0:
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise AssertionError("editor session stayed unavailable")
+                await asyncio.sleep(0.2)
             while True:
                 state = await client.call_tool("editor_state", {}, raise_on_error=False)
                 if not state.is_error:

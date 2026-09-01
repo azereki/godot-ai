@@ -97,7 +97,8 @@ def test_standalone_key_matches_the_pre_v4_updater_key():
 
 def test_standalone_key_validation_accepts_a_crlf_checkout():
     source = ROOT / "plugin/addons/godot_ai/utils/update_manager.gd"
-    v4_release._validate_embedded_public_key(source.read_bytes().replace(b"\n", b"\r\n"))
+    lf_source = source.read_bytes().replace(b"\r\n", b"\n")
+    v4_release._validate_embedded_public_key(lf_source.replace(b"\n", b"\r\n"))
 
 
 def test_standalone_key_validation_rejects_ambiguous_line_endings():

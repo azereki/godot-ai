@@ -51,18 +51,23 @@ def test_stale_server_smoke_accepts_setup_godot_launcher_env(monkeypatch, tmp_pa
     assert module["find_godot"]() == str(launcher)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="macOS default-path contract")
-def test_stale_server_smoke_macos_home_and_override_can_converge(
-    monkeypatch, tmp_path
-) -> None:
+@pytest.mark.skipif(os.name == "nt", reason="POSIX override contract")
+def test_stale_server_smoke_passes_the_exact_capability_override(monkeypatch, tmp_path) -> None:
     module = runpy.run_path(str(STALE_SERVER_SMOKE))
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(module["platform"], "system", lambda: "Darwin")
+    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path))
+    assert module["capability_directory"]() == tmp_path
+    assert module["editor_environment"](tmp_path)["GODOT_AI_CAPABILITY_DIR"] == str(tmp_path)
 
-    expected = tmp_path / "Library" / "Application Support" / "godot-ai" / "capabilities"
-    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(expected))
-    assert module["capability_directory"]() == expected
-    assert module["editor_environment"](expected)["GODOT_AI_CAPABILITY_DIR"] == str(expected)
+
+def test_stale_server_smoke_proves_its_fixture_bound_before_starting_godot() -> None:
+    source = STALE_SERVER_SMOKE.read_text(encoding="utf-8")
+    run = source[
+        source.index("def run_occupant_mode(") : source.index("async def reload_and_probe(")
+    ]
+
+    assert run.index("wait_for_log(occupant_log, OCCUPANT_READY_MARKER") < run.index(
+        "start_editor("
+    )
 
 
 def test_stale_server_requires_a_fresh_explicit_replacement_action() -> None:

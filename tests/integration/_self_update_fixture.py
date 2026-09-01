@@ -446,8 +446,10 @@ extends Node
 const VERSION := "{version}"
 const HTTP_PORT := {http_port}
 const ClientConfigurator := preload("res://addons/godot_ai/client_configurator.gd")
+const DriverSupport := preload("res://_test_self_update_driver_support.gd")
 
 var _frames := 0
+var _configured := false
 
 
 func _ready() -> void:
@@ -459,9 +461,17 @@ func _ready() -> void:
 
 func _process(_delta: float) -> void:
 \t_frames += 1
+\tif _frames > 1800:
+\t\tpush_error("SELF_UPDATE_TEST | managed server ownership was not established during client prep")
+\t\tget_tree().quit(32)
+\t\treturn
+\tif _configured:
+\t\tvar plugin := DriverSupport.find_godot_ai_plugin()
+\t\tif plugin != null and bool(plugin.call("has_managed_server")):
+\t\t\tget_tree().quit(0)
+\t\treturn
 \tif _frames < 45:
 \t\treturn
-\tset_process(false)
 \tvar context := ClientConfigurator.capture_launch_context()
 \tvar result := ClientConfigurator.configure(
 \t\t"codex",
@@ -473,7 +483,7 @@ func _process(_delta: float) -> void:
 \t\tget_tree().quit(31)
 \t\treturn
 \tprint("SELF_UPDATE_TEST | production-configured Codex command pin=%s" % VERSION)
-\tget_tree().quit(0)
+\t_configured = true
 
 
 func _has_pin() -> bool:
