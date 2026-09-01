@@ -2576,7 +2576,10 @@ def test_real_failpoint_requires_capability_and_authenticated_decision(tmp_path:
     assert not os.path.lexists(capability)
 
 
-def test_real_failpoint_is_one_shot_and_cleans_handled_capability(tmp_path: Path) -> None:
+@pytest.mark.parametrize("occurrence", [1, 2, 3])
+def test_real_failpoint_is_one_shot_and_cleans_handled_capability(
+    tmp_path: Path, occurrence: int
+) -> None:
     scenario = _scenario(tmp_path)
     token = bytes.fromhex("31" * 32)
     capability = tx.write_failpoint_capability(
@@ -2584,8 +2587,14 @@ def test_real_failpoint_is_one_shot_and_cleans_handled_capability(tmp_path: Path
         effect="journal_commit",
         when="after",
         token=token,
+        occurrence=occurrence,
     )
     controls = tx.Failpoints(capability, token, scenario.intent, timeout=2)
+    for _ in range(occurrence - 1):
+        controls.barrier("journal_commit", "before")
+        controls.barrier("intent_commit", "after")
+        controls.barrier("journal_commit", "after")
+        assert not os.path.lexists(scenario.recovery / "failpoint-barrier.json")
     errors: list[BaseException] = []
 
     def cross_twice() -> None:
@@ -2599,12 +2608,13 @@ def test_real_failpoint_is_one_shot_and_cleans_handled_capability(tmp_path: Path
     worker.start()
     barrier = scenario.recovery / "failpoint-barrier.json"
     _wait_until(lambda: os.path.lexists(barrier))
+    assert tx.load_record(barrier)["sequence"] == occurrence
     tx.write_failpoint_decision(scenario.recovery, token=token, action="continue")
     worker.join(2)
 
     assert not worker.is_alive()
     assert errors == []
-    assert controls.sequence == 1
+    assert controls.sequence == occurrence
     assert controls.spent
     assert not os.path.lexists(capability)
     assert not os.path.lexists(barrier)
@@ -2831,6 +2841,10 @@ def test_direct_actor_capability_writer_rejects_unknown_and_coordinator_effects(
         (tx.QUALIFICATION_FAILPOINT_TIMEOUT_ENV, "1e3", "positive decimal"),
         (tx.QUALIFICATION_FAILPOINT_TIMEOUT_ENV, "301", "between 0 and 300s"),
         (tx.QUALIFICATION_FAILPOINT_TIMEOUT_ENV, "9" * 400, "between 0 and 300s"),
+        *[
+            (tx.QUALIFICATION_FAILPOINT_OCCURRENCE_ENV, value, "occurrence")
+            for value in ("", "0", "-1", "01", "1.0", "10000", "9" * 400)
+        ],
     ],
 )
 def test_activate_failpoint_environment_rejects_invalid_values_without_arming(
@@ -2982,13 +2996,14 @@ def test_activate_cli_cleans_capability_when_prepared_state_rejects_intent(
 
 
 @pytest.mark.parametrize(
-    ("effect", "expect_barrier"),
-    [("intent_commit", True), ("quarantine_live", False)],
+    ("effect", "expect_barrier", "occurrence"),
+    [("intent_commit", True, 1), ("quarantine_live", False, 1), ("journal_commit", True, 2)],
 )
 def test_activate_cli_uses_authenticated_environment_failpoint_without_secret_leak(
     tmp_path: Path,
     effect: str,
     expect_barrier: bool,
+    occurrence: int,
 ) -> None:
     scenario = _scenario(tmp_path)
     token_hex = "31" * 32
@@ -3003,6 +3018,7 @@ def test_activate_cli_uses_authenticated_environment_failpoint_without_secret_le
     environment = {
         **os.environ,
         **_qualification_environment(token_hex, effect=effect, timeout="30"),
+        tx.QUALIFICATION_FAILPOINT_OCCURRENCE_ENV: str(occurrence),
         "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
     }
     process = subprocess.Popen(
@@ -3018,6 +3034,7 @@ def test_activate_cli_uses_authenticated_environment_failpoint_without_secret_le
         assert token_hex.encode("ascii") not in capability.read_bytes()
         if expect_barrier:
             _wait_until(lambda: os.path.lexists(barrier), timeout=30)
+            assert tx.load_record(barrier)["sequence"] == occurrence
             assert token not in barrier.read_bytes()
             tx.write_failpoint_decision(scenario.recovery, token=token, action="continue")
         else:

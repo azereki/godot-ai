@@ -35,6 +35,7 @@ func suite_setup(_ctx: Dictionary) -> void:
 		QualificationBarrier.EFFECT_ENV,
 		QualificationBarrier.WHEN_ENV,
 		QualificationBarrier.TIMEOUT_ENV,
+		QualificationBarrier.OCCURRENCE_ENV,
 	]:
 		_saved_environment[name] = OS.get_environment(name) if OS.has_environment(name) else null
 	_clear_qualification_environment()
@@ -255,6 +256,55 @@ func test_qualification_barrier_requires_authenticated_exact_decision() -> void:
 	_clear_qualification_environment()
 
 
+func test_qualification_barrier_selects_second_occurrence() -> void:
+	_clear_qualification_environment()
+	var token := "cd".repeat(32)
+	OS.set_environment(QualificationBarrier.TOKEN_ENV, token)
+	OS.set_environment(QualificationBarrier.EFFECT_ENV, "coordinator_filesystem_scan")
+	OS.set_environment(QualificationBarrier.WHEN_ENV, "after")
+	OS.set_environment(QualificationBarrier.TIMEOUT_ENV, "5")
+	OS.set_environment(QualificationBarrier.OCCURRENCE_ENV, "2")
+	var barrier := QualificationBarrier.new()
+	assert_true(barrier.configure(_prepared_fixture()))
+	assert_false(barrier.begin("coordinator_enable", "after"))
+	assert_false(barrier.begin("coordinator_filesystem_scan", "before"))
+	assert_false(barrier.begin("coordinator_filesystem_scan", "after"))
+	var barrier_path := _scratch_dir.path_join(QualificationBarrier.BARRIER_NAME)
+	assert_false(FileAccess.file_exists(barrier_path))
+	assert_true(barrier.begin("coordinator_filesystem_scan", "after"))
+	var decision: Dictionary = JSON.parse_string(FileAccess.get_file_as_string(barrier_path))
+	assert_eq(decision.sequence, 2)
+	decision.record = "coordinator_failpoint_decision"
+	decision.action = "continue"
+	decision.mac = _decision_mac(token, decision)
+	assert_true(QualificationBarrier._write_new(
+		_scratch_dir.path_join(QualificationBarrier.DECISION_NAME), decision))
+	assert_eq(barrier.poll(), QualificationBarrier.CONTINUE)
+	assert_false(barrier.begin("coordinator_filesystem_scan", "after"))
+	assert_false(FileAccess.file_exists(barrier_path))
+	barrier.clear_environment()
+	assert_false(OS.has_environment(QualificationBarrier.OCCURRENCE_ENV))
+
+
+func test_qualification_barrier_rejects_invalid_occurrence() -> void:
+	for value in ["", "0", "-1", "01", "1.0", "10000", "9".repeat(400)]:
+		_clear_qualification_environment()
+		OS.set_environment(QualificationBarrier.TOKEN_ENV, "ab".repeat(32))
+		OS.set_environment(QualificationBarrier.EFFECT_ENV, "journal_commit")
+		OS.set_environment(QualificationBarrier.WHEN_ENV, "after")
+		OS.set_environment(QualificationBarrier.TIMEOUT_ENV, "5")
+		OS.set_environment(QualificationBarrier.OCCURRENCE_ENV, value)
+		var barrier := QualificationBarrier.new()
+		assert_false(barrier.configure(_prepared_fixture()))
+		assert_true(barrier.error.contains("occurrence"))
+	_clear_qualification_environment()
+	OS.set_environment(QualificationBarrier.OCCURRENCE_ENV, "2")
+	var incomplete := QualificationBarrier.new()
+	assert_false(incomplete.configure(_prepared_fixture()))
+	assert_true(incomplete.error.contains("incomplete"))
+	_clear_qualification_environment()
+
+
 func _prepared_fixture() -> Dictionary:
 	return {
 		"from_version": "4.0.0",
@@ -294,5 +344,6 @@ func _clear_qualification_environment() -> void:
 		QualificationBarrier.EFFECT_ENV,
 		QualificationBarrier.WHEN_ENV,
 		QualificationBarrier.TIMEOUT_ENV,
+		QualificationBarrier.OCCURRENCE_ENV,
 	]:
 		OS.unset_environment(name)

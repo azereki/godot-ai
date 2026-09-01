@@ -7,6 +7,41 @@ tree. It supplements the historical
 rather than rewriting that commit-specific evidence. It is not authorization
 to tag, upload, or publish a release.
 
+## Qualification preparation — occurrence selector and operator preflight
+
+The first qualification tranche after `666f3e5` adds explicit occurrence
+selection to the existing activation/coordinator failpoint adapters. The
+controller can now address the second journal commit rather than always
+stopping at the first. Normal update behavior and publication remain unchanged.
+Production delta for this tranche: **+41 / -7, net +34** Python/GDScript lines;
+tests: **+72 / -4, net +68**. The production total is **64,687** lines.
+
+Local development validation (not final candidate qualification):
+
+- Python: **2,260 passed, 9 environment-gated skips**, one existing dependency
+  deprecation warning;
+- Godot 4.7.2: **2,128 passed, 24 platform/environment skips, zero failures**;
+- actual-editor self-update integration: **12 passed**;
+- user-performed Update click in the disposable macOS fixture: version and
+  server advanced, migration completed durably, external backup retained,
+  no new Godot crash report;
+- Ruff, import/parse validation, diff hygiene, and all eleven architecture
+  gates passed.
+
+Operator preflight on 2026-09-01 found `RELEASE_SIGNING_KEY_PEM` present as a
+repository secret, but no environment-scoped key, required reviewer, or
+deployment branch policy on `release-signing`. The last synthetic signing
+check passed, but that does not establish protected signing. Secure custody of
+the original key, the approval identity, and the independent attestation
+channel require operator input. Setup is described in
+[the release runbook](releasing.md#operator-setup-before-candidate-signing).
+
+The complete external failpoint/real-process matrix, measured storm ceilings,
+immutable A/B candidates, qualification/promotion workflow, and both
+attestations remain open. These development results do not satisfy the
+zero-required-skip exact-candidate gate. No final candidate was signed, no key
+was read or changed, and no public artifact was created by this tranche.
+
 ## One-click migration implementation
 
 - implementation commits: `07416ef`, plus the narrow hosted-CI restart

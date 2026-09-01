@@ -26,6 +26,31 @@ rebuild.
 nothing. A green signing check proves only that the stored private key matches
 the embedded public key; it is not release qualification.
 
+### Operator setup before candidate signing
+
+Inspect the live repository configuration; an environment name in YAML does
+not establish that it is protected. The release operator must:
+
+1. Configure `release-signing` with a designated required reviewer and an
+   explicit allowed release-source branch/tag policy. Resolve who dispatches
+   and who approves before enabling prevention of self-review.
+2. Add the **existing** `RELEASE_SIGNING_KEY_PEM` from secure custody as an
+   environment secret. Do not rotate the key: released v3 updaters already
+   trust its public half. GitHub does not return existing secret values.
+3. After verifying the environment copy against the embedded key, remove the
+   repository-scoped copy so jobs cannot bypass the environment approval gate.
+   Retain the original key in secure custody; do not place it in chat, logs,
+   source, or build artifacts.
+4. Name the separately administered attestation surface and its authenticated
+   approval identity before freezing A. A required reviewer on this same
+   repository is not, by itself, that independent trust channel.
+
+See GitHub's [environment protection model](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
+The synthetic signing check publishes no release. Its approval does not approve
+candidate hashes or waive qualification. The environment-copy check must not be
+mistaken for proof that the repository-scoped fallback has been removed; inspect
+both secret-name lists after the change.
+
 ## Exact release asset set
 
 Every stable release exposes exactly six same-version assets. The canonical v4

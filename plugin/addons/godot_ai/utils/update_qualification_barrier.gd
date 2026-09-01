@@ -10,6 +10,7 @@ const TOKEN_ENV := "GODOT_AI_QUALIFICATION_FAILPOINT_TOKEN"
 const EFFECT_ENV := "GODOT_AI_QUALIFICATION_FAILPOINT_EFFECT"
 const WHEN_ENV := "GODOT_AI_QUALIFICATION_FAILPOINT_WHEN"
 const TIMEOUT_ENV := "GODOT_AI_QUALIFICATION_FAILPOINT_TIMEOUT"
+const OCCURRENCE_ENV := "GODOT_AI_QUALIFICATION_FAILPOINT_OCCURRENCE"
 const COORDINATOR_EFFECTS := [
 	"coordinator_disable_request",
 	"coordinator_disable_verified",
@@ -41,7 +42,7 @@ const INVALID := 3
 const RECORD_KEYS := {
 	"coordinator_qualification_capability": [
 		"record", "schema_version", "transaction", "project_root", "install_root",
-		"recovery_root", "effect", "when", "token_sha256",
+		"recovery_root", "effect", "when", "token_sha256", "occurrence",
 	],
 	"coordinator_failpoint_barrier": [
 		"record", "schema_version", "transaction", "project_root", "install_root",
@@ -61,6 +62,7 @@ var _when := ""
 var _timeout_seconds := DEFAULT_TIMEOUT_SECONDS
 var _deadline_msec := 0
 var _sequence := 0
+var _occurrence := 1
 var _spent := false
 var _records_published := false
 var _decision_owned := false
@@ -74,10 +76,17 @@ func configure(prepared: Dictionary) -> bool:
 	var timeout_text := OS.get_environment(TIMEOUT_ENV)
 	var names := [TOKEN_ENV, EFFECT_ENV, WHEN_ENV, TIMEOUT_ENV]
 	var present := names.filter(func(name: String) -> bool: return OS.has_environment(name)).size()
-	if present == 0:
+	if present == 0 and not OS.has_environment(OCCURRENCE_ENV):
 		return true
 	if present != names.size():
 		return _invalid("qualification failpoint environment is incomplete")
+	if OS.has_environment(OCCURRENCE_ENV):
+		var occurrence_text := OS.get_environment(OCCURRENCE_ENV)
+		var occurrence_pattern := RegEx.new()
+		occurrence_pattern.compile("^[1-9][0-9]{0,3}$")
+		if occurrence_pattern.search(occurrence_text) == null:
+			return _invalid("qualification failpoint occurrence must be an integer from 1 to 9999")
+		_occurrence = occurrence_text.to_int()
 	if not _is_lower_hex(_token, 64):
 		return _invalid("qualification failpoint token must be 64 lowercase hex characters")
 	if _effect not in KNOWN_EFFECTS:
@@ -105,7 +114,7 @@ func is_coordinator_effect() -> bool:
 
 
 func clear_environment() -> void:
-	for name in [TOKEN_ENV, EFFECT_ENV, WHEN_ENV, TIMEOUT_ENV]:
+	for name in [TOKEN_ENV, EFFECT_ENV, WHEN_ENV, TIMEOUT_ENV, OCCURRENCE_ENV]:
 		OS.unset_environment(name)
 
 
@@ -115,6 +124,8 @@ func begin(effect: String, when: String) -> bool:
 	if not is_coordinator_effect():
 		return false
 	_sequence += 1
+	if _sequence != _occurrence:
+		return false
 	var root := str(_prepared.recovery_root)
 	var decision_path := root.path_join(DECISION_NAME)
 	if FileAccess.file_exists(decision_path):
@@ -181,6 +192,8 @@ func _identity(record: String, include_sequence: bool) -> Dictionary:
 	}
 	if include_sequence:
 		row.sequence = _sequence
+	else:
+		row.occurrence = _occurrence
 	return row
 
 

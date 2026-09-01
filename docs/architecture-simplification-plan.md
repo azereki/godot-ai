@@ -709,8 +709,8 @@ boundary proof and architecture baseline are retained, but its numeric storm
 latency/resource ceilings remain unresolved. Phases 2-5 and the core Phase-6
 transaction/recovery reducer are present and pass the section-7 mechanical
 gates. Phase 6 is not implementation-complete: the current external failpoint
-adapter covers only a subset of activation and coordinator effects and cannot
-uniquely select repeated effect names. The complete section-8.1 surface and
+adapter covers only a subset of activation and coordinator effects. It now
+selects repeated effect names by explicit occurrence. The complete section-8.1 surface and
 actual process matrix remain required before Phase 7. The phase bullets below
 stay as the approved execution contract rather than being rewritten as a
 release changelog.

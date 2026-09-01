@@ -72,11 +72,13 @@ QUALIFICATION_FAILPOINT_TOKEN_ENV = "GODOT_AI_QUALIFICATION_FAILPOINT_TOKEN"
 QUALIFICATION_FAILPOINT_EFFECT_ENV = "GODOT_AI_QUALIFICATION_FAILPOINT_EFFECT"
 QUALIFICATION_FAILPOINT_WHEN_ENV = "GODOT_AI_QUALIFICATION_FAILPOINT_WHEN"
 QUALIFICATION_FAILPOINT_TIMEOUT_ENV = "GODOT_AI_QUALIFICATION_FAILPOINT_TIMEOUT"
+QUALIFICATION_FAILPOINT_OCCURRENCE_ENV = "GODOT_AI_QUALIFICATION_FAILPOINT_OCCURRENCE"
 QUALIFICATION_FAILPOINT_ENV = (
     QUALIFICATION_FAILPOINT_TOKEN_ENV,
     QUALIFICATION_FAILPOINT_EFFECT_ENV,
     QUALIFICATION_FAILPOINT_WHEN_ENV,
     QUALIFICATION_FAILPOINT_TIMEOUT_ENV,
+    QUALIFICATION_FAILPOINT_OCCURRENCE_ENV,
 )
 ACTIVATE_FAILPOINT_EFFECTS = frozenset(
     {
@@ -199,7 +201,7 @@ RECORD_FIELDS = {
     "migration_complete": "claim_sha256 editor intent_sha256 live_tree transaction",
     "migration_election": "editor install_root project_root transaction",
     "manual_migration_election": "editor install_root marker_sha256 project_root",
-    "qualification_capability": "effect intent_sha256 token_sha256 transaction when",
+    "qualification_capability": "effect intent_sha256 occurrence token_sha256 transaction when",
     "failpoint_barrier": "effect install_root intent_sha256 project_root recovery_root "
     "sequence transaction when",
     "failpoint_decision": "action effect install_root intent_sha256 mac project_root "
@@ -2358,6 +2360,7 @@ class Failpoints:
         row = self._capability(load_record(expected_path))
         expected = {
             "effect": row["effect"],
+            "occurrence": row["occurrence"],
             "intent_sha256": _intent_sha(intent),
             "record": "qualification_capability",
             "schema_version": SCHEMA_VERSION,
@@ -2369,6 +2372,7 @@ class Failpoints:
             _fail("failpoint capability is not bound to this transaction and token")
         self.armed_effect = row["effect"]
         self.armed_when = row["when"]
+        self.armed_occurrence = row["occurrence"]
         self.capability_path = expected_path
 
     @staticmethod
@@ -2377,6 +2381,7 @@ class Failpoints:
         effect = _string(row["effect"], name="capability.effect", pattern=EFFECT)
         if effect not in ACTIVATE_FAILPOINT_EFFECTS:
             _fail("qualification capability effect is not reachable from activate")
+        _integer(row["occurrence"], name="capability.occurrence", minimum=1)
         _string(row["intent_sha256"], name="capability.intent_sha256", pattern=HEX64)
         _string(row["token_sha256"], name="capability.token_sha256", pattern=HEX64)
         _string(row["transaction"], name="capability.transaction", pattern=IDENTIFIER)
@@ -2399,8 +2404,10 @@ class Failpoints:
     def barrier(self, effect: str, when: str) -> None:
         if self.spent or effect != self.armed_effect or when != self.armed_when:
             return
-        self.spent = True
         self.sequence += 1
+        if self.sequence != self.armed_occurrence:
+            return
+        self.spent = True
         barrier_path = self.intent.recovery_root / "failpoint-barrier.json"
         decision_path = self.intent.recovery_root / "failpoint-decision.json"
         barrier_published = False
@@ -2467,6 +2474,7 @@ def write_failpoint_capability(
     effect: str,
     when: str,
     token: bytes,
+    occurrence: int = 1,
 ) -> Path:
     """Arm one local barrier without storing or returning its secret token."""
 
@@ -2475,11 +2483,13 @@ def write_failpoint_capability(
         _fail("qualification capability effect is not reachable from activate")
     if when not in {"before", "after"} or len(token) < 32:
         _fail("failpoint capability requires before/after and a 32-byte token")
+    _integer(occurrence, name="occurrence", minimum=1)
     path = intent.recovery_root / "qualification-capability.json"
     publish_record(
         path,
         {
             "effect": effect,
+            "occurrence": occurrence,
             "intent_sha256": _intent_sha(intent),
             "record": "qualification_capability",
             "schema_version": SCHEMA_VERSION,
@@ -2497,12 +2507,21 @@ def activate_failpoints_from_environment(intent: Intent) -> Failpoints | None:
     values = {name: os.environ.pop(name, None) for name in QUALIFICATION_FAILPOINT_ENV}
     if all(value is None for value in values.values()):
         return None
-    if any(value is None for value in values.values()):
+    if any(
+        value is None
+        for name, value in values.items()
+        if name != QUALIFICATION_FAILPOINT_OCCURRENCE_ENV
+    ):
         _fail("qualification failpoint environment is incomplete")
     token_hex = values[QUALIFICATION_FAILPOINT_TOKEN_ENV]
     effect = values[QUALIFICATION_FAILPOINT_EFFECT_ENV]
     when = values[QUALIFICATION_FAILPOINT_WHEN_ENV]
     timeout_text = values[QUALIFICATION_FAILPOINT_TIMEOUT_ENV]
+    occurrence_text = values[QUALIFICATION_FAILPOINT_OCCURRENCE_ENV]
+    if occurrence_text is None:
+        occurrence_text = "1"
+    if re.fullmatch(r"[1-9][0-9]{0,3}", occurrence_text) is None:
+        _fail("qualification failpoint occurrence must be an integer from 1 to 9999")
     assert token_hex is not None and effect is not None and when is not None
     assert timeout_text is not None
     if HEX64.fullmatch(token_hex) is None:
@@ -2522,7 +2541,9 @@ def activate_failpoints_from_environment(intent: Intent) -> Failpoints | None:
     if effect in COORDINATOR_FAILPOINT_EFFECTS:
         return None
     token = bytes.fromhex(token_hex)
-    capability = write_failpoint_capability(intent, effect=effect, when=when, token=token)
+    capability = write_failpoint_capability(
+        intent, effect=effect, when=when, token=token, occurrence=int(occurrence_text)
+    )
     try:
         return Failpoints(capability, token, intent, timeout=timeout)
     except BaseException:

@@ -322,6 +322,15 @@ Use two real Godot editor processes, not mocked consumers.
 
 ### 8.1 Deterministic barriers
 
+The current activation/coordinator adapter accepts optional process-local
+`GODOT_AI_QUALIFICATION_FAILPOINT_OCCURRENCE` (1–9999, default 1) alongside
+the required token/effect/before-or-after/timeout tuple. It counts matching
+effect/timing crossings, publishes the selected occurrence as `sequence`, and
+authenticates that sequence in the controller response. Unrelated effects do
+not advance the counter. The selector is one-shot and never arms a barrier
+without the complete capability tuple. This closes repeated-effect ambiguity;
+it does not complete the command-path coverage listed below.
+
 Every updater/recovery reducer effect has stable `before_*` and `after_*`
 barrier IDs, including:
 
