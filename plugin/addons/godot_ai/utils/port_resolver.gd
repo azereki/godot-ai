@@ -417,6 +417,17 @@ static func process_fingerprint(pid: int) -> String:
 		) % pid
 		if execute_windows_powershell(script, output) == 0 and not output.is_empty():
 			identity = str(output[0]).strip_edges()
+		if identity.is_empty():
+			## Some restricted Windows hosts expose process start time through
+			## Get-Process while CIM returns no Win32_Process projection. PID +
+			## creation time is the reuse-resistant identity; command-line brand
+			## is checked independently before destructive authority is minted.
+			output.clear()
+			script = (
+				"(Get-Process -Id %d -ErrorAction Stop).StartTime.ToFileTimeUtc()"
+			) % pid
+			if execute_windows_powershell(script, output) == 0 and not output.is_empty():
+				identity = str(output[0]).strip_edges()
 	else:
 		if OS.execute(
 			"ps", ["-ww", "-p", str(pid), "-o", "lstart=", "-o", "args="], output, true

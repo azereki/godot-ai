@@ -111,6 +111,16 @@ def test_owned_launch_waits_boundedly_for_the_exact_process_fingerprint() -> Non
     assert "kill_exact_processes([cleanup_grant], true)" in launch
 
 
+def test_windows_fingerprint_has_a_reuse_resistant_non_cim_fallback() -> None:
+    source = (PLUGIN / "utils" / "port_resolver.gd").read_text()
+    block = get_func_block(source, "static func process_fingerprint(pid: int) -> String:")
+
+    assert "Get-CimInstance Win32_Process" in block
+    assert "Get-Process -Id %d -ErrorAction Stop" in block
+    assert ".StartTime.ToFileTimeUtc()" in block
+    assert '(str(pid) + "|" + identity)' in block
+
+
 def test_replacement_is_bound_to_status_instance_and_exact_process() -> None:
     source = _lifecycle()
     block = get_func_block(source, "func _effect_replace(payload: Dictionary) -> Dictionary:")

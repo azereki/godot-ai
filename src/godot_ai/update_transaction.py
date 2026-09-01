@@ -49,7 +49,7 @@ MAX_RECORD_BYTES = 1_048_576
 MAX_FILES = 20_000
 MAX_TREE_BYTES = 512 * 1024 * 1024
 POLL_SECONDS = 0.02
-WINDOWS_RECORD_OPEN_RETRY_SECONDS = 0.5
+WINDOWS_SHARING_RETRY_SECONDS = 0.5
 DOWNLOAD_LIMITS = {
     ASSET_NAME: MAX_ARCHIVE_SIZE,
     MANIFEST_NAME: MAX_MANIFEST_SIZE,
@@ -385,21 +385,26 @@ def _secure_file(path: Path) -> os.stat_result:
     return info
 
 
-def _load_json_object(path: Path, *, require_canonical: bool) -> dict[str, Any]:
-    before = _secure_file(path)
-    deadline = time.monotonic() + WINDOWS_RECORD_OPEN_RETRY_SECONDS
+def _retry_windows_sharing_denial(operation: Callable[[], Any]) -> Any:
+    deadline = time.monotonic() + WINDOWS_SHARING_RETRY_SECONDS
     while True:
         try:
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            break
+            return operation()
         except PermissionError:
-            # ReplaceFile can expose a short sharing-denial window on Windows
-            # even though the namespace operation is atomic. Retry only that
-            # platform/error pair, for a fixed bound; durable ACL denial still
-            # fails closed with the original exception.
+            # Windows can briefly deny both opening the old destination and
+            # replacing it while another process closes a read handle. Retry
+            # only that platform/error pair, for a fixed bound; durable ACL
+            # denial still fails closed.
             if not _windows() or time.monotonic() >= deadline:
                 raise
             time.sleep(POLL_SECONDS)
+
+
+def _load_json_object(path: Path, *, require_canonical: bool) -> dict[str, Any]:
+    before = _secure_file(path)
+    fd = _retry_windows_sharing_denial(
+        lambda: os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    )
     with os.fdopen(fd, "rb") as stream:
         opened = os.fstat(stream.fileno())
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
@@ -464,7 +469,7 @@ def _store_record(path: Path, row: Mapping[str, Any], *, replace: bool) -> None:
     temporary = _write_temp(path.parent, canonical_json(row))
     try:
         if replace:
-            os.replace(temporary, path)
+            _retry_windows_sharing_denial(lambda: os.replace(temporary, path))
         else:
             os.link(temporary, path)
             temporary.unlink()

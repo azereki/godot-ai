@@ -119,6 +119,12 @@ def _wait_until(predicate: Any, timeout: float = 90.0) -> None:
         time.sleep(0.01)
 
 
+def _wait_for_phase(scenario: Scenario, actor: Actor, phase: str) -> None:
+    _wait_until(lambda: actor.error is not None or _phase(scenario) == phase)
+    if actor.error is not None:
+        raise actor.error
+
+
 def _manual_marker(project: Path) -> tuple[Path, dict[str, Any]]:
     state = project / ".godot"
     state.mkdir(mode=0o700, exist_ok=True)
@@ -163,7 +169,7 @@ class Actor:
 
 def _claim_success_without_migration(scenario: Scenario) -> dict[str, Any]:
     actor = Actor(scenario.intent, readiness_timeout=2, claim_timeout=2)
-    _wait_until(lambda: _phase(scenario) == "stage_live")
+    _wait_for_phase(scenario, actor, "stage_live")
     tx.write_readiness(scenario.intent)
     _wait_until(lambda: os.path.lexists(_paths(scenario).result))
     tx.claim_result(scenario.intent)
@@ -229,7 +235,7 @@ def test_identity_command_reports_exact_actor_identity_without_inputs(
 def test_success_swaps_exact_trees_retains_backup_and_requires_claim(tmp_path: Path) -> None:
     scenario = _scenario(tmp_path)
     actor = Actor(scenario.intent, readiness_timeout=5, claim_timeout=5)
-    _wait_until(lambda: _phase(scenario) == "stage_live")
+    _wait_for_phase(scenario, actor, "stage_live")
 
     tx.write_readiness(scenario.intent)
     paths = _paths(scenario)
@@ -251,7 +257,7 @@ def test_success_swaps_exact_trees_retains_backup_and_requires_claim(tmp_path: P
 def test_initiating_startup_barrier_writes_readiness_and_claims(tmp_path: Path) -> None:
     scenario = _scenario(tmp_path)
     actor = Actor(scenario.intent, readiness_timeout=2, claim_timeout=2)
-    _wait_until(lambda: _phase(scenario) == "stage_live")
+    _wait_for_phase(scenario, actor, "stage_live")
 
     outcome = tx.startup_barrier(
         scenario.project,
@@ -271,7 +277,7 @@ def test_initiating_startup_barrier_writes_readiness_and_claims(tmp_path: Path) 
 def test_startup_retry_finishes_claim_published_before_lock_release(tmp_path: Path) -> None:
     scenario = _scenario(tmp_path)
     actor = Actor(scenario.intent, readiness_timeout=2, claim_timeout=2)
-    _wait_until(lambda: _phase(scenario) == "stage_live")
+    _wait_for_phase(scenario, actor, "stage_live")
     tx.write_readiness(scenario.intent)
     _wait_until(lambda: os.path.lexists(_paths(scenario).result))
     with pytest.raises(SimulatedCrash, match="result_to_claim:after"):
@@ -348,7 +354,7 @@ def test_second_editor_cannot_cross_post_census_pre_rename_window(
         assert not (scenario.recovery / "editor-leases" / "late-editor-01234567.json").exists()
 
         release.set()
-        _wait_until(lambda: _phase(scenario) == "stage_live")
+        _wait_for_phase(scenario, actor, "stage_live")
         outcome = tx.startup_barrier(
             scenario.project,
             scenario.install,
@@ -463,7 +469,7 @@ def test_successful_claim_replays_m6_across_every_editor_crash_window(
 ) -> None:
     scenario = _scenario(tmp_path)
     actor = Actor(scenario.intent, readiness_timeout=2, claim_timeout=2)
-    _wait_until(lambda: _phase(scenario) == "stage_live")
+    _wait_for_phase(scenario, actor, "stage_live")
     claimed = tx.startup_barrier(
         scenario.project,
         scenario.install,
@@ -730,7 +736,7 @@ def test_complete_migration_cli_returns_the_bound_actor_envelope(
 ) -> None:
     scenario = _scenario(tmp_path)
     actor = Actor(scenario.intent, readiness_timeout=2, claim_timeout=2)
-    _wait_until(lambda: _phase(scenario) == "stage_live")
+    _wait_for_phase(scenario, actor, "stage_live")
     tx.write_readiness(scenario.intent)
     _wait_until(lambda: os.path.lexists(_paths(scenario).result))
     tx.claim_result(scenario.intent)
@@ -1723,7 +1729,7 @@ def test_migration_completion_publication_crash_is_fail_closed_and_recoverable(
 ) -> None:
     scenario = _scenario(tmp_path, f"migration-complete-{when}-012345")
     actor = Actor(scenario.intent, readiness_timeout=2, claim_timeout=2)
-    _wait_until(lambda: _phase(scenario) == "stage_live")
+    _wait_for_phase(scenario, actor, "stage_live")
     tx.write_readiness(scenario.intent)
     _wait_until(lambda: os.path.lexists(_paths(scenario).result))
     tx.claim_result(scenario.intent)
@@ -1927,7 +1933,7 @@ def test_every_mutation_barrier_leaves_an_exact_repairable_tree(
             claim_timeout=5,
             failpoints=barrier if effect == "result_commit" else None,
         )
-        _wait_until(lambda: _phase(scenario) == "stage_live")
+        _wait_for_phase(scenario, actor, "stage_live")
         try:
             tx.write_readiness(
                 scenario.intent,
@@ -2272,7 +2278,7 @@ def test_published_journal_sync_error_keeps_repair_authority(
 def test_repair_finishes_success_after_claim_rename_crash(tmp_path: Path) -> None:
     scenario = _scenario(tmp_path)
     actor = Actor(scenario.intent, readiness_timeout=2, claim_timeout=1)
-    _wait_until(lambda: _phase(scenario) == "stage_live")
+    _wait_for_phase(scenario, actor, "stage_live")
     tx.write_readiness(scenario.intent)
     paths = _paths(scenario)
     _wait_until(lambda: os.path.lexists(paths.result))
@@ -3250,6 +3256,29 @@ def test_windows_record_read_retries_a_transient_replace_sharing_denial(
     monkeypatch.setattr(tx, "_windows", lambda: True)
     monkeypatch.setattr(tx.os, "open", flaky_open)
     assert tx.load_record(path) == {"value": 1}
+    assert attempts == 1
+
+
+def test_windows_record_replace_retries_a_transient_reader_sharing_denial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _mkdir(tmp_path / "private")
+    path = directory / "record.json"
+    tx.publish_record(path, {"value": 1})
+    real_replace = tx.os.replace
+    attempts = 0
+
+    def flaky_replace(source: Any, target: Any) -> None:
+        nonlocal attempts
+        if Path(target) == path and attempts == 0:
+            attempts += 1
+            raise PermissionError("simulated Windows reader sharing window")
+        real_replace(source, target)
+
+    monkeypatch.setattr(tx, "_windows", lambda: True)
+    monkeypatch.setattr(tx.os, "replace", flaky_replace)
+    tx.replace_record(path, {"value": 2})
+    assert tx.load_record(path) == {"value": 2}
     assert attempts == 1
 
 
