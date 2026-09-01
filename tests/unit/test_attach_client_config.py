@@ -43,7 +43,7 @@ _UVX_POLICY_AND_ENTRYPOINT = [
     "--link-mode",
     "copy",
     "--from",
-    "godot-ai==4.0.0",
+    "godot-ai==3.0.6",
     "godot-ai",
     "attach",
 ]
