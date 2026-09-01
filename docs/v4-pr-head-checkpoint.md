@@ -7,6 +7,37 @@ tree. It supplements the historical
 rather than rewriting that commit-specific evidence. It is not authorization
 to tag, upload, or publish a release.
 
+## Signing and attestation setup — owner-approved boundary
+
+The owner approved the narrower repository/credential separation model on
+2026-09-01. The public
+[attestation repository](https://github.com/dsarno/godot-ai-release-attestations)
+now exists; its bootstrap is commit `c39ec40245e83aa2143a0e4361a97eee48407563`.
+API readback confirmed `dsarno` is the only collaborator, no deploy keys,
+Actions disabled, and main-branch force-push/deletion blocked (including
+administrators). This unsigned bootstrap is not a candidate approval or a
+separate cryptographic identity; the GitHub owner/provider remain trusted.
+
+`release-signing` now requires `dsarno` approval, disallows administrator
+bypass, and permits only the `main` and `v4/architecture-simplification`
+branches. Self-review is allowed because the owner may dispatch and approve.
+The existing key is still repository-scoped. The opt-in transfer in
+`verify-signing.yml` needs the operator's short-lived environment-write token;
+no key was rotated, retrieved, or copied during setup. The source secret must
+remain until the destination copy passes a fresh signing verification.
+Afterward remove the source fallback, delete/revoke the temporary credential,
+and retire the transfer step. See the [operator runbook](releasing.md#operator-setup-before-candidate-signing).
+
+The prior occurrence-selector commit `531f1bf` passed **32/32 hosted CI jobs**
+in [run 33556567537](https://github.com/hi-godot/godot-ai/actions/runs/33556567537).
+Setup-batch local validation: Ruff clean; Python **2,266 passed, 9 skipped**;
+Godot-backed updater **12 passed**; isolated live Godot **2,128 passed,
+24 platform/environment skips, 0 failed**. The first Python run caught two
+missing explicit UTF-8 encodings in the new test; both were fixed and the
+complete suite rerun successfully. These are development checks, not immutable
+release-candidate qualification. The live signing transfer is still pending.
+No final A/B candidates, release approval, or publication exist yet.
+
 ## Qualification preparation — occurrence selector and operator preflight
 
 The first qualification tranche after `666f3e5` adds explicit occurrence

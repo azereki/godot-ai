@@ -17,7 +17,7 @@ complete add-on tree, updates owned client entries, and restarts the matching
 managed server automatically.
 
 The public v4 release is not available yet: publication remains fail-closed
-until its immutable cross-platform qualification and independent attestation
+until its immutable cross-platform qualification and release attestation
 are complete. The steps above describe the supported flow once publication
 opens. Do not install an unpublished candidate into a real project.
 
@@ -105,5 +105,9 @@ no-config/no-build uv arguments with official PyPI named explicitly.
 
 This still relies on the installed `uv` executable/cache, PyPI/TLS delivery,
 and same-user machine integrity. GitHub release notes are mutable and are not
-a trust anchor. Public migration remains closed until the release runbook
-names and verifies the independent attestation for the exact promoted bytes.
+a trust anchor. Approval records will be published in
+[dsarno/godot-ai-release-attestations](https://github.com/dsarno/godot-ai-release-attestations),
+where godot-ai release automation must have no write access. This separates repository
+credentials, not the GitHub provider or owner account. Its bootstrap README
+does not approve a release; public migration remains closed until the exact
+promoted bytes have passed qualification and received a commit-pinned approval.

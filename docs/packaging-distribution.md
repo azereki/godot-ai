@@ -91,10 +91,10 @@ installed.
 
 `script/v4-release` deliberately loads the exact sibling
 `src/godot_ai/release_verify.py` by file path. It does not trust an installed
-`godot-ai` package. GitHub release notes are mutable and cannot independently
-authenticate assets delivered by the same account. Before publication, a
-separately administered attestation channel named by the migration guide must
-bind:
+`godot-ai` package. GitHub release notes are mutable and cannot authenticate
+assets against a release publisher who can replace those notes. Before
+publication, the [owner-approved, separately permissioned attestation channel](releasing.md#attestation-channel-and-approved-threat-boundary)
+must bind:
 
 - both verifier file SHA-256 values;
 - their exact source commit;
@@ -136,9 +136,12 @@ architecture rather than another self-reported hash. Exact critical pins still
 fail before FastMCP import when resolution merely drifts; noncritical
 transitive drift remains an accepted packaging risk.
 
-It must also authenticate its own signing identity. Until that channel is
-operational and verified in retained qualification evidence, publication and
-public migration remain closed.
+The channel authenticates approval through the known canonical attestation
+repository and the `dsarno` account, not a second cryptographic signing key.
+Compromise of that account or GitHub is outside the approved guarantee.
+Its bootstrap record is published; exact-candidate approval and verification
+of the permission boundary in retained qualification evidence remain required.
+Publication and public migration remain closed until those gates pass.
 
 The v4 SPKI fingerprint compiled into both standalone and in-plugin verification
 is:
@@ -178,7 +181,7 @@ publication remain unqualified until their retained evidence is reviewed.
 - [ ] Every qualification row records the complete resolved distribution
       artifact set; startup proves the exact behavior-defining dependency pins.
 - [ ] The embedded updater key and standalone verifier key are identical; the
-      SPKI fingerprint matches the independent publication surface.
+      SPKI fingerprint matches the separately permissioned attestation surface.
 - [ ] One-click final-v3-to-v4 migration proves both signature layers, an
       external retained backup, graceful editor restart/lease transfer,
       automatic client repin/server start, and the exact signed live tree.

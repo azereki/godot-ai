@@ -109,13 +109,23 @@ engine runtime coverage.
 
 ## 5. Bootstrap verifier and bridge migration
 
-### 5.1 Independent trust root
+### 5.1 Separately permissioned trust channel
 
 v4.0 uses the existing release-signing key. The migration instructions obtain
 the small verifier from the exact immutable v4 release source commit. At least
-one independently administered surface, not mutable with GitHub release assets,
+one separately permissioned surface, not writable with release-publisher credentials,
 authenticates that commit, both verifier-file digests, every release-asset
 identity, and the expected public-key fingerprint.
+
+The owner-approved channel is
+[dsarno/godot-ai-release-attestations](https://github.com/dsarno/godot-ai-release-attestations),
+with `dsarno` as approver. Follow the
+[runbook's approved boundary](releasing.md#attestation-channel-and-approved-threat-boundary):
+no godot-ai automation write credential there, owner-only writes, Actions off,
+and commit-pinned approval records. This is independent of scoped release-asset
+mutation, not independent administration. The shared GitHub provider and owner
+account are explicit trust roots. Qualification must retain the permission
+checks and prove the release credential cannot write the attestation channel.
 
 The verifier uses the user's Godot executable or another already-required
 runtime; it does not download executable dependencies during verification. It

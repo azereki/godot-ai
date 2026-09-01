@@ -170,6 +170,9 @@ POSIX other-user claims apply only where owner, mode, and link checks succeed.
 
 - compromise of the release-signing key, protected signing workflow, trusted
   repository source, or required approver;
+- compromise of the `dsarno` GitHub account or GitHub itself: the approved
+  attestation channel is a separately permissioned repository, not independent
+  administration or a separate hosting trust root;
 - compromise of PyPI's index/artifact service or TLS delivery, the selected
   `uv` executable/cache, or the exact `godot-ai` wheel served under an approved
   version; plugin signing does not independently bind later-resolved wheel
@@ -500,7 +503,9 @@ complete temporary/old tree and renames only the exact canonical stage live.
 First v4 startup broadly replaces owned pre-v4 client entries, durably records
 completion, and starts the managed server without a second confirmation.
 
-The separately administered attestation still binds the source commit, both
+The owner-approved, separately permissioned attestation channel documented in
+[the release runbook](releasing.md#attestation-channel-and-approved-threat-boundary)
+still binds the source commit, both
 verifier-file digests, all six release assets, Python-package artifacts,
 qualification dependency inventories, and signing-key fingerprint. A capsule
 is transitional delivery code, not authority to weaken canonical verification

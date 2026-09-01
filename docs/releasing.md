@@ -34,22 +34,56 @@ not establish that it is protected. The release operator must:
 1. Configure `release-signing` with a designated required reviewer and an
    explicit allowed release-source branch/tag policy. Resolve who dispatches
    and who approves before enabling prevention of self-review.
-2. Add the **existing** `RELEASE_SIGNING_KEY_PEM` from secure custody as an
-   environment secret. Do not rotate the key: released v3 updaters already
-   trust its public half. GitHub does not return existing secret values.
+2. Add the **existing** `RELEASE_SIGNING_KEY_PEM` as an environment secret,
+   from secure custody or the approved transfer below. Do not rotate the key:
+   released v3 updaters already trust its public half. GitHub's UI/API returns
+   secret metadata, not the stored value; an authorized Actions job can use it.
 3. After verifying the environment copy against the embedded key, remove the
    repository-scoped copy so jobs cannot bypass the environment approval gate.
    Retain the original key in secure custody; do not place it in chat, logs,
    source, or build artifacts.
-4. Name the separately administered attestation surface and its authenticated
-   approval identity before freezing A. A required reviewer on this same
-   repository is not, by itself, that independent trust channel.
+4. Verify the separately permissioned attestation channel below before freezing
+   A. A reviewer on the release repository alone does not establish that boundary.
 
 See GitHub's [environment protection model](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
 The synthetic signing check publishes no release. Its approval does not approve
 candidate hashes or waive qualification. The environment-copy check must not be
 mistaken for proof that the repository-scoped fallback has been removed; inspect
 both secret-name lists after the change.
+
+When the only available copy is the repository secret, use the opt-in
+`copy_key_to_environment` input of `verify-signing.yml`. Supply a short-lived
+fine-grained token for **hi-godot/godot-ai only**, with **Environments: write**,
+as the `release-signing` environment secret `RELEASE_KEY_MIGRATION_TOKEN`.
+Never copy a broad account token into the workflow. The transfer runs only after
+human environment approval and successful synthetic signature verification;
+it passes the PEM on standard input to GitHub's secret writer, refuses to
+overwrite an existing environment key, and uploads no artifacts. It does not
+delete the source key. Run verification again with the copy option off before
+removing the repository fallback. Then delete the temporary token secret,
+revoke the token at its issuer, and retire the transfer step. No release is
+signed or approved by this bootstrap operation.
+
+### Attestation channel and approved threat boundary
+
+The owner approved [dsarno/godot-ai-release-attestations](https://github.com/dsarno/godot-ai-release-attestations)
+on 2026-09-01. Its [bootstrap record](https://github.com/dsarno/godot-ai-release-attestations/blob/c39ec40245e83aa2143a0e4361a97eee48407563/README.md)
+names `dsarno`, the existing SPKI fingerprint, and the boundary; it is **not**
+an approval of any candidate. Cite future approval records by full commit SHA.
+
+This is credential/repository separation, not independent administration.
+The attestation repo is public, owner-write-only, has Actions disabled and no
+deploy keys, and protects its main history from force-push/deletion. Do not
+grant godot-ai release workflows a credential that can write there. Recheck
+those controls and actual release credential scope at qualification time.
+Compromise of `dsarno`, GitHub, the signing key, or the trusted approval process
+remains outside this guarantee; GitHub account identity and the known canonical
+attestation repository are accepted bootstrap trust roots.
+
+The `release-signing` environment requires approval by `dsarno`, permits only
+the `main` and `v4/architecture-simplification` branches, and disallows admin
+bypass. Self-review remains allowed because dispatch and approval may both use
+`dsarno`; this is one human approval checkpoint, not a two-person rule.
 
 ## Exact release asset set
 
@@ -125,11 +159,12 @@ python3 script/v4-release verify \
 The standalone migration verifier is exactly `script/v4-release` plus
 `src/godot_ai/release_verify.py` from the named source commit. GitHub release
 notes are mutable and must not be treated as a trust anchor. Before publication,
-a separately administered channel must authenticate the source commit, both
-verifier digests, all six asset identities, the embedded public-key SPKI
-fingerprint, and its own attestation identity. The migration guide must name
-that operational channel; until it does, publication stays closed. The two
-verifier files and repository documentation are not their own trust anchor.
+the separately permissioned channel described above must authenticate the source
+commit, both verifier digests, all six asset identities, the embedded public-key
+SPKI fingerprint, and its approved attestation identity. The migration guide
+names that channel; exact-candidate approval and retained permission checks
+remain required before publication. The two verifier files and repository
+documentation are not their own trust anchor.
 
 ## V3-to-v4 bridge transaction
 
