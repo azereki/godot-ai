@@ -48,6 +48,10 @@ def find_godot() -> str:
     for candidate in (
         os.environ.get("GODOT_BIN"),
         os.environ.get("GODOT4_BIN"),
+        ## setup-godot exports these extensionless launcher paths. Git Bash
+        ## resolves them, but Windows shutil.which("godot") does not.
+        os.environ.get("GODOT"),
+        os.environ.get("GODOT4"),
         "godot",
         "Godot",
     ):

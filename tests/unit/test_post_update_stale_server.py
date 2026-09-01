@@ -35,6 +35,18 @@ def test_stale_server_smoke_uses_a_capability_safe_temp_root() -> None:
         assert record_path(18128, Path(raw)).parent == Path(raw)
 
 
+def test_stale_server_smoke_accepts_setup_godot_launcher_env(monkeypatch, tmp_path) -> None:
+    launcher = tmp_path / "godot"
+    launcher.touch()
+    for name in ("GODOT_BIN", "GODOT4_BIN", "GODOT4"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GODOT", str(launcher))
+
+    module = runpy.run_path(str(STALE_SERVER_SMOKE))
+
+    assert module["find_godot"]() == str(launcher)
+
+
 def test_stale_server_requires_a_fresh_explicit_replacement_action() -> None:
     source = _lifecycle()
     start = get_func_block(source, "func start_server() -> void:")
