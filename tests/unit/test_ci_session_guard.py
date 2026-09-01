@@ -298,8 +298,12 @@ def test_quit_runner_fails_closed_when_session_status_query_fails() -> None:
 
 def test_reload_runner_handles_plugin_managed_transport_rotation() -> None:
     source = (ROOT / "script" / "ci-reload-test").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     managed_reconnect = source[
         source.index("wait_for_managed_reload()") : source.index("accept_reload_result()")
+    ]
+    reload_step = workflow[
+        workflow.index("- name: Reload smoke test") : workflow.index("- name: Quit smoke test")
     ]
 
     assert 'status == "reloaded"' in source
@@ -308,6 +312,7 @@ def test_reload_runner_handles_plugin_managed_transport_rotation() -> None:
     assert "readonly MANAGED_RELOAD_TIMEOUT_SECONDS=60" in source
     assert "readonly MCP_CALL_TIMEOUT_SECONDS=90" in source
     assert '--max-time "$MCP_CALL_TIMEOUT_SECONDS"' in source
+    assert "timeout-minutes: 5" in reload_step
     assert '[ "$HTTP_AUTH_CAPABILITY" != "$old_capability" ]' in managed_reconnect
     assert "refresh_http_headers" in managed_reconnect
     assert "initialize_mcp_session" in managed_reconnect

@@ -217,7 +217,10 @@ jobs:
 
       - name: Reload smoke test
         shell: bash
-        timeout-minutes: 2
+        ## Ten Windows reload/import cycles consume roughly two minutes before
+        ## the post-reload suite begins. Keep the outer step budget above the
+        ## script's independent 90-second MCP-call ceiling.
+        timeout-minutes: 5
         run: bash script/ci-reload-test
 
       - name: Quit smoke test
