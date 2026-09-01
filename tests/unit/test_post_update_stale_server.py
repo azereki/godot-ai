@@ -112,7 +112,7 @@ def test_owned_launch_waits_boundedly_for_the_exact_process_fingerprint() -> Non
 
 
 def test_windows_fingerprint_has_a_reuse_resistant_non_cim_fallback() -> None:
-    source = (PLUGIN / "utils" / "port_resolver.gd").read_text()
+    source = (PLUGIN / "utils" / "port_resolver.gd").read_text(encoding="utf-8")
     block = get_func_block(source, "static func process_fingerprint(pid: int) -> String:")
 
     assert "Get-CimInstance Win32_Process" in block
