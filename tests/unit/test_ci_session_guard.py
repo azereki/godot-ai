@@ -306,6 +306,8 @@ def test_reload_runner_handles_plugin_managed_transport_rotation() -> None:
     assert 'status == "reload_initiated"' in source
     assert 'content.get("transport_will_drop") is not True' in source
     assert "readonly MANAGED_RELOAD_TIMEOUT_SECONDS=60" in source
+    assert "readonly MCP_CALL_TIMEOUT_SECONDS=90" in source
+    assert '--max-time "$MCP_CALL_TIMEOUT_SECONDS"' in source
     assert '[ "$HTTP_AUTH_CAPABILITY" != "$old_capability" ]' in managed_reconnect
     assert "refresh_http_headers" in managed_reconnect
     assert "initialize_mcp_session" in managed_reconnect

@@ -17,6 +17,7 @@ SERVER_URL="$MCP_SERVER_URL"
 ci_load_http_auth
 readonly MANAGED_RELOAD_TIMEOUT_SECONDS=60
 readonly MANAGED_RELOAD_POLL_SECONDS=0.5
+readonly MCP_CALL_TIMEOUT_SECONDS=90
 HEADERS=()
 SESSION_ID=""
 REQ_ID=0
@@ -67,7 +68,7 @@ mcp_call() {
   fi
   REQ_ID=$((REQ_ID + 1))
   local raw
-  raw=$(curl -s --max-time 30 "$SERVER_URL" -X POST "${HEADERS[@]}" \
+  raw=$(curl -s --max-time "$MCP_CALL_TIMEOUT_SECONDS" "$SERVER_URL" -X POST "${HEADERS[@]}" \
     -H "Mcp-Session-Id: $SESSION_ID" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":$REQ_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}")
   echo "$raw" | python3 -c "
