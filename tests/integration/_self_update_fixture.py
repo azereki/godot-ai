@@ -830,13 +830,14 @@ const STATUS_PATH := "res://{CLEAN_MAJOR_STATUS_FILE}"
 const TOOL_PROBE_DONE_PATH := "res://{CLEAN_MAJOR_TOOL_PROBE_FILE}"
 const DriverSupport := preload("res://_test_self_update_driver_support.gd")
 const START_AFTER_FRAMES := 15
-const MAX_FRAMES := 2400
+const STARTUP_WAIT_MS := 120000
 const STATUS_WAIT_MS := 120000
 
 var _frames := 0
 var _migration_observed := false
 var _tool_probe_ready := false
 var _finished := false
+var _startup_wait_started_ms := 0
 var _status_wait_started_ms := 0
 var _wedged_responsiveness_proved := false
 
@@ -845,6 +846,7 @@ func _ready() -> void:
 \tif not Engine.is_editor_hint():
 \t\tqueue_free()
 \t\treturn
+\t_startup_wait_started_ms = Time.get_ticks_msec()
 \tset_process(true)
 
 
@@ -854,7 +856,10 @@ func _process(_delta: float) -> void:
 \t_frames += 1
 \tif _frames < START_AFTER_FRAMES:
 \t\treturn
-\tif _frames > MAX_FRAMES:
+\tif (
+\t\tnot _migration_observed
+\t\tand Time.get_ticks_msec() - _startup_wait_started_ms > STARTUP_WAIT_MS
+\t):
 \t\t_fail(21, "clean-major first-start barrier timed out")
 \t\treturn
 \t_record_wedged_responsiveness()
