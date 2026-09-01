@@ -346,13 +346,22 @@ func _complete_launch(result: Dictionary) -> void:
 
 func _complete_prove(result: Dictionary) -> void:
 	if bool(result.get("pending", false)):
+		_episode["proof_pending_reason"] = str(result.get("reason", "unknown"))
 		if Time.get_ticks_msec() >= int(_episode.get("prove_deadline_msec", 0)):
-			_block("proof_timeout", "The managed server did not publish valid capabilities in time.")
+			_block(
+				"proof_timeout",
+				"The managed server proof timed out at %s."
+				% str(_episode.get("proof_pending_reason", "unknown")),
+			)
 			return
 		_retry_effect_after(PROVE, _prove_payload(), 0.15)
 		return
 	if not bool(result.get("ok", false)):
-		_block(str(result.get("reason", "proof_failed")), str(result.get("message", "Managed server proof failed.")))
+		var message := str(result.get("message", "Managed server proof failed."))
+		var pending_reason := str(_episode.get("proof_pending_reason", ""))
+		if not pending_reason.is_empty():
+			message += " Last pending proof: %s." % pending_reason
+		_block(str(result.get("reason", "proof_failed")), message)
 		return
 	var launch: Dictionary = _episode.get("launch", {})
 	var pid := int(result.get("pid", 0))
@@ -660,15 +669,15 @@ func _effect_prove(payload: Dictionary) -> Dictionary:
 	var port := int(payload.http_port)
 	var capability := _read_capability(port)
 	if capability.is_empty() or str(capability.get("instance_nonce", "")) == str(payload.get("baseline_instance_id", "")):
-		return {"pending": true}
+		return {"pending": true, "reason": "capability_record"}
 	if (
 		str(capability.get("http", "")) != str(payload.get("http_capability", ""))
 		or str(capability.get("websocket", "")) != str(payload.get("ws_capability", ""))
 	):
-		return {"pending": true}
+		return {"pending": true, "reason": "capability_pair"}
 	var live := _probe_with_capability(port, capability, int(payload.timeout_ms))
 	if not _authenticated_status_matches_record(live, capability):
-		return {"pending": true}
+		return {"pending": true, "reason": "authenticated_status"}
 	var version := str(live.get("version", ""))
 	var ws_port := int(live.get("ws_port", 0))
 	if not _server_status_compatibility(
@@ -676,16 +685,17 @@ func _effect_prove(payload: Dictionary) -> Dictionary:
 	).get("compatible", false):
 		return {"ok": false, "reason": "incompatible", "message": "The launched server does not match this plugin."}
 	var pid := PortResolver.read_pid_file(str(payload.get("pid_file", "")))
-	if (
-		pid <= 1
-		or not PortResolver.find_all_pids_on_port(port).has(pid)
-		or not PortResolver.pid_cmdline_is_godot_ai(pid)
-		or not PortResolver.process_descends_from(pid, launch_pid)
-	):
-		return {"pending": true}
+	if pid <= 1:
+		return {"pending": true, "reason": "pid_file"}
+	if not PortResolver.find_all_pids_on_port(port).has(pid):
+		return {"pending": true, "reason": "listener_pid"}
+	if not PortResolver.pid_cmdline_is_godot_ai(pid):
+		return {"pending": true, "reason": "process_brand"}
+	if not PortResolver.process_descends_from(pid, launch_pid):
+		return {"pending": true, "reason": "launch_lineage"}
 	var fingerprint := PortResolver.process_fingerprint(pid)
 	if fingerprint.is_empty():
-		return {"pending": true}
+		return {"pending": true, "reason": "process_fingerprint"}
 	## Close every capture window before minting process authority. The same
 	## launch-lineage PID must still own the listener, the private capability
 	## record must still name the authenticated instance, and the process
@@ -701,7 +711,7 @@ func _effect_prove(payload: Dictionary) -> Dictionary:
 		or not _authenticated_status_matches_record(final_live, final_capability)
 		or str(final_live.get("instance_id", "")) != str(live.get("instance_id", ""))
 	):
-		return {"pending": true}
+		return {"pending": true, "reason": "final_capture_window"}
 	var final_version := str(final_live.get("version", ""))
 	var final_ws_port := int(final_live.get("ws_port", 0))
 	if not _server_status_compatibility(

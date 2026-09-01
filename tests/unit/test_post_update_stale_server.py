@@ -161,6 +161,8 @@ def test_owned_launch_mints_transport_only_from_the_final_compatible_probe() -> 
     assert 'var final_ws_port := int(final_live.get("ws_port", 0))' in prove
     assert '"version": final_version' in prove
     assert "_transport_from(port, final_ws_port, final_live, final_capability)" in prove
+    assert '"reason": "listener_pid"' in prove
+    assert '"reason": "final_capture_window"' in prove
 
 
 def test_lifecycle_has_one_episode_and_no_generic_host_edge() -> None:
