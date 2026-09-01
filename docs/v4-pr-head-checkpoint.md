@@ -9,11 +9,12 @@ to tag, upload, or publish a release.
 
 ## One-click migration implementation
 
-- implementation commit: `07416ef`
+- implementation commits: `07416ef`, plus the narrow hosted-CI restart
+  correction `7ba82b0`
 - permanent production tree: `64,653` physical Python/GDScript lines
   (`44,650` GDScript and `20,003` Python across 259 files)
 - permanent-production delta from the `59,859` baseline: **+4,794 lines**
-- temporary signed migration bridge: `701` GDScript lines, packaged only in the
+- temporary signed migration bridge: `706` GDScript lines, packaged only in the
   v3 transition capsule and absent from the canonical/live v4 tree
 
 This change deliberately adds a narrow compatibility capsule rather than
@@ -27,8 +28,10 @@ Local exact-commit evidence includes 2,250 passing Python tests (9 environment-
 gated skips), all 12 Godot self-update integration rows (including the exact
 v3.2.4 button-click path), Godot 4.5/4.6 runtime-and-bridge refusal/no-mutation
 smokes, GDScript import validation, Ruff, diff hygiene, and all architecture
-simplification gates. Hosted exact-head evidence is intentionally not claimed
-until CI completes on the pushed commit.
+simplification gates. The restart correction additionally passed the exact
+button-click smoke, 4.5/4.6 refusal smokes, five focused transaction/release
+tests, and 31 workflow-policy tests. Hosted exact-head evidence is intentionally
+not claimed until CI completes on the pushed commit.
 
 ## Prior reviewed head
 
