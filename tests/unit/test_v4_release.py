@@ -50,7 +50,11 @@ def _keys(root: Path, name: str = "release") -> tuple[Path, str]:
         "-out",
         str(private),
     )
-    public = _run("openssl", "pkey", "-in", str(private), "-pubout").decode("ascii")
+    public = (
+        _run("openssl", "pkey", "-in", str(private), "-pubout")
+        .decode("ascii")
+        .replace("\r\n", "\n")
+    )
     return private, public
 
 

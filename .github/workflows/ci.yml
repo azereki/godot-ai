@@ -319,6 +319,8 @@ jobs:
         run: |
           echo "===== godot-stale-smoke.log (last 500 lines) ====="
           tail -n 500 godot-stale-smoke.log || echo "(log not found)"
+          echo "===== stale-occupant.log (last 200 lines) ====="
+          tail -n 200 stale-occupant.log || echo "(log not found)"
           echo "===== godot-import.log (last 200 lines) ====="
           tail -n 200 godot-import.log || echo "(log not found)"
 

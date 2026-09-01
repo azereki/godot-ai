@@ -13,6 +13,7 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
 from godot_ai.transport.capability import CAPABILITY_DIR_ENV, read_capabilities
+from tests.conftest import allocate_free_ports
 from tests.integration._self_update_fixture import (
     CLEAN_MAJOR_MARKER_RELATIVE,
     CLEAN_MAJOR_STATUS_FILE,
@@ -147,7 +148,10 @@ def test_client_configuration_prep_is_removed_before_signed_swap(tmp_path: Path)
 
 
 def _install_clean_major_fixture(
-    tmp_path: Path, target_version: str
+    tmp_path: Path,
+    target_version: str,
+    http_port: int = LIVE_HTTP_PORT,
+    ws_port: int = LIVE_WS_PORT,
 ) -> tuple[Path, Path, Path, Path]:
     from_version = "3.2.4"
     project = tmp_path / "clean-major-migration"
@@ -162,12 +166,12 @@ def _install_clean_major_fixture(
         codex_home=codex_home,
         from_version=from_version,
         target_version=target_version,
-        http_port=LIVE_HTTP_PORT,
-        ws_port=LIVE_WS_PORT,
+        http_port=http_port,
+        ws_port=ws_port,
     )
     write_clean_major_driver(
         project,
-        http_port=LIVE_HTTP_PORT,
+        http_port=http_port,
         from_version=from_version,
         target_version=target_version,
     )
@@ -349,6 +353,7 @@ def test_signed_update_restarts_matching_live_server_without_parse_errors(
     godot_bin = godot_bin_or_skip()
     smoke = load_smoke_script()
     project = tmp_path / "signed-self-update"
+    http_port, ws_port = allocate_free_ports(2)
     base_version = read_plugin_version(PLUGIN_ROOT / "plugin.cfg")
     next_version = smoke.bump_patch_version(base_version)
     prepare_signed_update_project(
@@ -357,12 +362,12 @@ def test_signed_update_restarts_matching_live_server_without_parse_errors(
         next_version=next_version,
         base_server_version=base_version,
         next_server_version=next_version,
-        http_port=LIVE_HTTP_PORT,
-        ws_port=LIVE_WS_PORT,
+        http_port=http_port,
+        ws_port=ws_port,
     )
     write_install_update_driver(
         project,
-        http_port=LIVE_HTTP_PORT,
+        http_port=http_port,
         base_version=base_version,
         next_version=next_version,
     )
@@ -373,7 +378,7 @@ def test_signed_update_restarts_matching_live_server_without_parse_errors(
     isolated_home.mkdir(parents=True)
     write_configure_client_driver(
         project,
-        http_port=LIVE_HTTP_PORT,
+        http_port=http_port,
         version=base_version,
     )
     environment = {
@@ -416,7 +421,7 @@ def test_signed_update_restarts_matching_live_server_without_parse_errors(
         allow_headless=True,
         timeout=180,
         environment=environment,
-        live_probe=lambda: _authenticated_tool_probe(LIVE_HTTP_PORT, capability_dir),
+        live_probe=lambda: _authenticated_tool_probe(http_port, capability_dir),
     )
 
     assert_no_update_parse_errors(log)
@@ -509,8 +514,9 @@ def test_clean_major_installer_holds_first_start_until_client_confirmation(
     godot_bin = godot_bin_or_skip()
     target_version = read_plugin_version(PLUGIN_ROOT / "plugin.cfg")
     from_version = "3.2.4"
+    http_port, ws_port = allocate_free_ports(2)
     project, _recovery, isolated_home, codex_home = _install_clean_major_fixture(
-        tmp_path, target_version
+        tmp_path, target_version, http_port, ws_port
     )
     marker = project / CLEAN_MAJOR_MARKER_RELATIVE
     assert marker.is_file()
@@ -552,7 +558,7 @@ def test_clean_major_installer_holds_first_start_until_client_confirmation(
             None
             if wedged
             else lambda: _authenticated_tool_probe(
-                LIVE_HTTP_PORT,
+                http_port,
                 capability_dir,
                 resource_path=probe_resource,
                 content=probe_content,

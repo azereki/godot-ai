@@ -51,6 +51,7 @@ def test_stale_server_smoke_accepts_setup_godot_launcher_env(monkeypatch, tmp_pa
     assert module["find_godot"]() == str(launcher)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="macOS default-path contract")
 def test_stale_server_smoke_uses_isolated_macos_home_for_default_capability_path(
     monkeypatch, tmp_path
 ) -> None:

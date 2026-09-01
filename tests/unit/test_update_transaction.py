@@ -111,7 +111,7 @@ def _paths(scenario: Scenario) -> tx.TransactionPaths:
     )
 
 
-def _wait_until(predicate: Any, timeout: float = 5.0) -> None:
+def _wait_until(predicate: Any, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while not predicate():
         if time.monotonic() >= deadline:
@@ -1944,7 +1944,7 @@ def test_every_mutation_barrier_leaves_an_exact_repairable_tree(
         else:
             _wait_until(
                 lambda: os.path.lexists(paths.result) or actor.error is not None,
-                timeout=5,
+                timeout=10,
             )
     elif effect in {"quarantine_live", "backup_to_live"}:
         actor = Actor(

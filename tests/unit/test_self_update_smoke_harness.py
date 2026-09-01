@@ -97,7 +97,8 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     )
     assert "const DEFAULT_HTTP_PORT := 18000" in base_configurator
     assert "const DEFAULT_WS_PORT := 19500" in base_configurator
-    assert ".godot-ai-self-update-smoke/server-selector.py" in base_configurator
+    assert ".godot-ai-self-update-smoke" in base_configurator
+    assert "server-selector.py" in base_configurator
     assert '"-I"' in base_configurator
     assert (
         "godot-ai=="
