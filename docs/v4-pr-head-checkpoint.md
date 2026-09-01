@@ -30,8 +30,9 @@ v3.2.4 button-click path), Godot 4.5/4.6 runtime-and-bridge refusal/no-mutation
 smokes, GDScript import validation, Ruff, diff hygiene, and all architecture
 simplification gates. The restart correction additionally passed the exact
 button-click smoke, 4.5/4.6 refusal smokes, five focused transaction/release
-tests, and 31 workflow-policy tests. Hosted exact-head evidence is intentionally
-not claimed until CI completes on the pushed commit.
+tests, and 31 workflow-policy tests. Hosted exact-head CI at `b6d5655` passed
+**32/32 jobs** in [run 33543192056](https://github.com/hi-godot/godot-ai/actions/runs/33543192056),
+including the exact final-v3 one-click migration on Linux, macOS, and Windows.
 
 ## Prior reviewed head
 
