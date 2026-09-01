@@ -1983,6 +1983,10 @@ async def test_reload_plugin_reports_structured_failure_when_replacement_never_c
     assert error.data["diagnostics"]["check_sessions"] == "session_manage(op='list')"
 
 
+def test_reload_plugin_default_reconnect_budget_covers_slow_editor_imports():
+    assert editor_handlers.PLUGIN_RELOAD_RECONNECT_TIMEOUT_SEC == 90.0
+
+
 async def test_reload_plugin_raises_when_no_active_session():
     runtime = DirectRuntime(registry=SessionRegistry(), client=StubClient())
     with pytest.raises(GodotCommandError) as exc_info:

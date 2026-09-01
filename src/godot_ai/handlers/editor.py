@@ -32,7 +32,7 @@ GAME_SCREENSHOT_TIMEOUT_SEC = 35.0
 ## before the plugin tears down our own process. Tests override this
 ## to 0 so they don't wait. See `editor_reload_plugin` below.
 PLUGIN_MANAGED_RELOAD_DELAY_SEC = 0.5
-PLUGIN_RELOAD_RECONNECT_TIMEOUT_SEC = 15.0
+PLUGIN_RELOAD_RECONNECT_TIMEOUT_SEC = 90.0
 
 ## One strong in-flight `_dispatch_reload_async` task per old editor session. The
 ## event loop only holds weak references to tasks created via

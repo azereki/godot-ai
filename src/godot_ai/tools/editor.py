@@ -270,7 +270,7 @@ def register_editor_tools(mcp: FastMCP, *, include_non_core: bool = True) -> Non
           session to register and returns
           ``{status: "reloaded", old_session_id, new_session_id}``.
           If the old bridge disappears and no replacement registers
-          within 15 seconds, raises ``PLUGIN_DISCONNECTED`` with
+          within 90 seconds, raises ``PLUGIN_DISCONNECTED`` with
           ``data.reason == "reload_timeout"`` and recovery diagnostics.
 
         Args:

@@ -72,7 +72,16 @@ static func is_port_in_use_via_scrape(port: int, trace: Callable = Callable()) -
 		return not find_listener_pids_windows(port).is_empty()
 	_trace(trace, "lsof")
 	var exit_code := OS.execute("lsof", ["-ti:%d" % port, "-sTCP:LISTEN"], output, true)
-	return exit_code == 0 and output.size() > 0 and not output[0].strip_edges().is_empty()
+	if exit_code == 0 and output.size() > 0 and not output[0].strip_edges().is_empty():
+		return true
+	if OS.get_name() != "Linux":
+		return false
+	_trace(trace, "ss")
+	output.clear()
+	return (
+		OS.execute("ss", ["-H", "-ltnp"], output, true) == 0
+		and not parse_linux_ss_pids(str(output[0]) if not output.is_empty() else "", port).is_empty()
+	)
 
 
 ## Return the PID currently listening on the given TCP port, or 0 if
@@ -88,7 +97,7 @@ static func find_pid_on_port(port: int, trace: Callable = Callable()) -> int:
 ## both bind the same port.
 ##
 ## `trace` is an optional Callable that fires once per OS invocation with
-## a counter name (`"netstat"` / `"powershell"` / `"lsof"`) so the plugin
+## a counter name (`"netstat"` / `"powershell"` / `"lsof"` / `"ss"`) so the plugin
 ## can keep its cold-start trace accurate. The Windows path may fall
 ## through netstat → PowerShell, and a wrapping caller can't see which
 ## scraper actually ran without the hook.
@@ -117,10 +126,19 @@ static func find_all_pids_on_port(port: int, trace: Callable = Callable()) -> Ar
 	var output: Array = []
 	_trace(trace, "lsof")
 	var exit_code := OS.execute("lsof", ["-ti:%d" % port, "-sTCP:LISTEN"], output, true)
-	if exit_code != 0 or output.is_empty():
+	if exit_code == 0 and not output.is_empty():
+		var lsof_pids := parse_lsof_pids(str(output[0]))
+		if not lsof_pids.is_empty() or OS.get_name() != "Linux":
+			return lsof_pids
+	elif OS.get_name() != "Linux":
 		var empty: Array[int] = []
 		return empty
-	return parse_lsof_pids(str(output[0]))
+	_trace(trace, "ss")
+	output.clear()
+	if OS.execute("ss", ["-H", "-ltnp"], output, true) != 0 or output.is_empty():
+		var empty: Array[int] = []
+		return empty
+	return parse_linux_ss_pids(str(output[0]), port)
 
 
 static func _trace(trace: Callable, counter: String) -> void:
@@ -177,6 +195,28 @@ static func windows_listener_execute_result_in_use(exit_code: int, output: Array
 ## IPv4/IPv6 rows for the same listener are dropped.
 static func parse_lsof_pids(raw: String) -> Array[int]:
 	return parse_pid_lines(raw)
+
+
+## Parse Linux `ss -H -ltnp` without trusting process names or localized
+## state text. The local endpoint is the fourth whitespace-delimited field;
+## every `pid=` value on an exact-port row is retained for later brand,
+## lineage, and fingerprint checks.
+static func parse_linux_ss_pids(raw: String, port: int) -> Array[int]:
+	var result: Array[int] = []
+	if port < 1 or port > 65535:
+		return result
+	var expression := RegEx.new()
+	if expression.compile("(?:^|,)pid=([0-9]+)(?:,|\\))") != OK:
+		return result
+	for line in raw.split("\n", false):
+		var fields := line.split(" ", false)
+		if fields.size() < 4 or not str(fields[3]).ends_with(":%d" % port):
+			continue
+		for matched in expression.search_all(line):
+			var pid := int(matched.get_string(1))
+			if pid > 0 and not result.has(pid):
+				result.append(pid)
+	return result
 
 
 static func parse_pid_lines(raw: String) -> Array[int]:
