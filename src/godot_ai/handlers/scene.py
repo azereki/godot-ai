@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from godot_ai.handlers._readiness import require_writable_async
 from godot_ai.runtime.direct import DirectRuntime
-from godot_ai.tools._pagination import paginate
 
 
 async def scene_get_hierarchy(
@@ -13,33 +12,9 @@ async def scene_get_hierarchy(
     offset: int = 0,
     limit: int = 100,
 ) -> dict:
-    result = await runtime.send_command(
+    return await runtime.send_command(
         "get_scene_tree", {"depth": depth, "offset": offset, "limit": limit}
     )
-    ## Newer plugins paginate server-side (only the window is walked into node
-    ## dicts and shipped) and stamp `has_more`; pass their result straight
-    ## through. Older plugins — and version-skewed installs — ignore the
-    ## offset/limit params and return the full node list without pagination
-    ## metadata, so fall back to slicing here. This keeps a mixed
-    ## new-server/old-plugin pair correct.
-    if "has_more" in result:
-        return result
-    ## Old-plugin fallback: slice here, but honor the same contract the plugin
-    ## does so a new-server/old-plugin pair matches a new/new pair — clamp a
-    ## negative offset to 0, and treat limit <= 0 as "no limit" (return
-    ## everything from offset) rather than paginate()'s empty-slice semantics.
-    nodes = result.get("nodes", [])
-    norm_offset = max(0, offset)
-    if limit <= 0:
-        page = nodes[norm_offset:]
-        return {
-            "nodes": page,
-            "total_count": len(nodes),
-            "offset": norm_offset,
-            "limit": limit,
-            "has_more": False,
-        }
-    return paginate(nodes, norm_offset, limit, key="nodes")
 
 
 async def scene_get_roots(runtime: DirectRuntime) -> dict:
@@ -99,10 +74,6 @@ _RESOURCE_HIERARCHY_NODE_CAP = 100
 
 
 async def scene_hierarchy_resource_data(runtime: DirectRuntime) -> dict:
-    ## Route through scene_get_hierarchy rather than calling the plugin directly,
-    ## so the resource returns the same paginated shape
-    ## (total_count/offset/limit/has_more) regardless of plugin version — the
-    ## old-plugin fallback normalizes it. (CodeRabbit)
     result = await scene_get_hierarchy(
         runtime, depth=10, offset=0, limit=_RESOURCE_HIERARCHY_NODE_CAP
     )

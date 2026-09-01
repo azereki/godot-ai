@@ -118,9 +118,9 @@ class TelemetryRecord:
 def hash_session_id(session_id: str | None, *, salt: str = "") -> str:
     """Make a session id safe to ship: hash the slug, keep the twin suffix.
 
-    Godot-AI session ids look like ``<slug>@<4hex>`` where ``<slug>`` is
+    Godot-AI session ids look like ``<slug>@<16hex>`` where ``<slug>`` is
     derived from the project directory name (potentially identifying:
-    ``secret-game-prototype@a3f2``). We sha256 the salt-prefixed slug and
+    ``secret-game-prototype@7f9c3a10d8e426b1``). We sha256 the salt-prefixed slug and
     keep the first 8 hex chars, preserving per-install per-project
     stability without leaking the name. Sessions without an ``@`` (legacy
     or absent) hash as a whole. Empty / ``None`` returns ``""`` so callers
@@ -200,6 +200,23 @@ class TelemetryConfig:
             self.milestones_file = self.data_dir / "milestones.json"
         else:
             self._cleanup_local_files()
+
+    def live_enabled(self) -> bool:
+        """Re-read opt-out env vars on every call.
+
+        ``enabled`` is the construction-time snapshot used to decide whether to create
+        on-disk artifacts and start the worker. Record/send paths consult this method
+        so a later in-process opt-out takes effect without reconstructing the
+        collector (upstream PR #931 at
+        418fb5e2eec516f2b34251f0034dc37fe26e680c / issue #913).
+
+        This does not receive the dock checkbox: the Godot editor cannot mutate
+        another process's environment. An adopted server keeps sending until that
+        process sees an opt-out env var. Status ``telemetry_enabled`` reports this
+        live read so the dock can show the disagreement instead of claiming the
+        checkbox applied.
+        """
+        return not self._is_disabled_via_env()
 
     # --- env helpers -----------------------------------------------------
 
@@ -393,7 +410,7 @@ class TelemetryCollector:
         session_id: str | None = None,
     ) -> None:
         """Enqueue an event. Non-blocking; drops on queue full."""
-        if not self.config.enabled:
+        if not self.config.enabled or not self.config.live_enabled():
             return
 
         record = TelemetryRecord(
@@ -419,7 +436,7 @@ class TelemetryCollector:
         self, milestone: MilestoneType, data: dict[str, Any] | None = None
     ) -> bool:
         """Record a one-shot milestone. Returns ``True`` only on first call."""
-        if not self.config.enabled:
+        if not self.config.enabled or not self.config.live_enabled():
             return False
         key = milestone.value
         ## Mark in memory under the lock; persistence is enqueued for the
@@ -492,6 +509,8 @@ class TelemetryCollector:
                     self._queue.task_done()
 
     def _send(self, record: TelemetryRecord) -> None:
+        if not self.config.live_enabled():
+            return
         endpoint = self.config.endpoint
         if not endpoint:
             ## Pre-backend phase: log exactly once at debug level so an

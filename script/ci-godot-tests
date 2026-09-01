@@ -10,7 +10,8 @@ source "$SCRIPT_DIR/_ci_env.sh"
 source "$SCRIPT_DIR/_ci_session_guard.sh"
 
 SERVER_URL="$MCP_SERVER_URL"
-HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
+ci_load_http_auth
+HEADERS=("${HTTP_AUTH_HEADERS[@]}" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
 
 # Wait for Godot plugin to connect (session_manage(op="list") returns count > 0)
 echo "Waiting for Godot plugin to connect (server: $SERVER_URL)..."

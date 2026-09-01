@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hmac
 import json
 import os
 import socket
@@ -26,12 +27,23 @@ from godot_ai.protocol.attach import (
     PLUGIN_SPAWNED_ENV,
 )
 from godot_ai.protocol.errors import ErrorCode
+from godot_ai.transport.capability import (
+    HTTP_CAPABILITY_ENV,
+    WS_CAPABILITY_ENV,
+    LaunchCapabilities,
+    generate_capabilities,
+    read_capabilities,
+    validate_capability,
+    validate_instance_nonce,
+    validate_launch_capabilities,
+)
 
 DEFAULT_HTTP_PORT = 8000
 DEFAULT_WS_PORT = 9500
 DEFAULT_HEALTH_TIMEOUT_SECONDS = 30.0
 DEFAULT_LOCK_TIMEOUT_MARGIN_SECONDS = 15.0
 DEFAULT_PROBE_TIMEOUT_SECONDS = 1.0
+MAX_STATUS_RESPONSE_BYTES = 64 * 1024
 RUNTIME_DIR_ENV = "GODOT_AI_RUNTIME_DIR"
 
 
@@ -62,6 +74,7 @@ class BackendStatus:
             "exclude_domains": list,
             "owner_type": str,
             "tool_catalog_hash": str,
+            "package_path": str,
         }
         for key, expected_type in required.items():
             value = payload.get(key)
@@ -72,15 +85,19 @@ class BackendStatus:
         domains = payload["exclude_domains"]
         if not all(isinstance(item, str) for item in domains):
             raise ValueError("godot-ai status has invalid excluded domains")
+        try:
+            instance_id = validate_instance_nonce(payload["instance_id"])
+        except ValueError as exc:
+            raise ValueError("godot-ai status has invalid 'instance_id'") from exc
         return cls(
-            instance_id=payload["instance_id"],
+            instance_id=instance_id,
             server_version=payload["server_version"],
             attach_protocol_version=payload["attach_protocol_version"],
             ws_port=payload["ws_port"],
             exclude_domains=tuple(sorted(domains)),
             owner_type=payload["owner_type"],
             tool_catalog_hash=payload["tool_catalog_hash"],
-            package_path=str(payload.get("package_path", "")),
+            package_path=payload["package_path"],
         )
 
 
@@ -109,6 +126,19 @@ class AttachStartupError(RuntimeError):
         return (
             f"godot-ai attach [{self.code}]: {self.message}\nHint: {self.hint}\nDetails: {details}"
         )
+
+
+class InvalidStatusResponse(ValueError):
+    """A listener returned a response outside the bounded status contract."""
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise InvalidStatusResponse(f"duplicate status JSON key: {key!r}")
+        result[key] = value
+    return result
 
 
 def user_runtime_dir() -> Path:
@@ -279,28 +309,111 @@ def _is_lock_held_error(exc: OSError, *, platform: str | None = None) -> bool:
 
 
 async def probe_backend(
-    port: int, *, timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS
+    port: int,
+    http_capability: str | None = None,
+    *,
+    timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS,
 ) -> BackendStatus | None:
-    """Return branded status, None for connection failure, or reject a foreign listener."""
+    """Authenticate and pin one atomic capability-record/status snapshot.
+
+    A caller-supplied capability is used only while waiting for a child it
+    launched. Normal adoption reads the private record. Either path accepts a
+    status only when the current record binds that credential to the returned
+    instance nonce. One retry is allowed solely when the record rotates.
+    """
 
     url = f"http://127.0.0.1:{port}/godot-ai/status"
+    pinned = validate_capability(http_capability) if http_capability is not None else None
+    record = read_capabilities(port)
+    if pinned is None and record is None:
+        return None
+    capability = pinned or record.http
     try:
-        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-            response = await client.get(url)
+        async with asyncio.timeout(timeout):
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                for attempt in range(2):
+                    try:
+                        response, body = await _bounded_status_request(
+                            client,
+                            url,
+                            capability,
+                        )
+                    except httpx.TransportError:
+                        refreshed = read_capabilities(port)
+                        if attempt == 0 and refreshed is not None and refreshed != record:
+                            record = refreshed
+                            capability = pinned or refreshed.http
+                            continue
+                        return None
+
+                    refreshed = read_capabilities(port)
+                    rotated = refreshed is not None and refreshed != record
+                    if response.status_code == 200:
+                        try:
+                            payload = json.loads(body, object_pairs_hook=_unique_json_object)
+                        except (ValueError, UnicodeDecodeError) as exc:
+                            raise _foreign_occupant(
+                                port,
+                                "status probe did not return valid godot-ai JSON",
+                            ) from exc
+                        try:
+                            status = BackendStatus.from_payload(payload)
+                        except ValueError as exc:
+                            if isinstance(payload, dict) and payload.get("name") == "godot-ai":
+                                raise _incompatible_backend(str(exc), payload=payload) from exc
+                            raise _foreign_occupant(port, str(exc)) from exc
+                        if (
+                            refreshed is not None
+                            and hmac.compare_digest(refreshed.http, capability)
+                            and hmac.compare_digest(refreshed.instance_nonce, status.instance_id)
+                        ):
+                            return status
+                    if attempt == 0 and rotated:
+                        record = refreshed
+                        capability = pinned or refreshed.http
+                        continue
+                    detail = (
+                        "status instance did not match the private capability record"
+                        if response.status_code == 200
+                        else f"status probe returned HTTP {response.status_code}"
+                    )
+                    raise _foreign_occupant(port, detail)
+                raise AssertionError("bounded status retry exhausted")  # pragma: no cover
+    except TimeoutError:
+        return None
+    except InvalidStatusResponse as exc:
+        raise _foreign_occupant(port, str(exc)) from exc
     except httpx.TransportError:
         return None
-    if response.status_code != 200:
-        raise _foreign_occupant(port, f"status probe returned HTTP {response.status_code}")
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise _foreign_occupant(port, "status probe did not return JSON") from exc
-    try:
-        return BackendStatus.from_payload(payload)
-    except ValueError as exc:
-        if isinstance(payload, dict) and payload.get("name") == "godot-ai":
-            raise _incompatible_backend(str(exc), payload=payload) from exc
-        raise _foreign_occupant(port, str(exc)) from exc
+
+
+async def _bounded_status_request(
+    client: httpx.AsyncClient,
+    url: str,
+    capability: str,
+) -> tuple[httpx.Response, bytes]:
+    headers = {
+        "accept-encoding": "identity",
+        "authorization": f"Bearer {capability}",
+    }
+    async with client.stream("GET", url, headers=headers) as response:
+        encoding = response.headers.get("content-encoding", "").strip().lower()
+        if encoding not in {"", "identity"}:
+            raise InvalidStatusResponse("encoded status response is not allowed")
+        declared = response.headers.get("content-length")
+        if declared is not None:
+            try:
+                length = int(declared)
+            except ValueError as exc:
+                raise InvalidStatusResponse("invalid status Content-Length") from exc
+            if length < 0 or length > MAX_STATUS_RESPONSE_BYTES:
+                raise InvalidStatusResponse("oversized status response")
+        body = bytearray()
+        async for chunk in response.aiter_raw():
+            if len(body) + len(chunk) > MAX_STATUS_RESPONSE_BYTES:
+                raise InvalidStatusResponse("oversized status response")
+            body.extend(chunk)
+        return response, bytes(body)
 
 
 def port_available(port: int) -> bool:
@@ -326,10 +439,9 @@ def detached_spawn_kwargs(*, platform: str | None = None) -> dict[str, Any]:
         # Win32 ignores CREATE_NO_WINDOW when DETACHED_PROCESS is also set.
         # Keep the process-group boundary without defeating the fallback path's
         # invisible-console protection.
-        kwargs["creationflags"] = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-        )
+        kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+        ) | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     else:
         kwargs["start_new_session"] = True
     return kwargs
@@ -364,7 +476,12 @@ def backend_python_executable(
     return str(selected)
 
 
-def spawn_backend(port: int, ws_port: int, exclude_domains: tuple[str, ...]) -> SpawnedBackend:
+def spawn_backend(
+    port: int,
+    ws_port: int,
+    exclude_domains: tuple[str, ...],
+    capabilities: LaunchCapabilities,
+) -> SpawnedBackend:
     runtime_dir = user_runtime_dir()
     log_path = runtime_dir / f"backend-{port}.log"
     old_log_path = Path(f"{log_path}.old")
@@ -381,7 +498,7 @@ def spawn_backend(port: int, ws_port: int, exclude_domains: tuple[str, ...]) -> 
     ]
     if exclude_domains:
         args.extend(("--exclude-domains", ",".join(exclude_domains)))
-    env = _backend_spawn_env()
+    env = _backend_spawn_env(capabilities)
 
     try:
         if log_path.exists():
@@ -409,25 +526,29 @@ def spawn_backend(port: int, ws_port: int, exclude_domains: tuple[str, ...]) -> 
     return SpawnedBackend(process=process, log_path=log_path)
 
 
-def _backend_spawn_env() -> dict[str, str]:
+def _backend_spawn_env(capabilities: LaunchCapabilities) -> dict[str, str]:
     """Build a clean environment for the independent attach-owned backend."""
 
+    capabilities = validate_launch_capabilities(capabilities.http, capabilities.websocket)
     env = os.environ.copy()
     env[ATTACH_SPAWNED_ENV] = "1"
     for inherited_process_key in (
         PLUGIN_SPAWNED_ENV,
         "GODOT_AI_OWNER_PID",
-        "GODOT_AI_WS_TOKEN",
+        HTTP_CAPABILITY_ENV,
+        WS_CAPABILITY_ENV,
         # A bridge launched from a reload worker must not make its independent
         # child look like another reload worker; that marker disables reaping.
         DEV_TRANSPORT_ENV,
     ):
         env.pop(inherited_process_key, None)
+    env[HTTP_CAPABILITY_ENV] = capabilities.http
+    env[WS_CAPABILITY_ENV] = capabilities.websocket
     return env
 
 
-Probe = Callable[[int], Awaitable[BackendStatus | None]]
-Spawn = Callable[[int, int, tuple[str, ...]], SpawnedBackend]
+Probe = Callable[..., Awaitable[BackendStatus | None]]
+Spawn = Callable[[int, int, tuple[str, ...], LaunchCapabilities], SpawnedBackend]
 PortCheck = Callable[[int], bool]
 
 
@@ -474,6 +595,20 @@ class BackendEnsurer:
     def mcp_url(self) -> str:
         return f"{self.base_url}/mcp"
 
+    def http_capability(self) -> str:
+        """Read the current bearer value without retaining it in bridge state."""
+
+        record = read_capabilities(self.port)
+        if record is None:
+            raise AttachStartupError(
+                "BACKEND_CAPABILITY_UNAVAILABLE",
+                "The backend capability record is missing or invalid.",
+                hint="Wait for backend startup to finish, then retry.",
+                retryable=True,
+                data={"port": self.port},
+            )
+        return record.http
+
     async def ensure(self) -> BackendStatus:
         runtime_dir = self._runtime_dir or user_runtime_dir()
         lock = AdvisoryFileLock(
@@ -487,10 +622,16 @@ class BackendEnsurer:
             if not self._port_check(self.ws_port):
                 raise _foreign_occupant(self.ws_port, "WebSocket port is already occupied")
 
-            spawned = self._spawn(self.port, self.ws_port, self.exclude_domains)
+            capabilities = generate_capabilities()
+            spawned = self._spawn(
+                self.port,
+                self.ws_port,
+                self.exclude_domains,
+                capabilities,
+            )
             deadline = time.monotonic() + self._health_timeout_seconds
             while time.monotonic() < deadline:
-                status = await self._probe(self.port)
+                status = await self._probe(self.port, capabilities.http)
                 if status is not None:
                     return self._validate(status)
                 exit_code = spawned.process.poll()

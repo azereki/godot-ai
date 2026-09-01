@@ -424,10 +424,117 @@ func test_reparent_to_ancestor_is_allowed() -> void:
 	chain.teardown.call()
 
 
+func test_reparent_preserves_descendant_owner_on_undo() -> void:
+	## Upstream PR #927 / issue #904: descendant ownership was applied after
+	## commit_action, so undo left children with a null owner after remove_child
+	## pruned the subtree.
+	var chain := _build_temp_chain(
+		["_McpTestOwnerParent", "_McpTestOwnerChild"] as Array[String]
+	)
+	var dest := _handler.create_node({
+		"type": "Node3D",
+		"name": "_McpTestOwnerDest",
+		"parent_path": "/Main",
+	})
+	assert_has_key(dest, "data")
+	assert_eq(dest.data.name, "_McpTestOwnerDest")
+
+	var scene_root := EditorInterface.get_edited_scene_root()
+	var result := _handler.reparent_node({
+		"path": "/Main/_McpTestOwnerParent",
+		"new_parent": "/Main/_McpTestOwnerDest",
+	})
+	assert_has_key(result, "data")
+	assert_true(result.data.undoable, "reparent should be undoable")
+
+	var child_after := scene_root.get_node_or_null(
+		"_McpTestOwnerDest/_McpTestOwnerParent/_McpTestOwnerChild"
+	)
+	assert_ne(child_after, null, "child must exist under the new parent")
+	assert_eq(child_after.owner, scene_root, "child owner should be scene root after reparent")
+
+	assert_true(editor_undo(_undo_redo), "undo reparent should succeed")
+	var child := scene_root.get_node_or_null("_McpTestOwnerParent/_McpTestOwnerChild")
+	assert_ne(child, null, "child must exist under original parent after undo")
+	assert_ne(child.owner, null, "child owner must not be null after undo")
+	assert_eq(child.owner, scene_root, "child owner must still be the scene root after undo")
+
+	assert_true(editor_undo(_undo_redo), "undo dest create should succeed")
+	chain.teardown.call()
+
+
+func test_reparent_restores_owned_and_unowned_descendants_on_undo_redo() -> void:
+	## Upstream PR #927 review: undo must restore a null owner unchanged rather
+	## than substituting scene_root. One subtree with both a scene-owned and an
+	## unowned child covers do / undo / redo.
+	var parent_res := _handler.create_node({
+		"type": "Node3D",
+		"name": "_McpTestMixParent",
+		"parent_path": "/Main",
+	})
+	assert_has_key(parent_res, "data")
+	assert_eq(parent_res.data.name, "_McpTestMixParent")
+	var owned_res := _handler.create_node({
+		"type": "Node3D",
+		"name": "_McpTestMixOwned",
+		"parent_path": "/Main/_McpTestMixParent",
+	})
+	assert_has_key(owned_res, "data")
+	assert_eq(owned_res.data.name, "_McpTestMixOwned")
+	var unowned_res := _handler.create_node({
+		"type": "Node3D",
+		"name": "_McpTestMixUnowned",
+		"parent_path": "/Main/_McpTestMixParent",
+	})
+	assert_has_key(unowned_res, "data")
+	assert_eq(unowned_res.data.name, "_McpTestMixUnowned")
+
+	var scene_root := EditorInterface.get_edited_scene_root()
+	var owned := scene_root.get_node_or_null("_McpTestMixParent/_McpTestMixOwned")
+	var unowned := scene_root.get_node_or_null("_McpTestMixParent/_McpTestMixUnowned")
+	assert_ne(owned, null, "precondition: owned child exists")
+	assert_ne(unowned, null, "precondition: unowned child exists")
+	assert_eq(owned.owner, scene_root, "precondition: owned child is scene-owned")
+	unowned.owner = null
+	assert_eq(unowned.owner, null, "precondition: unowned child has a null owner")
+
+	var dest := _handler.create_node({
+		"type": "Node3D",
+		"name": "_McpTestMixDest",
+		"parent_path": "/Main",
+	})
+	assert_has_key(dest, "data")
+	assert_eq(dest.data.name, "_McpTestMixDest")
+
+	var result := _handler.reparent_node({
+		"path": "/Main/_McpTestMixParent",
+		"new_parent": "/Main/_McpTestMixDest",
+	})
+	assert_has_key(result, "data")
+	assert_true(result.data.undoable, "reparent should be undoable")
+	assert_eq(owned.owner, scene_root, "owned child is scene-owned after reparent")
+	assert_eq(unowned.owner, scene_root, "unowned child is scene-owned after reparent")
+
+	assert_true(editor_undo(_undo_redo), "undo reparent should succeed")
+	assert_eq(owned.owner, scene_root, "owned child owner restored to scene root on undo")
+	assert_eq(unowned.owner, null, "unowned child owner restored to null on undo")
+
+	assert_true(editor_redo(_undo_redo), "redo reparent should succeed")
+	assert_eq(owned.owner, scene_root, "owned child is scene-owned after redo")
+	assert_eq(unowned.owner, scene_root, "unowned child is scene-owned after redo")
+
+	assert_true(editor_undo(_undo_redo), "undo reparent after redo should succeed")
+	assert_eq(owned.owner, scene_root, "owned child owner restored after second undo")
+	assert_eq(unowned.owner, null, "unowned child owner restored to null after second undo")
+
+	assert_true(editor_undo(_undo_redo), "undo dest create should succeed")
+	assert_true(editor_undo(_undo_redo), "undo unowned create should succeed")
+	assert_true(editor_undo(_undo_redo), "undo owned create should succeed")
+	assert_true(editor_undo(_undo_redo), "undo parent create should succeed")
+
+
 ## Build a nested chain of throwaway Node3D test nodes under /Main, returning
 ## the deepest path and a teardown closure that unwinds each create via undo.
-## Used by the reparent regression tests; promote to test_suite.gd if a third
-## caller appears.
 func _build_temp_chain(names: Array[String]) -> Dictionary:
 	var parent_path := "/Main"
 	for name in names:
@@ -1491,6 +1598,39 @@ func test_duplicate_scene_root() -> void:
 func test_duplicate_node_invalid_path() -> void:
 	var result := _handler.duplicate_node({"path": "/Main/NoSuchNode"})
 	assert_is_error(result, ErrorCodes.NODE_NOT_FOUND)
+
+
+func test_duplicate_restores_descendant_owner_on_redo() -> void:
+	## Upstream PR #927 / issue #904: descendant ownership was applied after
+	## commit_action, so redo restored the copy without setting child owners.
+	var chain := _build_temp_chain(
+		["_McpTestDupSrc", "_McpTestDupChild"] as Array[String]
+	)
+	var scene_root := EditorInterface.get_edited_scene_root()
+
+	var result := _handler.duplicate_node({
+		"path": "/Main/_McpTestDupSrc",
+		"name": "_McpTestDupCopy",
+	})
+	assert_has_key(result, "data")
+	assert_true(result.data.undoable, "duplicate should be undoable")
+	assert_true(str(result.data.name).begins_with("_McpTestDupCopy"))
+
+	var copy_child := scene_root.get_node_or_null("_McpTestDupCopy/_McpTestDupChild")
+	assert_ne(copy_child, null, "duplicate child must exist")
+	assert_eq(copy_child.owner, scene_root, "duplicate child owner should be scene root")
+
+	assert_true(editor_undo(_undo_redo), "undo duplicate should succeed")
+	assert_eq(scene_root.get_node_or_null("_McpTestDupCopy"), null, "copy should be gone after undo")
+
+	assert_true(editor_redo(_undo_redo), "redo duplicate should succeed")
+	var copy_child_redo := scene_root.get_node_or_null("_McpTestDupCopy/_McpTestDupChild")
+	assert_ne(copy_child_redo, null, "duplicate child must exist after redo")
+	assert_ne(copy_child_redo.owner, null, "copy child's owner must not be null after redo")
+	assert_eq(copy_child_redo.owner, scene_root, "copy child's owner must be the scene root after redo")
+
+	assert_true(editor_undo(_undo_redo), "undo duplicate after redo should succeed")
+	chain.teardown.call()
 
 
 # ----- move_node -----

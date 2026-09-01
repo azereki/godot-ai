@@ -7,6 +7,12 @@ import pytest
 from godot_ai import __version__ as _SERVER_VERSION
 from godot_ai.godot_client.client import GodotClient
 from godot_ai.server import _startup_record_data
+from godot_ai.sessions.registry import SessionRegistry
+
+
+class _TableOnlyServer:
+    def __init__(self) -> None:
+        self.registry = SessionRegistry()
 
 
 def _client(monkeypatch, *, env_value: str | None = None, **kwargs) -> GodotClient:
@@ -14,7 +20,7 @@ def _client(monkeypatch, *, env_value: str | None = None, **kwargs) -> GodotClie
         monkeypatch.delenv("GODOT_AI_SUPPRESS_DIAGNOSTIC_HINTS", raising=False)
     else:
         monkeypatch.setenv("GODOT_AI_SUPPRESS_DIAGNOSTIC_HINTS", env_value)
-    return GodotClient(None, None, **kwargs)  # type: ignore[arg-type]
+    return GodotClient(_TableOnlyServer(), **kwargs)  # type: ignore[arg-type]
 
 
 def test_startup_record_defaults_to_hints_not_suppressed(monkeypatch) -> None:

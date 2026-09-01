@@ -34,7 +34,8 @@ else
   fi
   echo "Running GDScript validation via --import..."
   IMPORT_LOG=$(mktemp)
-  godot --headless --path "$PROJECT_DIR" --import > "$IMPORT_LOG" 2>&1 || true
+  godot --headless --path "$PROJECT_DIR" --import \
+    --log-file "${IMPORT_LOG}.godot" > "$IMPORT_LOG" 2>&1 || true
   # An empty import log means the import run produced no output at all —
   # treat that as a failure rather than silently passing.
   if [ ! -s "$IMPORT_LOG" ]; then
@@ -43,10 +44,10 @@ else
   fi
 fi
 
-# Check for parse errors in the import output. This is strict on every
-# supported Godot version, including the 4.5 canary. Logger-backed scripts
-# are parsed normally now, so any SCRIPT ERROR / Parse Error here is a real
-# failure.
+# Check for parse errors in the import output. Supported Godot versions are
+# strict; the separate unsupported-floor smoke proves 4.5/4.6 stop inertly.
+# Logger-backed scripts are parsed normally, so any SCRIPT ERROR / Parse Error
+# here is a real failure.
 ERRORS=$(grep -ciE "SCRIPT ERROR|Parse Error|Failed to load script" "$IMPORT_LOG" 2>/dev/null || true)
 ERRORS="${ERRORS:-0}"
 

@@ -6,16 +6,20 @@
 
 [![CI](https://github.com/hi-godot/godot-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/hi-godot/godot-ai/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/hi-godot/godot-ai/graph/badge.svg)](https://codecov.io/gh/hi-godot/godot-ai)
-[![Godot Asset Store](https://img.shields.io/badge/Godot-Asset%20Store-478cbf?logo=godotengine&logoColor=white)](https://store.godotengine.org/asset/dlight/godot-ai/)
 [![Discord](https://img.shields.io/badge/Discord-Join%20chat-5865F2?logo=discord&logoColor=white)](https://discord.gg/FDZ5fr2QkP)
 
 **Godot AI connects Claude Code, Claude Desktop, Codex, Hermes Agent, and other
 [MCP](https://modelcontextprotocol.io/introduction) clients to a live Godot
-editor.** Its [~43 tools and 120+ operations](docs/TOOLS.md) let AI assistants
+editor.** Its [46 tools and 120+ operations](docs/TOOLS.md) let AI assistants
 build scenes, edit nodes and scripts, wire signals, and configure UI, materials,
 animation, particles, cameras, and environments.
 
-> 📦 Install from the [Godot Asset Store](https://store.godotengine.org/asset/dlight/godot-ai/) or the legacy [Asset Library](https://godotengine.org/asset-library/asset/5050). The Python server requires [uv](https://docs.astral.sh/uv/).
+> 📦 This branch is the unpublished Godot AI v4 candidate. V4 requires Godot
+> 4.7+ within the 4.x line; its publication workflow remains closed while the exact candidate and
+> independent release trust anchor are qualified. Public marketplace listings
+> remain on v3. Do not replace a v3 install yet; see the
+> [v4 migration guide](docs/v4-migration.md) for the release gate and eventual
+> clean-migration procedure.
 
 > 💬 **[Join the Discord](https://discord.gg/FDZ5fr2QkP)** — questions, showcases, and contributor chat.
 
@@ -32,7 +36,7 @@ animation, particles, cameras, and environments.
 
 ### Prerequisites
 
-- Godot `4.5+` (`4.7+` recommended)
+- Godot `4.7+` within the 4.x line
 - [uv](https://docs.astral.sh/uv/) (for the Python server)
 
   <details>
@@ -49,7 +53,13 @@ animation, particles, cameras, and environments.
 
 ### 1. Install the plugin
 
-**From source** (latest):
+No public v4 install is available while publication is closed. After the
+independent release attestation named in the
+[migration guide](docs/v4-migration.md) exists, a fresh project will verify the
+three v4 assets and extract the verified `godot-ai-v4-plugin.zip` into an absent
+`addons/godot_ai` path.
+
+For contributor/dev checkouts only:
 
 ```bash
 git clone https://github.com/hi-godot/godot-ai.git
@@ -57,17 +67,9 @@ mkdir -p your-project/addons   # without this, cp makes addons/ a copy of godot_
 cp -r godot-ai/plugin/addons/godot_ai your-project/addons/
 ```
 
-Or [download the latest release ZIP](https://github.com/hi-godot/godot-ai/releases/latest)
-and extract `addons/godot_ai` into your project's `addons/` folder.
-
-<details>
-<summary>Or from a Godot marketplace</summary>
-
-Use the [Godot Asset Store](https://store.godotengine.org/asset/dlight/godot-ai/)
-or the deprecated but still-active [Asset Library](https://godotengine.org/asset-library/asset/5050).
-Marketplace releases may lag behind GitHub.
-
-</details>
+If the project already has Godot AI v3, do not copy or extract over it. Follow
+the closed-editor migration procedure, which retains the complete old tree
+outside the project before activating v4.
 
 ### 2. Enable the plugin
 
@@ -93,8 +95,8 @@ use **Configure all** to set up every detected client. Supported clients include
 <summary><strong>…and 17+ more clients</strong></summary>
 
 Codex, **Grok Build**, Cursor, Devin Desktop, VS Code, VS Code Insiders, Zed,
-Gemini CLI, Cline, Kilo Code, Roo Code, Zoo Code, Kiro, Trae, Cherry Studio,
-OpenCode, Qwen Code, Kimi Code, and Pi Agent.
+Gemini CLI, Cline, Kilo Code, Roo Code, Zoo Code, Kiro, Trae, OpenCode, Qwen
+Code, Kimi Code, and Pi Agent.
 
 </details>
 
@@ -102,11 +104,10 @@ OpenCode, Qwen Code, Kimi Code, and Pi Agent.
 > `~/.pi/agent/mcp.json`; Pi has no built-in MCP support. See the
 > [Pi package gallery](https://pi.dev/packages).
 
-Most clients use `godot-ai attach`, a client-owned stdio bridge that starts or
-reuses the local backend, making tools available before Godot opens and across
-same-version editor restarts. The dock shows the configured transport and, when
-needed, a copyable manual command. Cherry Studio remains URL-only because it
-manages MCP servers inside the app.
+Clients use `godot-ai attach`, a client-owned stdio bridge that starts or reuses
+the local backend and discovers its rotating private capability. The dock shows
+the configured transport and, when needed, a copyable manual command. Clients
+without a verified stdio or dynamic-capability surface are not advertised.
 
 <details>
 <summary><strong>Registering per-project instead of globally</strong></summary>
@@ -148,7 +149,7 @@ Re-run **Configure** after changing ports, excluded domains, or plugin versions.
 
 ---
 
-**Tools and resources:** see [docs/TOOLS.md](docs/TOOLS.md) for the full tool, op, and resource list (~43 tools exposing 120+ ops, plus read-only `godot://` resources), grouped by domain.
+**Tools and resources:** see [docs/TOOLS.md](docs/TOOLS.md) for the generated tool, op, and resource inventory (46 tools exposing 120+ ops, plus read-only `godot://` resources), grouped by domain.
 
 **Testing:** the plugin ships an in-editor GDScript test framework — your AI client (or you) can write `McpTestSuite` suites for your own game under `res://tests/` and run them with `test_run`. See [docs/testing.md](docs/testing.md).
 
@@ -159,32 +160,45 @@ Prefer the dock-generated command: it selects a compatible launcher and includes
 the current version, ports, and excluded tool domains. Re-run **Configure**
 after any of those values change.
 
-**Claude Code:**
-
-```bash
-claude mcp add --scope user --transport http godot-ai http://127.0.0.1:8000/mcp
-```
-
-**Claude Desktop** (`claude_desktop_config.json`):
+The generated uvx-tier entry has this shape (shown here for Claude Desktop).
+Keep the resolver flags: they prevent ambient uv configuration from selecting a
+different source or tool environment. The dock may instead select a verified
+development-venv or system-install tier and may add exclusions or the telemetry
+opt-out, so its exact output remains authoritative.
 
 ```json
 {
   "mcpServers": {
     "godot-ai": {
       "command": "/absolute/path/to/uvx",
-      "args": ["--link-mode", "copy", "--from", "godot-ai==VERSION", "godot-ai", "attach", "--port", "8000", "--ws-port", "9500"]
+      "args": [
+        "--isolated", "--no-config", "--no-env-file", "--no-sources", "--no-build",
+        "--index-strategy", "first-index", "--keyring-provider", "disabled",
+        "--index", "https://pypi.org/simple",
+        "--default-index", "https://pypi.org/simple",
+        "--find-links", "https://pypi.org/simple/godot-ai/",
+        "--link-mode", "copy", "--from", "godot-ai==VERSION",
+        "godot-ai", "attach", "--port", "8000", "--ws-port", "9500"
+      ]
     }
   }
 }
 ```
 
-**Codex** (`~/.codex/config.toml`):
+Codex uses the same attach command in `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers."godot-ai"]
-command = "godot-ai"
+command = "/absolute/path/to/uvx"
 args = [
-  "attach",
+  "--isolated", "--no-config", "--no-env-file", "--no-sources", "--no-build",
+  "--index-strategy", "first-index", "--keyring-provider", "disabled",
+  "--index", "https://pypi.org/simple",
+  "--default-index", "https://pypi.org/simple",
+  "--find-links", "https://pypi.org/simple/godot-ai/",
+  "--link-mode", "copy",
+  "--from", "godot-ai==VERSION",
+  "godot-ai", "attach",
   "--port", "8000",
   "--ws-port", "9500",
 ]
@@ -197,16 +211,14 @@ On Windows, use the dock-generated entry so Store/MSIX paths and consoleless
 launching are handled correctly. Other clients expose their exact config in
 the dock's **Run this manually** panel.
 
-Clients that support URL transport can instead use:
+These flags isolate resolution from ambient uv configuration; they do not
+cryptographically bind later public package bytes. PyPI/TLS, the selected uv
+executable and cache, and same-user machine integrity remain runtime trust
+roots; see [Packaging and Distribution](docs/packaging-distribution.md).
 
-```toml
-[mcp_servers."godot-ai"]
-url = "http://127.0.0.1:8000/mcp"
-enabled = true
-```
-
-URL mode relies on the client's reconnect behavior and may require a client
-restart if Godot AI was not running at startup.
+A persistent bare `http://127.0.0.1:8000/mcp` entry is not valid in v4: it
+cannot carry or rotate the private bearer capability. Use the dock-generated
+stdio attach command.
 
 </details>
 
@@ -215,7 +227,10 @@ restart if Godot AI was not running at startup.
 
 ```text
 MCP Client
-   | HTTP (/mcp)
+   | stdio
+   v
+godot-ai attach
+   | authenticated HTTP (/mcp)
    v
 Python Server (FastMCP)      port 8000
    | WebSocket               port 9500
@@ -226,23 +241,30 @@ Godot Editor Plugin
 Godot Editor
 ```
 
-The plugin connects the editor to the Python MCP server over WebSocket; clients
-reach its tools and resources over HTTP or the `attach` stdio bridge.
+Both local hops use independent rotating capabilities. On POSIX, the bootstrap
+record is owner-only and every path component is checked. On Windows, v4 uses
+the fixed per-user location and rejects reparse traversal, but does not claim
+secrecy or integrity against another local account or a process already running
+as the same user. Neither a tokenless WebSocket nor a bare HTTP fallback exists
+in v4.
 
 </details>
 
 <details>
 <summary><strong>Remote / LAN access (<code>--allow-host</code>)</strong></summary>
 
-The server binds to `127.0.0.1` by default. For LAN access, pass trusted IPs or
-CIDRs with `--allow-host` (repeat or comma-separate the flag):
+The server binds to `127.0.0.1` by default. `--allow-host` may widen the HTTP
+listener to trusted IPs or CIDRs, but it does not remove capability
+authentication (repeat or comma-separate the flag):
 
 ```bash
-godot-ai --allow-host 192.168.1.0/24
+godot-ai --transport streamable-http --allow-host 192.168.1.0/24
 ```
 
-The editor WebSocket remains loopback-only. Allow only trusted ranges; prefer
-an SSH tunnel or Tailscale on untrusted networks.
+The editor WebSocket remains loopback-only. A remote client also needs a safe
+way to invoke the attach bridge on the server host; never copy the rotating
+capability into a persistent URL config. Prefer an SSH-launched stdio command
+or a tunnel on untrusted networks.
 
 </details>
 

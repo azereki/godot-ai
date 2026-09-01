@@ -6,10 +6,12 @@ import pytest
 from pydantic import ValidationError
 
 from godot_ai.protocol.envelope import (
+    WS_PROTOCOL_VERSION,
+    AuthenticatedHandshake,
+    AuthenticationHello,
     CommandRequest,
     CommandResponse,
     ErrorDetail,
-    HandshakeMessage,
 )
 
 
@@ -39,6 +41,7 @@ class TestCommandResponse:
             request_id="abc123",
             status="ok",
             data={"nodes": []},
+            readiness="ready",
         )
         assert resp.status == "ok"
         assert resp.error is None
@@ -47,6 +50,7 @@ class TestCommandResponse:
         resp = CommandResponse(
             request_id="abc123",
             status="error",
+            readiness="ready",
             error=ErrorDetail(
                 code="NODE_NOT_FOUND",
                 message="Not found",
@@ -61,6 +65,7 @@ class TestCommandResponse:
         resp = CommandResponse(
             request_id="abc123",
             status="error",
+            readiness="ready",
             error=ErrorDetail(code="NODE_NOT_FOUND", message="Not found"),
         )
         assert resp.error is not None
@@ -71,17 +76,19 @@ class TestCommandResponse:
             request_id="abc123",
             status="ok",
             data={"version": "4.4"},
+            readiness="ready",
         )
         raw = resp.model_dump_json()
         parsed = CommandResponse.model_validate_json(raw)
         assert parsed.request_id == "abc123"
         assert parsed.data == {"version": "4.4"}
 
-    def test_error_watermark_is_optional_for_old_plugins(self):
+    def test_error_watermark_is_optional(self):
         resp = CommandResponse(
             request_id="abc123",
             status="ok",
             data={},
+            readiness="ready",
         )
         assert resp.error_watermark is None
 
@@ -91,6 +98,7 @@ class TestCommandResponse:
                 "request_id": "abc123",
                 "status": "ok",
                 "data": {},
+                "readiness": "ready",
                 "error_watermark": {
                     "editor_ring": 1,
                     "debugger_promoted": 2,
@@ -104,76 +112,136 @@ class TestCommandResponse:
             "game_error_warn": 3,
         }
 
-
-class TestHandshakeMessage:
-    def test_defaults(self):
-        msg = HandshakeMessage(
-            session_id="sess-001",
-            godot_version="4.4.1",
-            project_path="/tmp/project",
-            plugin_version="0.0.1",
-        )
-        assert msg.type == "handshake"
-        assert msg.protocol_version == 1
-
-    def test_from_dict(self):
-        raw = {
-            "type": "handshake",
-            "session_id": "sess-001",
-            "godot_version": "4.4.1",
-            "project_path": "/tmp/project",
-            "plugin_version": "0.0.1",
-            "protocol_version": 1,
+    def test_error_watermark_accepts_complete_bounded_shape(self):
+        watermark = {
+            "run_seq": 1,
+            "editor_ring": 2,
+            "debugger_promoted": 3,
+            "game_error_warn": 4,
+            "editor_ring_warn": 5,
+            "game_warn": (1 << 63) - 1,
         }
-        msg = HandshakeMessage.model_validate(raw)
-        assert msg.session_id == "sess-001"
 
-    def test_roundtrip_json(self):
-        msg = HandshakeMessage(
-            session_id="sess-001",
-            godot_version="4.4.1",
-            project_path="/tmp/project",
-            plugin_version="0.0.1",
-        )
-        raw = msg.model_dump_json()
-        parsed = json.loads(raw)
-        assert parsed["type"] == "handshake"
-        assert parsed["session_id"] == "sess-001"
-
-    def test_server_launch_mode_defaults_to_unknown(self):
-        ## Older plugins omit server_launch_mode; server should parse the
-        ## handshake cleanly rather than reject it, and default to "unknown"
-        ## so agents can distinguish "old plugin" from "mode could not be
-        ## determined" via plugin_version.
-        msg = HandshakeMessage(
-            session_id="sess-001",
-            godot_version="4.4.1",
-            project_path="/tmp/project",
-            plugin_version="0.0.1",
-        )
-        assert msg.server_launch_mode == "unknown"
-
-    def test_server_launch_mode_parsed_when_supplied(self):
-        msg = HandshakeMessage.model_validate(
+        parsed = CommandResponse.model_validate(
             {
-                "session_id": "sess-001",
-                "godot_version": "4.4.1",
-                "project_path": "/tmp/project",
-                "plugin_version": "0.0.1",
-                "server_launch_mode": "dev_venv",
+                "request_id": "abc123",
+                "status": "ok",
+                "readiness": "ready",
+                "error_watermark": watermark,
             }
         )
-        assert msg.server_launch_mode == "dev_venv"
 
-    def test_canonical_session_id_accepted(self):
-        ## The plugin's "<slug>@<4hex>" form must validate (connection.gd).
-        msg = HandshakeMessage(
-            session_id="my-game@a3f2",
-            godot_version="4.4.1",
-            project_path="/tmp/project",
-            plugin_version="0.0.1",
+        assert parsed.error_watermark == watermark
+
+    def test_error_watermark_rejects_extra_component(self):
+        with pytest.raises(ValidationError):
+            CommandResponse.model_validate(
+                {
+                    "request_id": "abc123",
+                    "status": "ok",
+                    "readiness": "ready",
+                    "error_watermark": {
+                        "run_seq": 1,
+                        "editor_ring": 2,
+                        "debugger_promoted": 3,
+                        "game_error_warn": 4,
+                        "editor_ring_warn": 5,
+                        "game_warn": 6,
+                        "attacker_component": 7,
+                    },
+                }
+            )
+
+    @pytest.mark.parametrize("value", [True, "1", 1.5, -1, 1 << 63])
+    def test_error_watermark_rejects_invalid_counter_shape(self, value):
+        with pytest.raises(ValidationError):
+            CommandResponse.model_validate(
+                {
+                    "request_id": "abc123",
+                    "status": "ok",
+                    "readiness": "ready",
+                    "error_watermark": {"run_seq": value},
+                }
+            )
+
+
+class TestV4HandshakeModels:
+    NONCE = "01" * 32
+    PROOF = "02" * 32
+
+    @classmethod
+    def response(cls, **changes):
+        value = {
+            "type": "auth_response",
+            "protocol_version": WS_PROTOCOL_VERSION,
+            "client_nonce": cls.NONCE,
+            "server_nonce": "03" * 32,
+            "client_proof": cls.PROOF,
+            "session_id": "my-game@a3f2",
+            "godot_version": "4.7.0",
+            "project_path": "/tmp/project",
+            "plugin_version": "4.0.0",
+            "readiness": "ready",
+            "editor_pid": 123,
+            "server_launch_mode": "dev_venv",
+        }
+        value.update(changes)
+        return value
+
+    def test_auth_hello_is_metadata_free_and_exact(self):
+        hello = AuthenticationHello.model_validate(
+            {
+                "type": "auth_hello",
+                "protocol_version": WS_PROTOCOL_VERSION,
+                "client_nonce": self.NONCE,
+            }
         )
-        assert msg.session_id == "my-game@a3f2"
+        assert json.loads(hello.model_dump_json()) == {
+            "type": "auth_hello",
+            "protocol_version": WS_PROTOCOL_VERSION,
+            "client_nonce": self.NONCE,
+        }
+
+    @pytest.mark.parametrize("field", ["session_id", "project_path", "auth_token"])
+    def test_auth_hello_rejects_metadata_and_raw_token(self, field):
+        with pytest.raises(ValidationError):
+            AuthenticationHello.model_validate(
+                {
+                    "type": "auth_hello",
+                    "protocol_version": WS_PROTOCOL_VERSION,
+                    "client_nonce": self.NONCE,
+                    field: "attacker-controlled",
+                }
+            )
+
+    @pytest.mark.parametrize("nonce", ["", "0" * 63, "0" * 65, "g" * 64])
+    def test_auth_hello_requires_fresh_nonce_shape(self, nonce):
+        with pytest.raises(ValidationError):
+            AuthenticationHello(
+                type="auth_hello",
+                protocol_version=WS_PROTOCOL_VERSION,
+                client_nonce=nonce,
+            )
+
+    def test_authenticated_metadata_has_no_legacy_defaults(self):
+        parsed = AuthenticatedHandshake.model_validate(self.response())
+        assert parsed.session_id == "my-game@a3f2"
+        for required in ("readiness", "editor_pid", "server_launch_mode", "client_proof"):
+            value = self.response()
+            value.pop(required)
+            with pytest.raises(ValidationError):
+                AuthenticatedHandshake.model_validate(value)
+
+    @pytest.mark.parametrize("protocol_version", [1, 3, "2"])
+    def test_mixed_protocol_version_rejected(self, protocol_version):
+        with pytest.raises(ValidationError):
+            AuthenticationHello.model_validate(
+                {
+                    "type": "auth_hello",
+                    "protocol_version": protocol_version,
+                    "client_nonce": self.NONCE,
+                }
+            )
 
     @pytest.mark.parametrize(
         "bad_id",
@@ -189,9 +257,4 @@ class TestHandshakeMessage:
         ## An untrusted WS peer can't register an arbitrary/oversized id that
         ## then flows into the registry key, logs, and telemetry hash (#527).
         with pytest.raises(ValidationError):
-            HandshakeMessage(
-                session_id=bad_id,
-                godot_version="4.4.1",
-                project_path="/tmp/project",
-                plugin_version="0.0.1",
-            )
+            AuthenticatedHandshake.model_validate(self.response(session_id=bad_id))

@@ -15,6 +15,8 @@ class ErrorCode(StrEnum):
     # the backend. Automatic replay is forbidden because the operation may
     # already have completed.
     TRANSPORT_OUTCOME_UNKNOWN = "TRANSPORT_OUTCOME_UNKNOWN"
+    # Python editor bridge exhausted its bounded pending-command capacity.
+    TRANSPORT_OVERLOADED = "TRANSPORT_OVERLOADED"
     # Emitted by attach when package/protocol drift cannot be repaired inside
     # the running upstream MCP session.
     NEW_CLIENT_SESSION_REQUIRED = "NEW_CLIENT_SESSION_REQUIRED"

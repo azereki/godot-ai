@@ -1,123 +1,259 @@
 # Releasing and self-update
 
-Part of the Godot AI agent guide — see [AGENTS.md](../AGENTS.md) for the always-loaded rules.
+Part of the Godot AI agent guide — see [AGENTS.md](../AGENTS.md) for the
+always-loaded rules.
 
+Godot AI v4 has one signed release tree and one transactional v4→v4 update
+path. It does not publish an overlay-compatible legacy ZIP, and a pre-v4
+installation cannot self-update across the major-version boundary. See the
+[v4 migration guide](v4-migration.md) for that manual clean replacement.
 
-Cutting a release, and the self-update install path with its smoke-test contract.
+## Publication is intentionally closed
 
-## Releasing
+`.github/workflows/release.yml` is a read-only, fail-closed publication gate.
+It creates no tag or release and publishes nothing to PyPI. The old
+`bump-and-release.yml` workflow has been removed. Do not work around this gate
+with a tag push, ad-hoc upload, rebuilt artifact, or marketplace update.
 
-Use the GitHub Actions workflow to cut a release:
-```bash
-gh workflow run bump-and-release.yml -f bump=patch   # or minor / major
-```
-This bumps `plugin.cfg` + `pyproject.toml`, commits, tags, and pushes. The `release.yml` workflow triggers on the tag and attaches two plugin zips to the GitHub Release:
+The v3 Asset Library and Asset Store listings remain frozen on v3. V4 may be
+published only after the Phase-7 immutable A/B qualification described in
+[Packaging & Distribution](packaging-distribution.md) is complete on Linux,
+macOS, and Windows and the exact approved bytes can be promoted without a
+rebuild.
 
-- **`godot-ai-plugin.zip`** — the artifact the classic Asset Library entry ([asset 5050](https://godotengine.org/asset-library/asset/5050)) downloads directly, the self-updater installs, and the README links for manual install. Ships `addons/` plus a `godot-ai-LICENSE.txt` sibling at the zip root: the multi-top shape stops the AssetLib-tab installer on Godot ≤ 4.6 from auto-stripping a lone `addons/` root (which would install to `res://godot_ai/`), and the namespaced filename avoids clobbering the user's project `LICENSE` (issue #450). Godot 4.7+ no longer strips a bare `addons/` root, so the sibling — and the split below — can be retired once the supported floor reaches 4.7.
-- **`godot-ai-plugin-store.zip`** — the upload for the [new Godot Asset Store](https://store.godotengine.org/asset/dlight/godot-ai/) listing. `addons/` only, no root license: store review requires no license duplicate at the zip root since the canonical copy ships at `addons/godot_ai/LICENSE`. Store installs never hit the ≤ 4.6 autoskip default (browser download + manual Import, or the 4.7+ in-editor store), so the single-top shape is safe there. No `.sha256`/`.sig` sidecars — the self-updater never consumes this artifact. **Use this zip, not `godot-ai-plugin.zip`, when updating the Asset Store listing.**
+`verify-signing.yml` is safe to dispatch separately: it exercises the protected
+`release-signing` environment against a synthetic payload and publishes
+nothing. A green signing check proves only that the stored private key matches
+the embedded public key; it is not release qualification.
 
-The shape contract for both zips is pinned by `tests/unit/test_release_zip_shape.py` and re-verified against the built artifacts in the workflow's "Verify zip structure" step.
+## The only v4 plugin assets
 
-## Self-update
+Every release exposes exactly these three same-version assets:
 
-The dock checks the GitHub releases API on startup. If a newer version exists, a yellow banner appears with an "Update" button that downloads the release ZIP, hands off to `update_reload_runner.gd`, disables the old plugin, extracts over the current `addons/godot_ai/`, waits for Godot's filesystem scan, and enables a fresh plugin instance. There must be no manual editor restart and no programmatic `OS.create_process` + `quit` restart in this path.
+- `godot-ai-v4-plugin.zip` — canonical `addons/godot_ai/**` tree;
+- `godot-ai-v4-plugin.manifest.json` — canonical identity, archive metadata,
+  and complete file inventory;
+- `godot-ai-v4-plugin.manifest.sig` — 512-byte detached RSA signature over the
+  exact manifest bytes.
 
-The server process is intentionally prepared for reload, not left untouched: `prepare_for_update_reload()` stops the managed server and resets the spawn guard so the re-enabled plugin starts or adopts the correct server for the new plugin version.
+There is no `godot-ai-plugin.zip` alias and no separate Store ZIP. The manifest
+binds repository, channel, tag, semantic version, source commit, ZIP hash and
+size, and every extracted file hash. The archive itself is deterministic and
+must contain no extra or missing path.
 
-An adopted **external** backend (typically one kept alive by AI-client attach
-bridges) survives that prep by design — the plugin holds no strong ownership
-proof for it — so the re-enabled plugin always wakes up facing a
-previous-version occupant on the HTTP port. Three mechanisms make that
-converge without user intervention:
+## Build, sign, and verify candidate bytes
 
-1. **Pre-warm** (`update_manager.gd::start_install` →
-   `ClientConfigurator.prewarm_server_package`): while the plugin zip
-   downloads, a detached `uvx --from godot-ai==<new> godot-ai --version`
-   builds the new server env into the uv cache. Bridges pinned to the old
-   version respawn their cached backend near-instantly after a kill; without
-   the warm cache the plugin's cold spawn loses the port bind race every
-   time.
-2. **Bounded stale-occupant recovery** (`server_lifecycle.gd`,
-   `_stale_recovery_budget`): a `status == "success"` pending-update marker
-   arms `authorize_stale_recovery()` before the startup walk (the Update
-   click is the consent), letting either the startup walk or the WS
-   handshake-mismatch verdict request replacement of a brand-verified
-   stale-version godot-ai occupant via the weak (`status_name`) proof tier.
-   Those requests share one single-flight recovery transaction: whichever
-   path starts first owns the kill/drain/respawn and the other coalesces into
-   it. An automatic handshake recovery is also pinned to the exact stale
-   version it observed and re-probes immediately before accepting kill proof,
-   so a delayed old verdict cannot kill the fresh replacement. Automatic
-   triggers only spend budget; only user actions (Update click, dock Restart
-   click) arm it, so the kill/respawn loop cannot run unbounded. Same-version
-   and foreign occupants are never touched by this path.
-   Because a click-time pre-warm cannot be guaranteed (see the transition
-   note below, and any pre-warm failure), both weak-kill recovery flows
-   also fire the pre-warm inside their kill worker, overlapping the uv
-   build with the kill + port drain.
-3. **Auto-repin** (`mcp_dock.gd::_maybe_auto_repin_after_update`): once the
-   new server is healthy, the first completed client sweep rewrites client
-   configs to the new version pin, armed one-shot by the drained update
-   marker (which carries `from_version`/`to_version` since the gate
-   landed). **Scope gate**: only entries whose stored launch verifies
-   EXACTLY against the rendering at the replaced version — same ports,
-   exclusions, telemetry flag; nothing differs but the pin
-   (`ClientConfigurator.entry_drift_is_version_pin_only`). Any other drift
-   (an entry pointing at another editor's ports, hand-edits) stays on the
-   drift banner's human Reconfigure click; auto-rewriting those was
-   observed live to hijack every client config on the machine to a smoke
-   fixture's ports. Markers from pre-gate runners lack `from_version` and
-   arm nothing. Running client apps still need a restart to pick up the
-   new argv, which the incompatible-occupant message continues to say.
-
-**Transition-release caveat**: the upgrade INTO the release that first
-ships these mechanisms is executed by the OLD installed updater and
-runner, which contain none of them. On that one upgrade there is no
-click-time pre-warm and no auto-repin (the old runner's marker carries no
-`from_version`, and the gate fails closed without it). The stale-occupant
-recovery still works — its arming peeks only `status == "success"`, which
-old runners do write — and the in-recovery pre-warm (new code, running in
-the kill worker) covers the bind race, so the update still converges
-without manual intervention; the bridges simply stay pinned to the old
-version until the user clicks Configure all. Every subsequent upgrade gets
-the full behavior.
-
-In dev checkouts the check is skipped: `is_dev_checkout()` detects a nearby `.venv` and short-circuits to avoid offering a path that would overwrite tracked source (the addons dir is a symlink into `plugin/`). Three override knobs let you exercise the update flow without leaving the repo (resolved in priority order):
-
-1. **EditorSetting `godot_ai/mode_override`** — set it manually via Editor > Editor Settings (there is currently no dock UI that writes it). Values: empty/absent (auto) / `user` / `dev`, read by `client_configurator.gd::mode_override()`.
-2. **`GODOT_AI_MODE` env var** — fallback for CLI launches and CI. Values: `user` / `dev`. Only takes effect when the EditorSetting is unset (the setting always wins).
-3. Neither set → the `.venv`-proximity heuristic runs as before.
-
-When either override reports `user`, the yellow update banner's label includes `(forced)` (the `forced` hint in `update_manager.gd`'s banner payload) so testers don't forget they're in override mode.
-
-`_install_update` keeps a physical data-safety guard (`addons_dir_is_symlink()`) independent of the mode override: even in forced-user mode the self-install bails if `res://addons/godot_ai` is a symlink. To actually test the end-to-end extract path, unpack a release zip over a plain-directory copy of the addons dir (or test from a standalone project outside the dev tree).
-
-For self-update changes, run the local interactive smoke harness:
+`script/v4-release` is the source-of-truth CLI. Package unsigned deterministic
+bytes first:
 
 ```bash
-script/local-self-update-smoke
+python3 script/v4-release package \
+  --repo-root . \
+  --output-dir /absolute/path/to/candidate \
+  --channel stable \
+  --tag v4.0.0 \
+  --version 4.0.0 \
+  --source-commit <40-hex-source-commit>
 ```
 
-For runner-ordering changes, the current-as-base form above is the forward
-regression check: it proves the runner shipped in this branch can upgrade to a
-future zip without parse errors. A base from a pre-fix release is a historical
-constraint case: its old installed runner may still print transient parse
-errors during that one upgrade, and PRs in the new version cannot retroactively
-change that runner.
+Sign that prebuilt manifest in the protected signing environment; do not pass
+private-key material through logs or commit it to the repository:
 
-Until old two-phase runners have aged out, release shape matters for the next
-upgrade those users take: avoid adding new files that reference constants,
-methods, or static/non-static shape changes added to existing load-surface
-scripts in the same release. This applies to both `class_name` scripts and
-preload-only scripts because the failure mode is stale Script-object content,
-not just class registry skew.
+```bash
+python3 script/v4-release sign \
+  --manifest /absolute/path/to/candidate/godot-ai-v4-plugin.manifest.json \
+  --signature /absolute/path/to/candidate/godot-ai-v4-plugin.manifest.sig \
+  --private-key /secure/path/release-private-key.pem \
+  --expected-repository hi-godot/godot-ai \
+  --expected-channel stable \
+  --expected-tag v4.0.0 \
+  --expected-version 4.0.0 \
+  --expected-source <40-hex-source-commit>
+```
 
-Agent trigger: this smoke is required whenever a change touches any of these areas:
+`build` combines local package/sign/verify for development fixtures. It is not
+permission to rebuild a qualified public candidate. Verify any candidate with:
 
-- `mcp_dock.gd` update check/download/install paths
-- `update_reload_runner.gd`
-- `plugin.gd` plugin disable/enable, dock detach, or update handoff paths
-- server reload prep around `prepare_for_update_reload()`
-- release ZIP layout or install/extract behavior
+```bash
+python3 script/v4-release verify \
+  --archive /absolute/path/to/candidate/godot-ai-v4-plugin.zip \
+  --manifest /absolute/path/to/candidate/godot-ai-v4-plugin.manifest.json \
+  --signature /absolute/path/to/candidate/godot-ai-v4-plugin.manifest.sig \
+  --expected-repository hi-godot/godot-ai \
+  --expected-channel stable \
+  --expected-tag v4.0.0 \
+  --expected-version 4.0.0 \
+  --expected-source <40-hex-source-commit>
+```
 
-The harness creates a disposable project with a physical addon copy, stages a synthetic v(N+1) ZIP that adds a new typed Dict/Array field read from `_exit_tree`, forces the Update banner to use that local ZIP, records the macOS DiagnosticReports baseline, and launches Godot. The only operator action is to click Update in the dock. Passing means the editor stays alive without restart, the plugin version advances, `user://godot_ai_update/` is consumed, no new Godot `.ips` appears, the vNext `_exit_tree` trigger does not print during the update window, and `/godot-ai/status` is live at the new `server_version` after the plugin reloads.
+The standalone migration verifier is exactly `script/v4-release` plus
+`src/godot_ai/release_verify.py` from the named source commit. GitHub release
+notes are mutable and must not be treated as a trust anchor. Before publication,
+a separately administered channel must authenticate the source commit, both
+verifier digests, all three asset identities, the embedded public-key SPKI
+fingerprint, and its own attestation identity. The migration guide must name
+that operational channel; until it does, publication stays closed. The two
+verifier files and repository documentation are not their own trust anchor.
+
+## V4 self-update transaction
+
+The dock considers only a newer `v4.*` GitHub release with the exact three
+bounded assets above. An Update click runs this sequence:
+
+1. Preflight refuses an unresolved transaction, retained backup that still
+   needs archival, unsafe recovery namespace, active transaction lock, or a
+   second live editor lease before download or quiescence.
+2. The actor allocates a random owner-private download directory under the
+   external recovery root. The manager downloads only the three trusted HTTPS
+   release-asset URLs into that exact directory, enforcing release-declared
+   sizes and exact filenames. Successful preparation or cancellation removes
+   the bounded files; a later exclusive preflight safely collects a stale
+   interrupted directory.
+3. The Python transaction actor verifies the signature and complete inventory,
+   extracts a fresh stage, and publishes `prepared.json`. Its expected stage
+   identity comes from the signed manifest—not from a later re-hash of mutable
+   stage contents.
+4. The root quiesces plugin-owned work and asks the value-only coordinator to
+   disable the plugin. The coordinator owns no live files or plugin/Dock
+   reference.
+5. The actor reconstructs the prepared intent, proves the stage still equals
+   the signed inventory, acquires the activation lock, renames the complete
+   live tree to a retained backup, and renames the complete stage into place.
+   It never overlays files.
+6. The coordinator hands the exact initiating actor command across the swap in
+   a bounded environment envelope. After Godot scans and enables the new tree,
+   the new plugin's bounded startup barrier uses that old actor—never a newly
+   resolved/downloaded package—to publish readiness and claim the result before
+   ordinary lifecycle, transport, updater, or client work begins. Interactive
+   editors run this barrier on one joined worker so a cold, offline, or wedged
+   actor cannot freeze the editor UI; export/import launches run it
+   synchronously with the same fixed deadline before registering the export
+   filter.
+7. A successful claim remains the durable client-migration obligation. The
+   root repins configured clients, then asks the exact actor that cleared this
+   startup barrier to publish an
+   immutable `migration-complete.json` bound to the claim, intent, signed live
+   tree, and current editor lease. Normal server/client/update startup is
+   released only after that acknowledgement. A crash before it causes the next
+   ordinary startup to rediscover the claim and repeat the migration barrier;
+   a crash after publication does not repeat completed work. External clients
+   reconnect to the stable endpoint; an individual restart is remediation for
+   a stale client, not a release gate that the plugin cannot verify.
+8. Failure rolls the complete old tree back when that can be proven safe.
+   Ambiguous state becomes `repair_required`; normal startup remains barred
+   until the explicit repair actor resolves it.
+
+The prepared, intent, journal, readiness, result→claim, migration-completion,
+activation-lock, and editor-lease records live in a private recovery root
+outside the project on the same filesystem. Namespace changes are atomic
+renames. Records are strict, size-bounded canonical JSON; links, unsafe POSIX
+ancestors, wrong ownership/modes, identity drift, stale actors, and unknown
+fields fail closed.
+
+V4 transaction records use schema 1. Claimed transaction directories remain
+part of startup and preflight evidence: the actor scans and validates that
+retained history before deciding that no repair or M6 obligation remains. There
+is no automatic history compaction. Do not hand-edit or delete record JSON to
+bypass a refusal. A future record-schema change must first ship an explicit
+bounded migration/compaction policy for retained v4 history.
+
+Only the initiating editor lineage may cross an active activation lock. An
+editor already open holds a lease and blocks preflight; an editor opened after
+lock acquisition refuses before composition and disables the plugin. Re-enable
+it or restart after the transaction so Godot loads the terminal tree afresh.
+V4 never lets an old in-memory script continue as a read-only "observer" of a
+newly renamed tree.
+
+### Recovering a stranded client mutation lock
+
+Automatic Configure/Remove writes and M6 repins share one account-wide durable
+lock at `OS.get_config_dir()/godot-ai/client_mutation.lock` (the error prints
+the exact platform path). Each claim covers the mutation and its readback. If a
+timed-out CLI mutation cannot prove that its process tree stopped, the lock
+survives plugin reload, editor restart, and crashes, and later client mutation
+or M6 startup fails closed.
+
+Stop the relevant MCP client processes—or reboot—then explicitly remove the
+**entire exact lock directory printed in the error** before retrying. Restarting
+Godot alone is insufficient, and deleting only `owner.json` deliberately leaves
+the deny marker in place. This recovery concerns global client configuration;
+it does not authorize editing update-transaction records or rolling back the
+live add-on.
+
+### Retained backup and the next update
+
+A successful update keeps one retained backup. Godot AI never silently deletes
+it. After validating and externally backing up the new version, close every
+editor for the project and archive it explicitly. Use the exact
+`recovery_root` printed by `prepare`/`root`—not its parent directory:
+
+```bash
+python -m godot_ai.update_transaction archive-backup \
+  --project /absolute/path/to/project \
+  --install /absolute/path/to/project/addons/godot_ai \
+  --recovery-root /absolute/path/to/recovery-base/INSTALL-ID \
+  --editors-closed
+```
+
+The actor refuses archival if it finds a live or unverifiable editor lease or
+an activation lock. On success it atomically moves the retained tree into
+hash-named immutable history, allowing the next update while preserving
+recovery evidence.
+
+The CLI deliberately distinguishes the two meanings. `--recovery-root` is an
+exact, already-derived install root and is required by `activate`,
+`abort-prepared`, `repair`, and `archive-backup`. `--recovery-base` is the
+optional parent used by `root`, `prepare`, `startup`, and `lease`; those
+commands append the deterministic install ID themselves. Passing an exact
+root as a base would derive a different path and is refused rather than
+guessing operator intent.
+
+### Recovering an abandoned prepared update
+
+If an editor dies after `prepare` (or after publishing an abort intent) but
+before activation, first make sure that editor process is gone. Use the exact
+project, install, recovery-root, and transaction values printed for the failed
+update, and invoke the actor from the same exact installed environment:
+
+```bash
+python -m godot_ai.update_transaction abort-prepared \
+  --project /absolute/path/to/project \
+  --install /absolute/path/to/project/addons/godot_ai \
+  --recovery-root /absolute/path/to/recovery-base/INSTALL-ID \
+  --transaction TRANSACTION-ID \
+  --dead-owner-takeover
+```
+
+For an `uvx` installation, use the same isolated/no-config/no-build,
+official-PyPI resolver options rendered by the plugin, followed by
+`--from godot-ai==LIVE_VERSION godot-ai-update-transaction`; substitute the
+exact version in the still-live add-on's `plugin.cfg`. Do not let an alternate
+index from local uv configuration choose a repair actor. The takeover refuses
+while the prepared editor, another abort requester, or a prior repairer remains
+live or unverifiable. It also refuses after activation begins or if any bound
+identity/hash has changed. On success it deletes only the authenticated staged
+candidate, publishes durable cleanup, and leaves the live add-on untouched.
+Do not use this command as a general rollback tool; post-activation ambiguity
+belongs to the separate `repair` command.
+
+## Required self-update smoke
+
+Any change to release identity/layout, verification, update discovery,
+transaction records, lease/startup barriers, plugin disable/enable, client
+repinning, or recovery must run:
+
+```bash
+python script/local-self-update-smoke
+```
+
+The harness builds a disposable signed v4-to-v4 fixture from the current tree and
+launches a real editor. The operator clicks **Update** in the dock. Passing
+requires exact version/tree advancement, a healthy authenticated backend after
+reload, no parse/load error in the disable→enable window, no new macOS Godot
+crash report, no activation artifact inside the project, and a retained
+recoverable backup. This interactive check is release-blocking and supplements,
+rather than replaces, the automated failpoint, rollback, multi-editor, exact
+release-shape, and clean-migration suites. Pre-v4 updater behavior is a completed
+one-time audit recorded in
+[pre-v4-updater-one-time-evidence.md](../verification/pre-v4-updater-one-time-evidence.md),
+not a recurring compatibility obligation.

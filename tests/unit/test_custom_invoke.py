@@ -162,9 +162,7 @@ def test_list_empty_without_active_session(fresh_service) -> None:
 
 def test_list_scoped_to_active_session(fresh_service) -> None:
     _register(fresh_service, "s1")
-    fresh_service.update_session_tools(
-        "s2", [CustomToolDefinition(name="other", description="d")]
-    )
+    fresh_service.update_session_tools("s2", [CustomToolDefinition(name="other", description="d")])
     runtime = _FakeRuntime("s1")
     result = asyncio.run(custom_mod.custom_list(runtime))
     assert [t["name"] for t in result["tools"]] == ["my_tool"]
@@ -176,9 +174,7 @@ def test_list_hides_disabled_but_service_retains_definition(fresh_service) -> No
     result = asyncio.run(custom_mod.custom_list(runtime))
     assert result["tool_count"] == 0
     assert fresh_service.get_tool("my_tool", session_id="s1") is None
-    retained = fresh_service.get_tool(
-        "my_tool", session_id="s1", include_disabled=True
-    )
+    retained = fresh_service.get_tool("my_tool", session_id="s1", include_disabled=True)
     assert retained is not None
     assert retained.enabled is False
 
@@ -213,10 +209,10 @@ def test_event_rejects_unbounded_tool_count() -> None:
         CustomToolsChangedEvent()
 
 
-# --- token gate on custom_tools_changed ---
+# --- authenticated custom_tools_changed event ---
 
 
-def _event_stub(auth_token: str | None, token_authenticated: bool, service):
+def _event_stub(service):
     from godot_ai.sessions.registry import Session, SessionRegistry
 
     registry = SessionRegistry()
@@ -225,12 +221,10 @@ def _event_stub(auth_token: str | None, token_authenticated: bool, service):
         godot_version="4.4.1",
         project_path="/tmp/demo",
         plugin_version="0.0.1",
-        token_authenticated=token_authenticated,
     )
     registry.register(session)
     return types.SimpleNamespace(
         registry=registry,
-        _auth_token=auth_token,
         _custom_tool_service=service,
         ## _handle_event schedules the broadcast via the server; the stub
         ## only needs it to be callable (catalog mutation is what's asserted).
@@ -253,22 +247,8 @@ def _push_tools(stub) -> None:
     )
 
 
-def test_tokened_launch_drops_unauthenticated_catalog_push(fresh_service) -> None:
-    stub = _event_stub("secret", token_authenticated=False, service=fresh_service)
-    _push_tools(stub)
-    assert fresh_service.get_tools(session_id="demo@a3f2") == []
-
-
-def test_tokened_launch_accepts_authenticated_catalog_push(fresh_service) -> None:
-    stub = _event_stub("secret", token_authenticated=True, service=fresh_service)
-    _push_tools(stub)
-    assert [t.name for t in fresh_service.get_tools(session_id="demo@a3f2")] == ["t"]
-
-
-def test_tokenless_launch_accepts_catalog_push(fresh_service) -> None:
-    ## Compat identity model unchanged: no token configured → any local
-    ## session may publish (budgets still bound the payload).
-    stub = _event_stub(None, token_authenticated=False, service=fresh_service)
+def test_authenticated_session_accepts_catalog_push(fresh_service) -> None:
+    stub = _event_stub(fresh_service)
     _push_tools(stub)
     assert [t.name for t in fresh_service.get_tools(session_id="demo@a3f2")] == ["t"]
 

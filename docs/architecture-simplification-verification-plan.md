@@ -1,21 +1,24 @@
 # v4 Architecture Simplification — Verification Plan
 
 - Date: 2026-08-30
-- Status: companion to
-  [architecture-simplification-plan.md](architecture-simplification-plan.md),
-  draft 3
+- Status: approved executable release contract; the ownership redesign and
+  core update reducer have a local checkpoint, but the complete section-8.1
+  failpoint surface is not implemented and no final Phase-7 qualification
+  bundle or publication approval is recorded
 - Purpose: make migration, updater, security, release, crash, and stress gates
   executable against exact bytes
-- Release floor: Godot 4.7+
+- Release range: Godot 4.7+ within the 4.x line
 - Required desktop platforms: Windows, macOS, Linux
 
 ## 1. Gate rules
 
-This document is a release contract, not a menu.
+This document is the v4-candidate release contract, not a menu. The historical
+updater classification was a one-time boundary decision completed before the
+rebuild; it is not silently promoted into a recurring candidate matrix.
 
-- Required engines, historical assets, candidate packages, signing access,
-  machines, and platforms may not skip. Missing input means the candidate is
-  not qualified.
+- Required v4 engines, candidate packages, signing access, machines, and
+  platforms may not skip. Missing candidate input means the candidate is not
+  qualified.
 - Tests run against unmodified candidate bytes. A harness may redirect an
   explicitly authorized qualification channel; it may not patch GDScript,
   synthesize expected digests, bypass discovery/signatures, substitute a dev
@@ -35,17 +38,23 @@ Before the first architecture tranche, check in a verification manifest with:
 - each characterization-test commit and how the identical test runs on oracle
   and rebuild;
 - every outstanding-PR head/patch ID and disposition;
-- every historical tag commit and downloaded asset SHA-256;
+- the retained one-time historical evidence digest and its reviewed boundary
+  decision (not deleted historical downloads or harnesses);
 - OS image/runner identity, architecture, Godot binary SHA-256, Python/uv
-  version, and dependency locks;
+  version, exact behavior-defining pins, and the complete resolved distribution
+  artifact inventory (name/version/filename/size/SHA-256) for every row;
 - fixed workload seeds and generated operation traces;
 - numeric error, latency, recovery, memory, file-descriptor, and thread bounds;
 - all failpoint IDs and expected on-disk states;
 - expected-red, current-green, oracle-only, and intentional-v4-difference rows;
 - evidence output schema and retention path.
 
-The manifest itself is versioned and included in the pre-publication
-qualification bundle.
+The implementation-start manifest was a temporary audit scaffold. Once its
+decisions were incorporated into the approved plan and executable gates, the
+scaffold was removed rather than maintained as a second source of truth.
+Release-candidate inputs and outputs are still frozen in the pre-publication
+qualification bundle. The immutable pre-v4 investigation is distilled into
+[pre-v4-updater-one-time-evidence.md](../verification/pre-v4-updater-one-time-evidence.md).
 
 ## 3. Mandatory platform matrix
 
@@ -53,81 +62,61 @@ Pin exact current-stable patch/build hashes at implementation start. At minimum:
 
 | Platform | Primary architecture | Godot rows | Python rows |
 |---|---|---|---|
-| Windows | x86_64 | 4.7.0, current stable if byte-distinct | 3.11, 3.13, 3.14 |
-| macOS | arm64 | 4.7.0, current stable if byte-distinct | 3.11, 3.13, 3.14 |
-| Linux | x86_64 | 4.7.0, current stable if byte-distinct | 3.11, 3.13, 3.14 |
+| Windows | x86_64 | 4.7.0, current stable 4.x if byte-distinct | 3.11, 3.12, 3.13, 3.14 |
+| macOS | arm64 | 4.7.0, current stable 4.x if byte-distinct | 3.11, 3.12, 3.13, 3.14 |
+| Linux | x86_64 | 4.7.0, current stable 4.x if byte-distinct | 3.11, 3.12, 3.13, 3.14 |
 
-Each platform/Godot row is keyed by the pinned binary hash. If current stable
+Each platform/Godot row is keyed by the pinned binary hash. If current stable 4.x
 is byte-identical to 4.7.0 when inputs freeze, deduplicate it rather than
 pretending to have two builds; every gate derives its row count from the unique
 pinned manifest. A newer-development Godot can run as a non-blocking Linux
 canary; it does not replace a required stable row.
 
 Godot 4.5 and 4.6 run explicit refusal/documentation checks: v4 does not enable,
-the user sees the 4.7 floor, and no tree mutation occurs.
+the user sees the 4.7 floor, and no tree mutation occurs. Recurring hosted CI
+runs this unsupported-engine floor guard on Linux only; it is not a supported
+Windows/macOS qualification row. Every supported Godot 4.7+ row still runs on
+all three required platforms.
 
 Core Python unit/integration suites run all listed versions on all platforms.
 The most expensive manual/failure rows may use Python 3.11 and 3.14, provided
-ordinary CI covers 3.13 and the exact-candidate server path is proven at both
-the floor and ceiling.
+ordinary CI covers 3.12 and 3.13 and the exact-candidate server path is proven
+at both the floor and ceiling.
 
-## 4. Historical updater inventory and no-mutation proof
+## 4. Completed historical updater boundary proof
 
-### 4.1 Complete classification
+This section is superseded as an executable release gate by the retained
+[one-time evidence](../verification/pre-v4-updater-one-time-evidence.md). That
+audit classified the available tags and established the product boundary:
+pre-v4 updaters select the legacy asset by exact name, while v4 publishes only
+the distinct v4 asset. Its temporary downloaded trees, platform-specific
+harness, and full report were intentionally deleted after review. They are not
+reproducible inputs and must not be described as no-skip candidate evidence.
 
-Mechanically enumerate every release tag. For each tag, record:
+Recurring v4 qualification retains only the durable consequences:
 
-- whether an updater exists;
-- release parser and asset-selector implementation hash;
-- Update/start-install action implementation hash;
-- temp/backup/install implementation hash;
-- state-reset/stale-URL behavior;
-- expected missing-legacy-asset outcome.
+- the release inventory has one v4 plugin ZIP and no legacy
+  `godot-ai-plugin.zip` alias;
+- the v4 migration page and release fallback remain canonical;
+- the manual installer starts from a byte-hashed pre-v4-shaped add-on tree,
+  moves that entire tree externally, and never overlays it; and
+- no v4 updater or transport compatibility branch is added for pre-v4 code.
 
-Group identical behavior by normalized patch hash. The source inventory already
-found 104 local `v*` tags: v0.2.0/v0.3.0 have no updater and the other 102 use an
-exact `godot-ai-plugin.zip` equality match. The executable inventory must
-reproduce that result rather than trusting this prose.
-
-Always include these milestone representatives plus one exact tag for every
-additional generated behavior class:
-
-- v0.3.1, v1.0.0, v1.5.1, v2.1.1;
-- v2.2.0, v2.2.2, v2.3.1, v2.4.0;
-- v2.7.6, v3.0.0, v3.1.5, v3.2.4.
-
-### 4.2 Runtime no-mutation rows
-
-Run actual extracted released code, not a reimplementation.
-
-For each behavior class:
-
-1. start from a clean, hashed old add-on/project tree;
-2. present the final v4.0 release metadata and complete asset inventory, with
-   no `godot-ai-plugin.zip` alias;
-3. exercise fresh discovery;
-4. where supported, first present a v3 response and then v4 to test stale URL
-   reset/repeated discovery;
-5. invoke the real Update/start-install button path;
-6. assert no v4 payload URL is selected;
-7. assert the only navigation is the canonical releases/migration page;
-8. assert byte-identical project/add-on hashes;
-9. assert no temp, backup, result, marker, or false-success artifact;
-10. assert bounded completion and retained logs/UI state.
-
-Run all behavior classes on Linux at Godot 4.7. Run v3.2.4 and the oldest
-compatible representative on every mandatory platform. Any behavior class that
-cannot execute on 4.7 receives a source proof plus an executable compatible-
-engine row; it does not disappear as a skip.
+Reopening the historical compatibility decision requires a new, independently
+reviewed archaeology run. It is not required to qualify an otherwise unchanged
+v4 candidate. The retained evidence accurately describes its narrower
+macOS/Godot 4.7 execution; it does not imply Linux, Windows, or historical-
+engine runtime coverage.
 
 ## 5. Bootstrap verifier and clean migration
 
 ### 5.1 Independent trust root
 
-v4.0 uses the existing release-signing key. The migration instructions link a
-small verifier at a full immutable pre-v4 source commit and show the expected
-public-key fingerprint in at least one independently maintained surface not
-mutable with GitHub release assets.
+v4.0 uses the existing release-signing key. The migration instructions obtain
+the small verifier from the exact immutable v4 release source commit. At least
+one independently administered surface, not mutable with GitHub release assets,
+authenticates that commit, both verifier-file digests, every release-asset
+identity, and the expected public-key fingerprint.
 
 The verifier uses the user's Godot executable or another already-required
 runtime; it does not download executable dependencies during verification. It
@@ -154,27 +143,40 @@ The harness executes the published commands and paths verbatim:
 
 1. download candidate archive/manifest/signature;
 2. run the standalone verifier;
-3. prove every editor using the canonical project/install root is closed;
-4. stop old MCP clients and old managed backend;
-5. canonicalize a recovery destination outside the entire project;
-6. reject source/destination aliases, collisions, symlinks, junctions, reparse
+3. from an initially cold qualification cache, run the documented installer's
+   isolated/no-config/no-build exact
+   `uvx --from godot-ai==<target> godot-ai-update-transaction identity`
+   prewarm, through the explicitly authorized private-index environment, and
+   prove package/protocol identity before any project mutation;
+4. prove every editor using the canonical project/install root is closed;
+5. stop old MCP clients and old managed backend;
+6. canonicalize a recovery destination outside the entire project;
+7. reject source/destination aliases, collisions, symlinks, junctions, reparse
    traversal, root disagreement, or unsafe permissions under the platform
    threat claim;
-7. rename the old add-on to the recovery root when it is on the same
-   filesystem; otherwise copy, compare the full tree/hash, and only then remove
-   the live source;
-8. extract and verify the exact v4 tree;
-9. reopen/enable v4;
-10. repin and restart configured clients;
-11. start the matching private candidate server;
-12. exercise authenticated transport, discovery, representative read/write,
+8. require the recovery root to share the project's filesystem, then rename
+   the old add-on there; refuse cross-filesystem migration before mutation;
+9. extract and verify the exact v4 tree;
+10. reopen/enable v4;
+11. repin owned configuration for configured clients and durably complete
+    migration;
+12. start the matching private candidate server, proving clients can reconnect
+    to the stable endpoint;
+13. exercise authenticated transport, discovery, representative read/write,
     game run/capture where supported, restart, and editor reopen;
-13. prove the external backup remains intact and restorable.
+14. prove the external backup remains intact and restorable.
 
-Required old bases are v2.7.6, v3.1.5, and v3.2.4 across every unique pinned
-desktop/Godot row. v3.1.5 receives special attention because it is the largest
-measured exact-version cohort. Add an older pre-signing base on Linux for the
-one-time trust/bootstrap documentation path.
+Missing `uvx`, timeout/offline resolution, malformed identity, wrong package or
+protocol identity, and an extra response field each fail before an install
+claim, recovery directory, marker, backup, or live-tree mutation exists.
+
+Each mandatory desktop row runs the documented installer against fresh,
+byte-hashed pre-v4-shaped trees representing the supported clean-break input:
+an old `plugin.cfg`, old-only files, and owned client entries. At least one row
+uses a retained exact v3.2.4 add-on tree when that artifact is available; its
+absence does not resurrect deleted historical-code execution as a release
+gate. The installer proof concerns exact-tree backup/replacement and the v4
+startup marker, not whether old plugin code still executes on a modern engine.
 
 The harness scans the entire project after reopening for duplicate/stale
 `class_name` failures and parse cascades. A backup anywhere under the project
@@ -190,7 +192,7 @@ Before publication:
 - classic Asset Library and Asset Store v3 listings are frozen/deprecated and
   do not serve v4 bytes;
 - source archives cannot be mistaken for updater payloads;
-- every old Update fallback lands on instructions that state Godot 4.7+,
+- every old Update fallback lands on instructions that state Godot 4.7+ in 4.x,
   editor closure, external backup, and exact replacement.
 
 ## 6. Exact two-candidate qualification
@@ -199,13 +201,17 @@ Before publication:
 
 - **A:** final stable identity `4.0.0`, source SHA A. A's plugin ZIP, signed
   manifest, wheel, and sdist are the only bytes eligible for v4.0 publication.
-- **B:** qualification-only identity `4.1.0rc1`, source SHA B. B is a reviewed
-  minimal child of A whose only functional changes are version/channel metadata
-  and removal of an explicitly v4.0-only migration marker, proving exact-tree
-  deletion. B is never relabeled or published as stable v4.1.
+- **B:** qualification-only identity `4.0.1`, source SHA B. B is a reviewed
+  minimal child of A whose only runtime change is version/package identity. It
+  also removes the bundled, runtime-inert `addons/godot_ai/README.md`, proving
+  that activation deletes an A-only managed-tree file instead of overlaying B.
+  `4.0.1` is permanently reserved for qualification: B is never relabeled or
+  published, and no future release may reuse that version.
 
-Both manifests bind source SHA, repository, channel, tag/version, artifact
-name/size/digest, and inventory.
+Both plugin manifests bind source SHA, repository, channel, tag/version,
+artifact name/size/digest, and exact plugin-tree inventory. Each candidate's
+approval digest set additionally binds its wheel and sdist plus every artifact
+in each qualification row's resolved Python distribution inventory.
 
 ```text
 accepted green tranches
@@ -215,12 +221,12 @@ SHA A / 4.0.0
   |-- credential-free build --> unsigned bundle A
   |-- protected signer -------> signed digest set A
   |
-  `-- reviewed minimal child SHA B / 4.1.0rc1
+  `-- reviewed minimal child SHA B / 4.0.1 (qualification only)
        |-- credential-free build --> unsigned bundle B
        `-- protected signer -------> signed digest set B
 
 A + B digests
-  |-> historical no-mutation
+  |-> retained historical boundary decision + v4 no-legacy-alias gate
   |-> clean migration to exact A
   |-> exact A -> B hot self-update
   |-> failure/lock/repair/storm evidence
@@ -239,22 +245,28 @@ Qualification provides:
 
 - a private or draft GitHub-like API/asset endpoint serving exact A under the
   final `v4.0.0` tag/artifact path and exact B under its unique
-  `v4.1.0rc1` path;
+  `v4.0.1` qualification path;
 - stable artifact names and documentation commands whose local paths and
   arguments are identical before and after publication; qualification changes
   only an explicit process-local authorized release base, never candidate
   bytes or the reviewed instructions;
 - B served through the normal v4 discovery/parser/authentication path;
-- a private PEP 503 index containing the exact A and B wheel/sdist bytes;
+- a private PEP 503 index containing the exact A and B wheel/sdist bytes and
+  the attested dependency artifacts selected for every qualification row;
 - an explicit process-local qualification switch and endpoint/index
   authorization that cannot be enabled by downloaded metadata;
 - proof that private endpoints/tokens are never persisted into client config,
   project files, result records, logs, or telemetry.
 
-The unmodified A plugin uses normal `uvx --from godot-ai==<version>` semantics
-against the authorized private index. The matrix exercises prewarm, server
-restart, client repin, client restart, attach, and matching-version transport.
-A dev venv, source symlink, or public-package substitution fails this gate.
+The unmodified A plugin is launched with
+`GODOT_AI_QUALIFICATION_PYTHON_INDEX=1` plus an explicit private `UV_INDEX` or
+`UV_DEFAULT_INDEX`. This is the only mode in which its shared uv resolver
+policy omits the production official-PyPI arguments and preserves uv index
+environment variables. The matrix exercises prewarm, server restart, client
+repin, client restart, attach, and matching-version transport, and proves the
+switch, endpoint, and credentials never enter persisted argv or evidence. A
+dev venv, missing switch/index pair, source symlink, or public-package
+substitution fails this gate.
 
 ### 6.3 Publication promotion
 
@@ -272,6 +284,8 @@ A dev venv, source symlink, or public-package substitution fails this gate.
 If GitHub publication fails after PyPI, resume with the immutable A artifacts.
 Before a future stable v4.1 release, public v4.0 must qualify the exact private
 v4.1 candidate that will be published byte-for-byte; B cannot stand in for it.
+The next publishable stable patch after v4.0.0 is at least v4.0.2 because the
+v4.0.1 identity has been burned by qualification.
 
 ## 7. Interprocess activation-lock matrix
 
@@ -286,14 +300,22 @@ Required cases:
   removal, the same update may proceed without rotating or overwriting it;
 - a non-initiating editor already live on the root: activation refuses before
   mutation;
-- a second editor starts after lock acquisition: it enters the activation
-  barrier as observer and runs no normal side effects;
+- a second editor starts after lock acquisition: startup refuses before normal
+  composition, persists no lease or outcome, and disables the plugin rather
+  than continuing an old compiled tree as an observer;
 - after the matching terminal claim exists and the activation lock is
-  released, that observer validates without renaming/consuming the claim,
-  exits the barrier exactly once, starts its normal owners, and emits no
-  `PostUpdateOutcome` fanout, client repin, or update-outcome telemetry;
+  released, that editor must re-enable the plugin or restart so Godot loads the
+  terminal tree afresh; the refused instance emits no `PostUpdateOutcome`
+  fanout, client repin, or update-outcome telemetry;
+- a successful claim without `migration-complete.json` is rediscovered on
+  every ordinary startup; crashes before repin, during repin, and after repin
+  but before durable completion all repeat the M6 barrier and start no server;
+- migration completion requires the exact current editor lease, successful
+  claim/journal, and signed live-tree identity; only its durable actor
+  acknowledgement releases normal startup or permits another update;
 - a missing, malformed, mismatched, timed-out, or still-locked terminal state
-  keeps the observer barred and points to existing-runtime repair;
+  keeps every non-initiating startup barred and points to existing-runtime
+  repair;
 - different canonical roots do not block each other;
 - case, separator, relative, symlink, junction, and reparse aliases resolve to
   the same identity or fail closed;
@@ -301,6 +323,9 @@ Required cases:
 - killed/stale owner cannot be taken over automatically;
 - repair takeover requires explicit user action, closed editors, dead-process
   fingerprint proof, and atomic claim;
+- explicit `abort-prepared --dead-owner-takeover` can clean only authenticated
+  preactivation stage state after proving the prepared editor and any prior
+  abort requester/repairer dead or PID-reused; it never mutates the live tree;
 - PID reuse, malformed/unknown records, mismatched roots/transactions, and
   unverifiable ownership fail closed;
 - only the initiating reload lineage writes readiness and claims result;
@@ -318,6 +343,7 @@ barrier IDs, including:
 - recovery-root and activation-lock creation;
 - editor census and client quiescence;
 - candidate/manifest/staged-tree revalidation;
+- prepared-state temporary write and atomic commit;
 - intent temporary write and atomic commit;
 - disable request and verified disable;
 - live-to-backup rename;
@@ -327,9 +353,12 @@ barrier IDs, including:
 - result temporary write and atomic commit;
 - result rename-to-claim;
 - claim validation and pre-fanout;
+- migration-completion publication;
 - fanout and startup-barrier release;
 - every rollback/quarantine rename, rescan, and re-enable;
 - repair transaction claim and each repair effect;
+- prepared-update abort intent, stage deletion/sync, cleanup publication, and
+  preactivation dead-owner repair-claim publication/reclamation;
 - replacement-authorization spend;
 - activation-lock release.
 
@@ -349,7 +378,8 @@ and never leaks its token.
 Each before/after failure and process-kill case declares:
 
 - expected live, stage, backup, and quarantine tree hashes;
-- expected lock, intent, readiness, result, and claim presence/content;
+- expected prepared, activation-lock, editor-lease, intent, journal, readiness,
+  result, claim, and migration-completion presence/content;
 - which process may still be live;
 - whether normal startup remains barred;
 - exact next restart or repair action;
@@ -372,7 +402,7 @@ Qualification therefore runs repeated fresh-snapshot cycles:
 - 10 exact A -> B hot updates on Windows;
 - 10 exact A -> B hot updates on macOS;
 - 5 exact A -> B hot updates on Linux;
-- 5 clean v3.1.5/v3.2.4 -> A migrations per platform;
+- 5 clean byte-hashed pre-v4-shaped tree -> A migrations per platform;
 - repeated Dock detach/reattach and plugin disable/enable around success and
   failure rows.
 
@@ -414,13 +444,22 @@ are generated once from these fixed seeds and retained:
 - `41002`
 - `41003`
 
+Target IDs are also RNG inputs and therefore locked: single-editor profiles use
+`editor-a`; multi-editor uses `editor-a`, then `editor-b`. A different CLI name
+is a different schedule and is rejected rather than compared to canonical
+coverage floors.
+
 ### 10.1 Steady profile
 
 - 8 workers;
 - 20 waves;
 - 25 calls per worker/wave (4,000 calls/seed);
-- minimum 100 calls per supported tool domain across the profile;
+- minimum 80 calls per supported domain, except 70 for the trace-bounded
+  session/signal domains and 25 for project (the same floors apply to
+  multi-editor);
 - no intentional reload;
+- exactly one live session at the bound endpoint, matching the authorized
+  disposable project root and captured editor PID;
 - every unique pinned platform/Godot row.
 
 ### 10.2 Reload-churn profile
@@ -429,8 +468,12 @@ are generated once from these fixed seeds and retained:
 - 30 waves;
 - 25 calls per worker/wave (9,000 calls/seed);
 - plugin/Dock reload every third wave;
+- workers continue load through the recorded reload window; recovery must
+  identify exactly one new session with the original editor PID and canonical
+  project path before the scratch scene is considered recovered;
 - managed and adopted-server topologies;
 - client configure/repin churn;
+- minimum 180 calls per supported domain and 60 for project;
 - latest-stable Godot on all platforms plus Linux 4.7.0.
 
 ### 10.3 Multi-editor profile
@@ -439,6 +482,8 @@ are generated once from these fixed seeds and retained:
 - four workers per editor;
 - 20 waves, 25 calls per worker/wave;
 - at least half of calls explicitly session-pinned;
+- target-local rotation barriers: the rotating editor is quiesced while the
+  other editor remains under load;
 - focus, Dock, plugin, client, and server churn;
 - all three platforms at current stable Godot.
 
@@ -446,22 +491,37 @@ are generated once from these fixed seeds and retained:
 
 - zero unexpected errors;
 - `CONNECTION`/`EDITOR_NOT_READY` only inside recorded reload windows and zero
-  outside;
+  outside; `SESSION` is always unexpected;
 - 100% required reload survival;
 - recovery p95 <= 15 seconds and maximum <= 30 seconds;
 - per-operation p95/p99 below the checked-in baseline-derived thresholds and
   absolute caps;
 - no operation/domain below its minimum coverage;
-- after 60 seconds quiescence: zero pending requests, exact expected
-  session/process/capability/lock counts, no orphan transaction, and no tree
-  drift;
+- every target is an explicitly bound absolute disposable project containing
+  the exact qualification marker; locked input-map operations are read-only;
+- the original saved `res://` scene is observed before setup, restored and
+  observed after the run, and only the run-owned `res://_stormtest/` tree is
+  removed;
+- the final durable project inventory exactly matches its preflight inventory
+  (the generated root `.godot/` cache is excluded); cleanup incompleteness or
+  any path-level drift fails the storm contract;
+- after 60 seconds quiescence, the surrounding qualification row (outside the
+  storm runner) records zero pending requests, exact expected
+  session/process/capability/lock counts, and no orphan transaction;
 - checked-in absolute RSS/file-descriptor/thread ceilings and no monotonic
   post-quiescence growth across the five repetitions;
 - replay of any failed generated trace reproduces the same operation sequence.
 
-The current storm harness must be extended to seed per worker, route multiple
-editors, record p99, enforce thresholds, and exit nonzero on contract failure
-before it can satisfy this gate.
+The storm harness now seeds independent worker streams, retains/replays an
+operation trace, routes multiple explicit editors, records p99, enforces the
+checked-in contract, proves reload replacement identity, and gates cleanup and
+tree equality. The verification manifest still lists latency and resource
+ceilings as unresolved baseline fields; those values must be reviewed and
+checked in before these profiles can grant final release approval.
+The locked-profile preflight enforces that boundary: it refuses while any
+baseline field remains explicitly unresolved or while overall/per-operation
+p95 and p99 ceilings are absent. Non-locked exploratory runs remain available
+to collect the missing evidence but cannot satisfy this release gate.
 
 ## 11. Evidence and release approval
 
@@ -472,9 +532,11 @@ The bundle required for publication approval contains:
 - plan/review/verification versions;
 - pinned base/oracle/PR/tag manifest;
 - source A/B SHAs and parentage;
-- plugin/Python artifact inventories, signatures, and hashes;
+- plugin/Python artifact inventories, signatures, sizes, and hashes;
+- per-row complete resolved distribution inventories and successful startup
+  enforcement of the exact behavior-defining package versions;
 - protected-signing approval identity;
-- historical updater class inventory and runtime reports;
+- the compact one-time pre-v4 updater evidence record;
 - all platform/Godot/Python results;
 - migration transcripts and verifier output;
 - interprocess/failpoint/crash reports;
@@ -493,6 +555,8 @@ After publishing the already-approved A bytes, append a separate attestation
 containing:
 
 - public PyPI wheel/sdist download URLs and hash comparisons;
+- public dependency artifact URLs and hash comparisons for the exact
+  publication-smoke resolution on every supported OS/Python row;
 - public GitHub asset inventory, download URLs, and hash comparisons;
 - release/tag visibility and canonical migration-link checks;
 - the immutable pre-publication approval identifier and digest set;

@@ -1,12 +1,10 @@
 @tool
 extends McpTestSuite
 
-const PluginScript := preload("res://addons/godot_ai/plugin.gd")
-
 ## Deterministic tests for the `--allow-host` LAN opt-in plumbing (#507):
 ## the pure McpAllowHosts helpers (value normalization, token validation,
 ## LAN-address pick, manual-command LAN URL note) and the
-## EditorSetting → `_build_server_flags` launch-args path. The Settings-tab
+## EditorSetting → endpoint policy → lifecycle launch-args path. The Settings-tab
 ## UI itself is live-verified in the editor.
 
 ## Snapshot the user's live allow-hosts setting at suite entry so the
@@ -148,7 +146,9 @@ func test_allow_host_flag_appended_when_setting_non_empty() -> void:
 		skip("no EditorSettings in this context")
 		return
 	es.set_setting(McpSettings.SETTING_ALLOW_HOSTS, "192.168.1.0/24, 10.0.0.5")
-	var flags := PluginScript._build_server_flags(8000, 9500)
+	var plan := McpClientConfigurator.capture_endpoint_policy(9500)
+	plan["http_port"] = 8000
+	var flags := McpServerLifecycleManager._server_flags(plan)
 	var idx := flags.find("--allow-host")
 	assert_gt(idx, -1, "expected --allow-host in server flags: %s" % str(flags))
 	assert_eq(flags[idx + 1], "10.0.0.5,192.168.1.0/24")
@@ -160,7 +160,9 @@ func test_allow_host_flag_absent_when_setting_empty() -> void:
 		skip("no EditorSettings in this context")
 		return
 	es.set_setting(McpSettings.SETTING_ALLOW_HOSTS, "")
-	var flags := PluginScript._build_server_flags(8000, 9500)
+	var plan := McpClientConfigurator.capture_endpoint_policy(9500)
+	plan["http_port"] = 8000
+	var flags := McpServerLifecycleManager._server_flags(plan)
 	assert_eq(flags.find("--allow-host"), -1, "empty setting must not emit --allow-host: %s" % str(flags))
 
 

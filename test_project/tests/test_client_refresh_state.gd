@@ -77,10 +77,8 @@ func test_running_can_complete_or_time_out() -> void:
 		McpClientRefreshState.RUNNING, McpClientRefreshState.RUNNING_TIMED_OUT))
 
 
-func test_timed_out_can_drop_back_to_running_or_idle() -> void:
-	## Drop to RUNNING when a force-refresh abandons the orphan and starts
-	## a new sweep; drop to IDLE when the late result lands.
-	assert_true(McpClientRefreshState.can_transition(
+func test_timed_out_worker_must_finish_before_a_retry_starts() -> void:
+	assert_false(McpClientRefreshState.can_transition(
 		McpClientRefreshState.RUNNING_TIMED_OUT, McpClientRefreshState.RUNNING))
 	assert_true(McpClientRefreshState.can_transition(
 		McpClientRefreshState.RUNNING_TIMED_OUT, McpClientRefreshState.IDLE))

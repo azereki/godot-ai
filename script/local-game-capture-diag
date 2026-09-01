@@ -41,6 +41,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "script"))
+from _transport_auth import authorization_header  # noqa: E402
 
 DEFAULT_URL = os.environ.get("MCP_SERVER_URL", "http://127.0.0.1:8000/mcp")
 HEADERS = {
@@ -51,6 +57,7 @@ HEADERS = {
 
 def _post(url: str, session_id: str | None, body: dict, timeout: float = 10.0) -> dict:
     headers = dict(HEADERS)
+    headers["Authorization"] = authorization_header(url)
     if session_id:
         headers["Mcp-Session-Id"] = session_id
     req = urllib.request.Request(

@@ -11,9 +11,9 @@ goes, and how to opt out. All telemetry code is open source and lives in
 - **Anonymous**: a randomly generated UUID per installation. No account,
   no email, no machine fingerprint beyond OS / Python version.
 - **Salted, hashed session ids**: Godot AI session ids include a
-  project-directory slug (e.g. `secret-game-prototype@a3f2`). Before any
+  project-directory slug (e.g. `secret-game-prototype@7f9c3a10d8e426b1`). Before any
   event leaves the process, the slug is replaced with the first 8 hex
-  chars of `sha256(customer_uuid + slug)` — `3f1a8b22@a3f2`. Salting with
+  chars of `sha256(customer_uuid + slug)` — `3f1a8b22@7f9c3a10d8e426b1`. Salting with
   the per-installation UUID means the hash is stable per project on a
   given install, but the same project name produces different hashes on
   different installations — so hashes can't be correlated across users or
@@ -60,7 +60,8 @@ Allowlist (mirrored in `plugin/addons/godot_ai/telemetry.gd` and
 - `dock_startup` — dock loaded
 - `plugin_reload` — `set_plugin_enabled(false→true)` outcome
 - `self_update` — `success`, `failed_clean`, or `failed_mixed`
-- `dev_server_toggle` — Start/Stop Dev Server button activity
+- `dev_server_toggle` — managed server start/restart/stop button activity (the
+  legacy event name is retained for telemetry-schema continuity)
 
 ### What we never collect
 - Source code, scene contents, file paths
@@ -87,6 +88,18 @@ their argv (the bridge sets the same env var for itself and any backend it
 spawns). Attach entries written before the toggle changed read as
 `configured_mismatch` — re-run Configure so the client relaunches the bridge
 with the current preference.
+
+Apply & Restart does **not** mutate the environment of a server the plugin
+adopted rather than spawned (a hand-started dev server, CI backend, or
+attach-owned process). That process keeps whatever telemetry state it was born
+with until *its* environment changes or it is replaced. `/godot-ai/status`
+publishes `telemetry_enabled` from a live env re-read so the dock can show when
+the checkbox and the running server disagree; it is a report, not an opt-out
+channel. This behavior was ported from upstream PR #931 (issue #913).
+
+Record/send paths in an already-running Python process re-read
+`GODOT_AI_DISABLE_TELEMETRY` / `DISABLE_TELEMETRY` on each event, so a later
+in-process opt-out takes effect without reconstructing the collector.
 
 ### Via environment variable
 
@@ -167,7 +180,7 @@ Delete the data directory to reset both.
   "record": "tool_execution",
   "timestamp": 1736294400.123,
   "customer_uuid": "550e8400-e29b-41d4-a716-446655440000",
-  "session_id": "3f1a8b22@a3f2",
+  "session_id": "3f1a8b22@7f9c3a10d8e426b1",
   "version": "0.0.41",
   "platform": "Darwin",
   "source": "darwin",

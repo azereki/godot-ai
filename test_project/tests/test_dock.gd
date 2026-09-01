@@ -6,74 +6,36 @@ extends McpTestSuite
 ## whatever mode the current test environment is actually running in.
 
 const McpDockScript = preload("res://addons/godot_ai/mcp_dock.gd")
+const ClientJobOwnerScript = preload("res://addons/godot_ai/utils/client_job_owner.gd")
 const GodotAiPlugin := preload("res://addons/godot_ai/plugin.gd")
 const PortPickerPanelScript = preload("res://addons/godot_ai/dock_panels/port_picker_panel.gd")
 const LogViewerScript = preload("res://addons/godot_ai/dock_panels/log_viewer.gd")
 
-## Stub for the dock's `_update_manager` slot. Tests that want to fake
-## "self-update mid-install" inject one of these so the dock's
-## `_is_self_update_in_progress()` gate sees an in-flight manager,
-## mirroring how production code consults the seam.
-class _StubInstallGate extends Node:
-	var in_flight: bool = false
-
-	func is_install_in_flight() -> bool:
-		return in_flight
-
-class _RestartDispatchPlugin extends GodotAiPlugin:
-	var status: Dictionary = {}
-	var can_restart := false
+class _IntentRecorder:
 	var force_restart_calls := 0
 	var recover_calls := 0
 	var primary_calls := 0
 	var stop_calls := 0
-	var has_managed := false
-	var dev_running := false
 
-	func get_server_status() -> Dictionary:
-		return status.duplicate()
+	func on_lifecycle_action(action: int) -> void:
+		if action == McpDockScript.LifecycleAction.RECOVER_INCOMPATIBLE:
+			recover_calls += 1
+		elif action == McpDockScript.LifecycleAction.RESTART_SERVER:
+			force_restart_calls += 1
 
-	func can_restart_managed_server() -> bool:
-		return can_restart
-
-	func force_restart_server() -> void:
-		force_restart_calls += 1
-
-	func recover_incompatible_server(
-		_user_initiated: bool = true, _stale_version: String = ""
-	) -> bool:
-		recover_calls += 1
-		return true
-
-	func has_managed_server() -> bool:
-		return has_managed
-
-	func is_dev_server_running() -> bool:
-		return dev_running
-
-	func force_restart_or_start_dev_server() -> bool:
-		primary_calls += 1
-		return has_managed or dev_running
-
-	func stop_dev_server() -> void:
-		stop_calls += 1
-		dev_running = false
+	func on_dev_server_action(action: int) -> void:
+		if action == McpDockScript.DevServerAction.START_OR_RESTART:
+			primary_calls += 1
+		elif action == McpDockScript.DevServerAction.STOP:
+			stop_calls += 1
 
 
-class _RefreshCountingDock extends McpDockScript:
-	var action_completion_refreshes := 0
+class _RefreshCountingOwner extends ClientJobOwnerScript:
+	var refresh_requests := 0
 
-	func _request_client_action_completion_refresh() -> void:
-		action_completion_refreshes += 1
-
-
-class _ConnectionStub:
-	var is_connected := true
-	var server_version := ""
-	var transport_status: Dictionary = {"phase": "connected", "attempt": 0, "state_elapsed_sec": 0.0}
-
-	func get_transport_status() -> Dictionary:
-		return transport_status.duplicate(true)
+	func request_status_refresh(_ids: Array[String], _force := false) -> bool:
+		refresh_requests += 1
+		return false
 
 
 static func _finished_thread_noop() -> void:
@@ -182,8 +144,8 @@ func test_clients_header_and_actions_use_narrow_layout() -> void:
 
 func test_connected_status_stays_compact_across_client_readiness() -> void:
 	_dock._build_ui()
-	_dock._connection = _ConnectionStub.new()
-	_dock._last_client_status_refresh_completed_msec = 0
+	_dock.present_transport_snapshot({"connected": true, "status": {"phase": "connected"}})
+	_dock.present_client_work_snapshot({"refresh_completed": false})
 
 	_dock._refresh_clients_summary()
 	assert_eq(
@@ -192,7 +154,7 @@ func test_connected_status_stays_compact_across_client_readiness() -> void:
 		"Connected status should stay compact before the initial status sweep completes",
 	)
 
-	_dock._last_client_status_refresh_completed_msec = Time.get_ticks_msec()
+	_dock.present_client_work_snapshot({"refresh_completed": true})
 	_dock._refresh_clients_summary()
 	assert_eq(
 		_dock._status_label.text,
@@ -248,15 +210,15 @@ func test_transport_status_text_distinguishes_each_reconnect_phase() -> void:
 
 func test_update_status_renders_transport_phase_and_transient_reason() -> void:
 	_dock._build_ui()
-	var connection := _ConnectionStub.new()
-	connection.is_connected = false
-	connection.transport_status = {
+	_dock.present_transport_snapshot({
+		"connected": false,
+		"status": {
 		"phase": "connecting",
 		"attempt": 2,
 		"state_elapsed_sec": 10.0,
 		"reason": "Server rejected the editor auth token.",
-	}
-	_dock._connection = connection
+		},
+	})
 	_dock._startup_grace_until_msec = 0
 
 	_dock._update_status()
@@ -271,15 +233,15 @@ func test_update_status_renders_transport_phase_and_transient_reason() -> void:
 
 func test_update_status_hides_stale_transient_reason_while_connected() -> void:
 	_dock._build_ui()
-	var connection := _ConnectionStub.new()
-	connection.is_connected = true
-	connection.transport_status = {
+	_dock.present_transport_snapshot({
+		"connected": true,
+		"status": {
 		"phase": "connected",
 		"attempt": 0,
 		"state_elapsed_sec": 0.0,
 		"reason": "Previous peer rejected the editor auth token.",
-	}
-	_dock._connection = connection
+		},
+	})
 	_dock._startup_grace_until_msec = 0
 
 	_dock._update_status()
@@ -294,14 +256,14 @@ func test_update_status_hides_stale_transient_reason_while_connected() -> void:
 
 func test_empty_client_cta_visible_only_until_a_client_is_configured() -> void:
 	_dock._build_ui()
-	_dock._last_client_status_refresh_completed_msec = 0
+	_dock.present_client_work_snapshot({"refresh_completed": false})
 	_dock._refresh_clients_summary()
 	assert_false(
 		_dock._client_empty_cta_btn.visible,
 		"CTA should stay hidden until the initial client status sweep proves there are no configured clients",
 	)
 
-	_dock._last_client_status_refresh_completed_msec = Time.get_ticks_msec()
+	_dock.present_client_work_snapshot({"refresh_completed": true})
 	_dock._refresh_clients_summary()
 	assert_true(
 		_dock._client_empty_cta_btn.visible,
@@ -373,96 +335,6 @@ func test_drift_banner_no_op_when_mismatched_set_unchanged() -> void:
 	_dock._refresh_drift_banner(["codex"] as Array[String])
 	assert_true(_dock._drift_label.text != "SENTINEL — should survive a no-op refresh")
 	assert_true(_dock._drift_label.text != first_text, "Different set must produce different text")
-
-
-func test_mixed_state_banner_hidden_in_clean_addons_tree() -> void:
-	## The dock builds the mixed-state banner during `_build_ui` and seeds
-	## it from `UpdateMixedState.diagnose()`. In test_project's tree the
-	## addons dir has no `.update_backup` files, so the banner must default
-	## to hidden. Without this guard a future regression that always shows
-	## the banner would only surface when a real FAILED_MIXED state landed.
-	_dock._build_ui()
-	assert_true(_dock._mixed_state_banner != null, "Banner must be constructed by _build_ui")
-	assert_false(
-		_dock._mixed_state_banner.visible,
-		"Clean addons tree must keep the mixed-state banner hidden",
-	)
-
-
-func test_mixed_state_banner_renders_synthetic_diagnostic() -> void:
-	## Drive the render seam with a fake diagnostic so the banner contract
-	## (visibility + label text + file list) is pinned without polluting
-	## the real `addons/godot_ai/` tree with `.update_backup` files. This
-	## covers Copilot's "dock banner is untested" finding on PR #382.
-	_dock._build_ui()
-	var fake_diag := {
-		"addon_dir": "res://addons/godot_ai/",
-		"backup_files": [
-			"res://addons/godot_ai/handlers/scene_handler.gd.update_backup",
-			"res://addons/godot_ai/plugin.gd.update_backup",
-		],
-		"backup_count": 2,
-		"truncated": false,
-		"message": "Fake diagnostic for test_mixed_state_banner_renders_synthetic_diagnostic",
-	}
-	_dock._apply_mixed_state_banner_diagnostic(fake_diag)
-	assert_true(_dock._mixed_state_banner.visible, "Non-empty diagnostic must show banner")
-	assert_contains(
-		_dock._mixed_state_label.text,
-		"Fake diagnostic for test_mixed_state_banner_renders_synthetic_diagnostic",
-		"Banner must surface the diagnostic message verbatim",
-	)
-	## RichTextLabel.text reflects the BBCode source, not the rendered
-	## content added via `add_text()` — assert via `get_parsed_text()`
-	## which returns the visible text concatenation.
-	assert_contains(
-		_dock._mixed_state_files.get_parsed_text(),
-		"plugin.gd.update_backup",
-		"Banner must list each backup file path so the operator can act on them",
-	)
-
-
-func test_mixed_state_banner_re_hides_when_diagnostic_empties() -> void:
-	## The Re-scan button calls `_refresh_mixed_state_banner(true)` which
-	## eventually feeds the apply seam an empty Dict when the addons tree
-	## has been restored. Pin that the banner correctly hides when applied
-	## with `{}` so the button delivers the dismissal it advertises.
-	_dock._build_ui()
-	_dock._apply_mixed_state_banner_diagnostic({
-		"addon_dir": "res://addons/godot_ai/",
-		"backup_files": ["res://addons/godot_ai/foo.gd.update_backup"],
-		"backup_count": 1,
-		"truncated": false,
-		"message": "show me",
-	})
-	assert_true(_dock._mixed_state_banner.visible, "Precondition: banner must be visible")
-	_dock._apply_mixed_state_banner_diagnostic({})
-	assert_false(
-		_dock._mixed_state_banner.visible,
-		"Empty diagnostic must hide the banner — the Re-scan dismissal path",
-	)
-
-
-func test_mixed_state_banner_renders_truncated_hint() -> void:
-	## When the scanner caps results, the dock must surface that the list
-	## isn't exhaustive — otherwise a power user with a runaway tree thinks
-	## they only have N backups when there might be more. The truncation
-	## hint references the canonical MAX_BACKUP_RESULTS so the message
-	## stays accurate if the cap moves.
-	_dock._build_ui()
-	_dock._apply_mixed_state_banner_diagnostic({
-		"addon_dir": "res://addons/godot_ai/",
-		"backup_files": ["res://addons/godot_ai/x.gd.update_backup"],
-		"backup_count": 200,
-		"truncated": true,
-		"message": "lots of backups",
-	})
-	assert_true(_dock._mixed_state_banner.visible)
-	assert_contains(
-		_dock._mixed_state_files.get_parsed_text(),
-		"truncated",
-		"truncated=true must produce the cap-hit hint in the file list",
-	)
 
 
 func test_apply_row_status_renders_mismatch_as_amber_with_url_hint() -> void:
@@ -545,13 +417,11 @@ func test_incompatible_server_does_not_paint_client_rows_error() -> void:
 	## INCOMPATIBLE skips health interpretation so Configure / Configure all
 	## can still write pins (#916). Rows must not be painted ERROR/red with
 	## the blocked-server paragraph — that made Configure all unusable.
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.status = {
+	_dock.present_lifecycle_snapshot({
 		"state": McpServerState.INCOMPATIBLE,
 		"message": "Port 8000 is occupied by godot-ai server v1.2.10; plugin expects v2.2.0.",
 		"connection_blocked": true,
-	}
-	_dock._plugin = plugin
+	})
 	_dock._build_ui()
 
 	var any_id := McpClientConfigurator.client_ids()[0]
@@ -569,7 +439,6 @@ func test_incompatible_server_does_not_paint_client_rows_error() -> void:
 	)
 	assert_eq(name_label.text, display_name,
 		"row caption stays the display name so Configure all remains usable")
-	plugin.free()
 
 
 func test_drift_banner_clears_after_per_row_reconfigure() -> void:
@@ -600,45 +469,62 @@ func test_drift_banner_clears_after_per_row_reconfigure() -> void:
 		"Cache must drop the now-green client so a follow-up Reconfigure-mismatched click is a no-op")
 
 
-## Records the reconfigure fan-out so the post-update repin tests can assert
-## dispatch without running real Configure workers, and fakes the pin-only
-## gate so no real config files are read.
-class _RepinRecordingDock extends McpDockScript:
+class _ClientActionRecordingDock extends McpDockScript:
 	var configured_ids: Array[String] = []
-	var refresh_calls := 0
-	var pin_only_ids: Array[String] = []
-	var gate_from_versions: Array[String] = []
 
 	func _on_configure_client(client_id: String) -> void:
 		configured_ids.append(client_id)
 
-	func _refresh_all_client_statuses() -> void:
-		refresh_calls += 1
 
-	func _entry_drift_is_version_pin_only(
-		client_id: String, from_version: String, _launch_context: Dictionary
-	) -> bool:
-		gate_from_versions.append(from_version)
-		return pin_only_ids.has(client_id)
+## Replaces the worker body so post-update owner tests never touch real client
+## files or build a uvx environment.
+class _RepinRecordingOwner extends ClientJobOwnerScript:
+	var calls: Array[Dictionary] = []
+	var probe_ids: Array[String] = []
+	var delay_msec := 0
+
+	func _run_post_update_repin(
+		_probes: Array[Dictionary],
+		_context: Dictionary,
+		from_version: String,
+		to_version: String,
+		replace_owned_mismatches: bool,
+		generation: int,
+	) -> Dictionary:
+		if delay_msec > 0:
+			OS.delay_msec(delay_msec)
+		for probe in _probes:
+			probe_ids.append(str(probe.get("id", "")))
+		calls.append({
+			"from": from_version,
+			"to": to_version,
+			"replace_owned_mismatches": replace_owned_mismatches,
+		})
+		return {
+			"ok": true,
+			"generation": generation,
+			"configured_ids": ["claude_code"],
+			"repinned_ids": ["claude_code"],
+			"error": "",
+			"prewarm": {"skipped": true},
+		}
 
 
 func test_configure_all_dispatches_while_incompatible() -> void:
 	## The write path must run while INCOMPATIBLE — Configure writes an
 	## explicit url + live plugin version and does not need a healthy occupant.
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.status = {
+	var blocked := {
 		"state": McpServerState.INCOMPATIBLE,
 		"message": "Port 8000 is occupied by godot-ai server v1.2.10; plugin expects v2.2.0.",
 	}
-	var dock := _RepinRecordingDock.new()
-	dock._plugin = plugin
+	var dock := _ClientActionRecordingDock.new()
+	dock.present_lifecycle_snapshot(blocked)
 	dock._client_rows["claude_code"] = {"status": McpClient.Status.NOT_CONFIGURED}
 	dock._client_rows["cursor"] = {"status": McpClient.Status.CONFIGURED}
 
 	dock._on_configure_all_clients()
 	var configured := dock.configured_ids.duplicate()
 	dock.free()
-	plugin.free()
 
 	assert_eq(configured, ["claude_code"] as Array[String],
 		"Configure all must dispatch writes for unconfigured rows while INCOMPATIBLE")
@@ -648,149 +534,121 @@ func test_configure_all_dispatches_while_incompatible_refresh_running() -> void:
 	## `_set_incompatible_server()` can flip INCOMPATIBLE without clearing
 	## `_refresh_state`. Per-row Configure already ignores RUNNING; Configure
 	## all must too, or the button stays dead until the sweep finishes.
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.status = {
+	var blocked := {
 		"state": McpServerState.INCOMPATIBLE,
 		"message": "Port 8000 is occupied by godot-ai server v1.2.10; plugin expects v2.2.0.",
 	}
-	var dock := _RepinRecordingDock.new()
-	dock._plugin = plugin
-	dock._refresh_state = McpClientRefreshState.RUNNING
+	var dock := _ClientActionRecordingDock.new()
+	dock.present_lifecycle_snapshot(blocked)
+	dock.present_client_work_snapshot({"refresh_state": McpClientRefreshState.RUNNING})
 	dock._client_rows["claude_code"] = {"status": McpClient.Status.NOT_CONFIGURED}
 
 	dock._on_configure_all_clients()
 	var configured := dock.configured_ids.duplicate()
 	dock.free()
-	plugin.free()
 
 	assert_eq(configured, ["claude_code"] as Array[String],
 		"Configure all must dispatch while INCOMPATIBLE even if a refresh is RUNNING")
 
 
-func test_post_update_repin_reconfigures_pin_only_rows_once() -> void:
-	## After a self-update the plugin arms the one-shot repin; the first
-	## completed sweep with drift must reconfigure the rows whose only drift
-	## is the version pin, then never fire again.
-	var dock := _RepinRecordingDock.new()
-	dock._client_rows["claude_code"] = {"status": McpClient.Status.CONFIGURED_MISMATCH}
-	dock._last_mismatched_ids = ["claude_code"] as Array[String]
-	dock.pin_only_ids = ["claude_code"] as Array[String]
-	dock.notify_self_update_success("3.1.2")
+func test_post_update_repin_is_one_restricted_owned_worker() -> void:
+	var owner := _RepinRecordingOwner.new()
+	var completions: Array[Dictionary] = []
+	owner.post_update_repin_completed.connect(func(result: Dictionary) -> void:
+		completions.append(result)
+	)
+	var target := McpClientConfigurator.get_plugin_version()
+	var started := owner.begin_post_update_repin("3.1.2", target)
+	assert_true(bool(started.get("ok", false)))
+	assert_false(owner._accepting_work, "ordinary client work remains closed during migration")
+	assert_false(owner.request_action("claude_code", "configure"))
+	assert_false(owner.request_mcp_status("blocked-mcp"))
+	while owner._post_update_thread != null and owner._post_update_thread.is_alive():
+		OS.delay_msec(1)
+	owner._poll_post_update_repin()
+	assert_eq(owner.calls, [{
+		"from": "3.1.2",
+		"to": target,
+		"replace_owned_mismatches": false,
+	}])
+	assert_eq(completions.size(), 1)
+	assert_eq(completions[0].repinned_ids, ["claude_code"])
+	assert_false(owner.probe_ids.has("zed"),
+		"manual-only JSONC clients must not enter the hard automatic M6 barrier")
+	owner.free()
 
-	dock._maybe_auto_repin_after_update()
-	var first_pass := dock.configured_ids.duplicate()
-	var pending_after := dock._pending_post_update_repin
-	var gate_versions := dock.gate_from_versions.duplicate()
 
-	dock._maybe_auto_repin_after_update()
-	var second_pass := dock.configured_ids.duplicate()
-	var refreshes := dock.refresh_calls
+func test_manual_major_repin_marks_owned_mismatches_replaceable() -> void:
+	var owner := _RepinRecordingOwner.new()
+	var target := McpClientConfigurator.get_plugin_version()
+	var started := owner.begin_post_update_repin("3.2.4", target, true)
+	assert_true(bool(started.get("ok", false)))
+	while owner._post_update_thread != null and owner._post_update_thread.is_alive():
+		OS.delay_msec(1)
+	owner._poll_post_update_repin()
+	assert_eq(owner.calls, [{
+		"from": "3.2.4",
+		"to": target,
+		"replace_owned_mismatches": true,
+	}])
+	owner.free()
+
+
+func test_post_update_repin_rejects_missing_or_wrong_versions() -> void:
+	var owner := _RepinRecordingOwner.new()
+	assert_false(bool(owner.begin_post_update_repin("", "4.0.0").get("ok", true)))
+	assert_false(bool(owner.begin_post_update_repin("3.1.2", "99.0.0").get("ok", true)))
+	assert_eq(owner._post_update_thread, null)
+	owner.free()
+
+
+func test_unproven_post_update_prewarm_blocks_retry_and_quiescence() -> void:
+	Engine.remove_meta(ClientJobOwnerScript.POST_UPDATE_UNPROVEN_META)
+	var owner := ClientJobOwnerScript.new()
+	owner._record_unproven_post_update_result({
+		"termination_failed": true,
+		"unsafe_client_id": "",
+	})
+	var retried := owner.begin_post_update_repin(
+		"3.1.2", McpClientConfigurator.get_plugin_version()
+	)
+	assert_false(bool(retried.get("ok", true)))
+	assert_contains(str(retried.get("error", "")), "explicitly remove")
+	var quiesced := owner.quiesce()
+	assert_false(bool(quiesced.get("ok", true)))
+	assert_true(bool(quiesced.get("termination_unproven", false)))
+	owner.free()
+	Engine.remove_meta(ClientJobOwnerScript.POST_UPDATE_UNPROVEN_META)
+
+
+func test_post_update_repin_worker_is_joined_by_quiescence() -> void:
+	var owner := _RepinRecordingOwner.new()
+	owner.delay_msec = 75
+	var started := owner.begin_post_update_repin(
+		"3.1.2", McpClientConfigurator.get_plugin_version()
+	)
+	assert_true(bool(started.get("ok", false)))
+	var result := owner.quiesce()
+	assert_true(bool(result.get("ok", false)))
+	assert_eq(owner._post_update_thread, null)
+	assert_true(owner._is_post_update_cancelled())
+	owner.free()
+
+
+func test_post_update_retry_button_emits_barrier_action_instead_of_a_second_update() -> void:
+	var dock := McpDockScript.new()
+	var update_calls := [0]
+	var actions: Array[String] = []
+	dock.update_requested.connect(func() -> void: update_calls[0] += 1)
+	dock.post_update_action_requested.connect(func(action: String) -> void: actions.append(action))
+	dock._post_update_action = "retry"
+	dock._on_update_pressed()
+	assert_eq(actions, ["retry"])
+	assert_eq(update_calls[0], 0)
+	dock._post_update_action = ""
+	dock._on_update_pressed()
+	assert_eq(update_calls[0], 1)
 	dock.free()
-
-	assert_eq(first_pass, ["claude_code"] as Array[String],
-		"the armed repin must reconfigure every pin-only-drifted row")
-	assert_eq(gate_versions, ["3.1.2"] as Array[String],
-		"the gate must render the entry against the replaced version")
-	assert_false(pending_after, "the repin is one-shot: consumed by the sweep that ran it")
-	assert_eq(second_pass, ["claude_code"] as Array[String],
-		"a later sweep must not reconfigure again")
-	assert_true(refreshes >= 1,
-		"the repin must trigger the trailing status re-sweep like the banner click")
-
-
-func test_post_update_repin_skips_rows_that_drift_beyond_the_pin() -> void:
-	## The blast-radius regression the self-update smoke caught live: a
-	## fixture editor on custom ports saw every real client config as
-	## mismatched and rewrote all of them to its own ports. Entries whose
-	## drift is anything more than the version pin must be left for the
-	## drift banner's human click.
-	var dock := _RepinRecordingDock.new()
-	dock._client_rows["claude_code"] = {"status": McpClient.Status.CONFIGURED_MISMATCH}
-	dock._client_rows["cursor"] = {"status": McpClient.Status.CONFIGURED_MISMATCH}
-	dock._last_mismatched_ids = ["claude_code", "cursor"] as Array[String]
-	## Only claude_code's drift is the pin; cursor points elsewhere.
-	dock.pin_only_ids = ["claude_code"] as Array[String]
-	dock.notify_self_update_success("3.1.2")
-
-	dock._maybe_auto_repin_after_update()
-	var configured := dock.configured_ids.duplicate()
-	dock.free()
-
-	assert_eq(configured, ["claude_code"] as Array[String],
-		"rows drifting beyond the version pin must never be auto-rewritten")
-
-
-func test_post_update_repin_requires_a_from_version() -> void:
-	## Markers written by pre-gate runners carry no from_version — without
-	## it the pin-only comparison cannot be rendered, so nothing may arm.
-	var dock := _RepinRecordingDock.new()
-	dock._client_rows["claude_code"] = {"status": McpClient.Status.CONFIGURED_MISMATCH}
-	dock._last_mismatched_ids = ["claude_code"] as Array[String]
-	dock.pin_only_ids = ["claude_code"] as Array[String]
-	dock.notify_self_update_success("")
-
-	dock._maybe_auto_repin_after_update()
-	var configured := dock.configured_ids.duplicate()
-	var pending := dock._pending_post_update_repin
-	dock.free()
-
-	assert_true(configured.is_empty(),
-		"an empty from_version must arm nothing (fail closed)")
-	assert_false(pending, "an empty from_version must not leave the flag armed")
-
-
-func test_post_update_repin_stays_pending_while_server_blocks_health() -> void:
-	## While the post-update stale-occupant recovery is still in flight the
-	## server state is INCOMPATIBLE and health interpretation is skipped
-	## (#916) — consuming the flag on that sweep would drop the repin. It
-	## must stay pending and fire on the first healthy sweep.
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.status = {"state": McpServerState.INCOMPATIBLE, "message": "incompatible"}
-	var dock := _RepinRecordingDock.new()
-	dock._plugin = plugin
-	dock._client_rows["claude_code"] = {"status": McpClient.Status.CONFIGURED_MISMATCH}
-	dock._last_mismatched_ids = ["claude_code"] as Array[String]
-	dock.pin_only_ids = ["claude_code"] as Array[String]
-	dock.notify_self_update_success("3.1.2")
-
-	dock._maybe_auto_repin_after_update()
-	var pending_while_blocked := dock._pending_post_update_repin
-	var configured_while_blocked := dock.configured_ids.duplicate()
-
-	plugin.status = {"state": McpServerState.READY}
-	dock._maybe_auto_repin_after_update()
-	var configured_after_recovery := dock.configured_ids.duplicate()
-	dock.free()
-	plugin.free()
-
-	assert_true(pending_while_blocked,
-		"an INCOMPATIBLE-server sweep must keep the repin pending")
-	assert_true(configured_while_blocked.is_empty(),
-		"auto-repin must not fire while the server is INCOMPATIBLE")
-	assert_eq(configured_after_recovery, ["claude_code"] as Array[String],
-		"the first healthy sweep must run the deferred repin")
-
-
-func test_post_update_repin_consumed_without_drift_never_fires_later() -> void:
-	## A clean sweep (no drift — e.g. the user reconfigured by hand mid-
-	## update) must consume the flag without firing, so it cannot ambush an
-	## unrelated mismatch weeks later.
-	var dock := _RepinRecordingDock.new()
-	dock.pin_only_ids = ["claude_code"] as Array[String]
-	dock.notify_self_update_success("3.1.2")
-
-	dock._maybe_auto_repin_after_update()
-	var pending_after := dock._pending_post_update_repin
-
-	dock._client_rows["claude_code"] = {"status": McpClient.Status.CONFIGURED_MISMATCH}
-	dock._last_mismatched_ids = ["claude_code"] as Array[String]
-	dock._maybe_auto_repin_after_update()
-	var configured := dock.configured_ids.duplicate()
-	dock.free()
-
-	assert_false(pending_after, "a clean sweep must still consume the one-shot flag")
-	assert_true(configured.is_empty(),
-		"a consumed repin must never fire on later drift")
 
 
 func test_successful_configure_discloses_the_scope_sweep_on_the_row() -> void:
@@ -834,17 +692,19 @@ func test_focus_in_auto_refresh_is_enabled_with_async_cooldown() -> void:
 	## editor thread during OS/window refocus.
 	assert_true(_dock._should_refresh_client_statuses_on_focus_in(),
 		"Editor focus-in should request the async client-status refresh")
-	assert_eq(McpDockScript.CLIENT_STATUS_REFRESH_COOLDOWN_MSEC, 15 * 1000,
+	assert_eq(ClientJobOwnerScript.STATUS_COOLDOWN_MSEC, 15 * 1000,
 		"Focus-in refresh cooldown is intentionally short and explicit")
 
 
 func test_refresh_cooldown_helper_only_blocks_automatic_refreshes() -> void:
-	_dock._last_client_status_refresh_completed_msec = Time.get_ticks_msec()
-	assert_true(_dock._is_client_status_refresh_in_cooldown(),
-		"Recent automatic refresh should be inside cooldown")
-	_dock._last_client_status_refresh_completed_msec = 0
-	assert_false(_dock._is_client_status_refresh_in_cooldown(),
-		"No completed refresh means no cooldown")
+	var owner := ClientJobOwnerScript.new()
+	owner._accepting_work = true
+	owner._refresh_completed_msec = Time.get_ticks_msec()
+	assert_false(owner.request_status_refresh(["missing"], false),
+		"Recent automatic refresh should be rejected inside cooldown")
+	assert_eq(owner._refresh_state, McpClientRefreshState.IDLE,
+		"Cooldown rejection must not allocate a worker")
+	owner.free()
 
 
 func test_initial_refresh_helper_replaces_settle_timer_constant() -> void:
@@ -859,7 +719,7 @@ func test_initial_refresh_helper_replaces_settle_timer_constant() -> void:
 	## guard for the constant itself: if a future merge adds it back (e.g.
 	## resurrecting #234's stopgap on top of #235), `get_script_constant_map`
 	## will catch it on the next test run.
-	var script: GDScript = McpDockScript
+	var script: GDScript = ClientJobOwnerScript
 	var has_constant := false
 	for entry in script.get_script_constant_map():
 		if String(entry) == "CLIENT_STATUS_REFRESH_INITIAL_DELAY_MSEC":
@@ -868,23 +728,86 @@ func test_initial_refresh_helper_replaces_settle_timer_constant() -> void:
 	assert_false(has_constant, "CLIENT_STATUS_REFRESH_INITIAL_DELAY_MSEC must be removed — #235 replaces #234's timer with a deterministic gate")
 
 
-func test_exit_tree_drains_orphaned_refresh_threads() -> void:
-	## Regression for the static-var orphan bug surfaced on the plugin disable
-	## path (editor_reload_plugin, Project Settings toggle): the McpDock
-	## script class is itself reloaded, which wipes
-	## `_orphaned_client_status_refresh_threads` and GCs any Thread still in
-	## it mid-execution → `~Thread … destroyed without its completion having
-	## been realized` plus GDScript VM corruption (Opcode: 0, IP-bounds
-	## errors, intermittent SIGSEGV). `_exit_tree` must drain the orphan list
-	## synchronously before returning, so no GDScript work straddles the
-	## script-class reload boundary.
+func test_quiesce_realizes_the_single_refresh_worker() -> void:
 	var t := Thread.new()
 	var err := t.start(func() -> int: return 42)
 	assert_eq(err, OK, "Test fixture failed to start thread")
-	McpDockScript._orphaned_client_status_refresh_threads.append(t)
-	_dock._exit_tree()
-	assert_true(McpDockScript._orphaned_client_status_refresh_threads.is_empty(),
-		"_exit_tree must clear the orphan list synchronously after waiting on each thread")
+	var owner := ClientJobOwnerScript.new()
+	owner._refresh_thread = t
+	owner._refresh_state = McpClientRefreshState.RUNNING
+	owner.quiesce()
+	assert_eq(owner._refresh_thread, null,
+		"quiesce must realize the sole refresh worker before script reload")
+	owner.free()
+
+
+func test_repeated_forced_refreshes_coalesce_behind_one_timed_out_worker() -> void:
+	var owner := ClientJobOwnerScript.new()
+	owner._accepting_work = true
+	owner._refresh_generation = 7
+	owner._refresh_state = McpClientRefreshState.RUNNING_TIMED_OUT
+	var worker := Thread.new()
+	var error := worker.start(func() -> Dictionary:
+		OS.delay_msec(100)
+		return {"results": {}, "generation": 7}
+	)
+	assert_eq(error, OK)
+	owner._refresh_thread = worker
+	for _index in range(5):
+		assert_false(owner.request_status_refresh([], true))
+		assert_eq(owner._refresh_thread, worker,
+			"force refresh must retain the one live worker")
+	assert_true(owner._refresh_pending)
+	assert_true(owner._refresh_pending_force)
+	while worker.is_alive():
+		OS.delay_msec(1)
+	owner._poll_refresh()
+	assert_eq(owner._refresh_thread, null)
+	assert_eq(owner._refresh_state, McpClientRefreshState.IDLE)
+	assert_false(owner._refresh_pending)
+	owner.free()
+
+
+func test_mcp_status_requests_share_the_one_refresh_worker_and_quiesce_owner() -> void:
+	var owner := ClientJobOwnerScript.new()
+	owner._accepting_work = true
+	owner._refresh_generation = 7
+	owner._refresh_state = McpClientRefreshState.RUNNING
+	var worker := Thread.new()
+	var error := worker.start(func() -> Dictionary:
+		OS.delay_msec(100)
+		return {"results": {}, "generation": 7}
+	)
+	assert_eq(error, OK)
+	owner._refresh_thread = worker
+	for index in range(5):
+		assert_true(owner.request_mcp_status("mcp-%d" % index))
+		assert_eq(owner._refresh_thread, worker, "MCP requests must not allocate a second worker")
+	assert_eq(owner._mcp_status_waiters.size(), 5)
+	assert_true(owner._refresh_pending, "one all-client retry should be coalesced")
+	owner.quiesce()
+	assert_eq(owner._refresh_thread, null)
+	assert_true(owner._mcp_status_waiters.is_empty())
+	owner.free()
+
+
+func test_mcp_status_waiters_complete_only_for_their_refresh_generation() -> void:
+	var owner := ClientJobOwnerScript.new()
+	var emissions: Array[Dictionary] = []
+	owner.mcp_status_completed.connect(func(ids: Array[String], payload: Dictionary) -> void:
+		emissions.append({"ids": ids, "payload": payload})
+	)
+	owner._mcp_status_waiters = {"first": 3, "later": 4}
+	owner._complete_mcp_status_waiters({}, 3, "")
+	assert_eq(emissions.size(), 1)
+	assert_eq(emissions[0].ids, ["first"])
+	assert_has_key(emissions[0].payload, "data")
+	assert_true(owner._mcp_status_waiters.has("later"))
+	owner._complete_mcp_status_waiters({}, 4, "probe failed")
+	assert_eq(emissions.size(), 2)
+	assert_has_key(emissions[1].payload, "error")
+	assert_true(owner._mcp_status_waiters.is_empty())
+	owner.free()
 
 
 func test_self_update_in_progress_blocks_request_refresh() -> void:
@@ -895,20 +818,17 @@ func test_self_update_in_progress_blocks_request_refresh() -> void:
 	## inside `GDScriptFunction::call` (confirmed by SIGABRT in
 	## `VBoxContainer(McpDock)::_run_client_status_refresh_worker`).
 	##
-	## `_request_client_status_refresh` is the funnel for every spawn path,
-	## so gating here covers focus-in (`_notification` → handler) without
-	## needing a separate gate at each call site. The seam is
-	## `_dock._update_manager.is_install_in_flight()`; inject a stub
-	## manager so `_is_self_update_in_progress()` resolves to true.
-	var stub := _StubInstallGate.new()
-	stub.in_flight = true
-	_dock._update_manager = stub
+	## The Dock receives install state as a value; it has no manager reference.
+	_dock._build_ui()
+	var intents: Array = []
+	_dock.client_status_refresh_requested.connect(
+		func(ids: Array[String], force: bool) -> void: intents.append([ids, force])
+	)
+	_dock.present_update_state({"install_in_flight": true})
 	var ok: bool = _dock._request_client_status_refresh(false)
-	assert_false(ok, "Refresh must not spawn a worker while self-update is in progress")
-	assert_eq(_dock._client_status_refresh_thread, null, "No worker thread should have been started while self-update is in progress")
-	stub.in_flight = false
-	_dock._update_manager = null
-	stub.free()
+	assert_false(ok, "Refresh must not emit work while self-update is in progress")
+	assert_true(intents.is_empty(), "No refresh intent should escape during activation")
+	_dock.present_update_state({"install_in_flight": false})
 
 
 func test_drain_helper_does_not_poison_shutdown_flag() -> void:
@@ -921,46 +841,51 @@ func test_drain_helper_does_not_poison_shutdown_flag() -> void:
 	## (which is sticky and permanently disables refreshes for the dock
 	## instance). The drain leaves SHUTTING_DOWN intact when `_exit_tree`
 	## already set it, but otherwise resets to IDLE.
-	_dock._drain_client_status_refresh_workers()
+	var owner := ClientJobOwnerScript.new()
+	owner.activate()
+	owner.quiesce()
+	owner.resume_after_quiesce()
 	assert_eq(
-		_dock._refresh_state,
+		owner._refresh_state,
 		McpClientRefreshState.IDLE,
-		"drain must collapse to IDLE when not already shutting down — only _exit_tree sets SHUTTING_DOWN"
+		"a failed update handoff must restore the old owner's refresh state"
 	)
+	assert_true(bool(owner.snapshot().get("accepting_work", false)),
+		"resume must reopen the intent gate after a failed handoff")
+	owner.quiesce()
+	owner.free()
 
 
-## Shared fixture for the three version-label tests. Inject a Label + Button
-## + McpConnection onto the dock so the pure refresh logic can be exercised
+## Shared fixture for the version-label tests. Inject copied values plus a
+## Label + Button so the pure refresh logic can be exercised
 ## without depending on whether the test environment resolves as user mode
 ## or dev checkout (the user-mode Server row is what owns these handles in
 ## production — see `_refresh_setup_status`).
-func _seed_server_row(server_ver: String) -> McpConnection:
-	_dock._plugin = null
+func _seed_server_row(server_ver: String) -> void:
 	_dock._server_restart_in_progress = false
 	_dock._crash_restart_btn = null
-	var conn := McpConnection.new()
-	_dock._connection = conn
+	_dock.present_transport_snapshot({"server_version": server_ver})
+	_dock.present_lifecycle_snapshot({})
 	_dock._setup_server_label = Label.new()
 	_dock._version_restart_btn = Button.new()
 	_dock._version_restart_btn.visible = false
 	_dock._last_rendered_server_text = ""
-	conn.server_version = server_ver
-	return conn
 
 
-func _cleanup_server_row(conn: McpConnection) -> void:
+func _cleanup_server_row() -> void:
 	_dock._setup_server_label.free()
 	_dock._setup_server_label = null
 	_dock._version_restart_btn.free()
 	_dock._version_restart_btn = null
-	conn.free()
+	_dock.present_transport_snapshot({})
+	_dock.present_lifecycle_snapshot({})
 
 
 func test_server_version_label_muted_when_ack_not_received() -> void:
 	## Pre-ack: show the expected version only as an unverified target.
 	## The row must not state "godot-ai == <plugin>" as a fact until the
 	## live server has reported that exact version.
-	var conn := _seed_server_row("")
+	_seed_server_row("")
 	_dock._refresh_server_version_label()
 	var plugin_ver := McpClientConfigurator.get_plugin_version()
 	assert_eq(
@@ -968,13 +893,13 @@ func test_server_version_label_muted_when_ack_not_received() -> void:
 		"checking live version (expected godot-ai == %s)" % plugin_ver
 	)
 	assert_false(_dock._version_restart_btn.visible, "Restart button stays hidden pre-ack")
-	_cleanup_server_row(conn)
+	_cleanup_server_row()
 
 
 func test_server_version_label_green_when_server_matches_plugin() -> void:
 	## Post-ack + match: the happy path. Green label, no Restart button.
 	var plugin_ver := McpClientConfigurator.get_plugin_version()
-	var conn := _seed_server_row(plugin_ver)
+	_seed_server_row(plugin_ver)
 	_dock._refresh_server_version_label()
 	assert_eq(_dock._setup_server_label.text, "godot-ai == %s" % plugin_ver,
 		"Match: label omits the '(plugin X)' suffix since there's no drift to flag")
@@ -984,7 +909,7 @@ func test_server_version_label_green_when_server_matches_plugin() -> void:
 		"Matched version must render green, got %s" % str(color))
 	assert_false(_dock._version_restart_btn.visible,
 		"Restart button stays hidden when versions match")
-	_cleanup_server_row(conn)
+	_cleanup_server_row()
 
 
 func test_server_version_label_amber_without_restart_when_ownership_unproven() -> void:
@@ -993,7 +918,7 @@ func test_server_version_label_amber_without_restart_when_ownership_unproven() -
 	## server outlives the plugin upgrade). Label must expose both versions.
 	## The Restart button stays hidden without plugin-provided ownership proof
 	## so the dock does not offer to kill an arbitrary foreign process.
-	var conn := _seed_server_row("1.2.3-stale-for-test")
+	_seed_server_row("1.2.3-stale-for-test")
 	_dock._refresh_server_version_label()
 	var plugin_ver := McpClientConfigurator.get_plugin_version()
 	assert_contains(_dock._setup_server_label.text, "1.2.3-stale-for-test",
@@ -1007,19 +932,19 @@ func test_server_version_label_amber_without_restart_when_ownership_unproven() -
 		"Mismatch must render amber, matching the drift banner's color"
 	)
 	assert_false(_dock._version_restart_btn.visible, "Restart button requires ownership proof")
-	_cleanup_server_row(conn)
+	_cleanup_server_row()
 
 
 func test_server_version_label_repaints_color_when_state_changes_without_text_change() -> void:
 	## The label text for "server vX, expected vY" is identical before and
 	## after the plugin marks the server incompatible; the color must still
 	## repaint from amber to red so the blocked state is visible.
-	var conn := _seed_server_row("1.2.3-stale-for-test")
-	var plugin := GodotAiPlugin.new()
-	plugin._lifecycle._server_actual_version = "1.2.3-stale-for-test"
-	plugin._lifecycle._server_expected_version = "2.2.0"
-	plugin._lifecycle._server_state = McpServerState.READY
-	_dock._plugin = plugin
+	_seed_server_row("1.2.3-stale-for-test")
+	_dock.present_lifecycle_snapshot({
+		"state": McpServerState.READY,
+		"actual_version": "1.2.3-stale-for-test",
+		"expected_version": "2.2.0",
+	})
 
 	_dock._refresh_server_version_label()
 	assert_eq(
@@ -1028,7 +953,11 @@ func test_server_version_label_repaints_color_when_state_changes_without_text_ch
 		"precondition: mismatch starts amber while not blocked"
 	)
 
-	plugin._lifecycle._server_state = McpServerState.INCOMPATIBLE
+	_dock.present_lifecycle_snapshot({
+		"state": McpServerState.INCOMPATIBLE,
+		"actual_version": "1.2.3-stale-for-test",
+		"expected_version": "2.2.0",
+	})
 	_dock._refresh_server_version_label()
 	assert_eq(
 		_dock._setup_server_label.get_theme_color("font_color"),
@@ -1037,21 +966,17 @@ func test_server_version_label_repaints_color_when_state_changes_without_text_ch
 	)
 	assert_false(_dock._version_restart_btn.visible, "incompatible state must hide Restart")
 
-	_dock._plugin = null
-	plugin.free()
-	_cleanup_server_row(conn)
+	_cleanup_server_row()
 
 
 func test_server_version_label_shows_restart_for_recoverable_incompatible_server() -> void:
-	var conn := _seed_server_row("1.2.3-stale-for-test")
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.status = {
+	_seed_server_row("1.2.3-stale-for-test")
+	_dock.present_lifecycle_snapshot({
 		"state": McpServerState.INCOMPATIBLE,
 		"actual_version": "1.2.3-stale-for-test",
 		"expected_version": "2.2.0",
 		"can_recover_incompatible": true,
-	}
-	_dock._plugin = plugin
+	})
 
 	_dock._refresh_server_version_label()
 	assert_true(
@@ -1059,39 +984,40 @@ func test_server_version_label_shows_restart_for_recoverable_incompatible_server
 		"recoverable incompatible godot-ai server should offer the user-confirmed restart"
 	)
 
-	_dock._plugin = null
-	plugin.free()
-	_cleanup_server_row(conn)
+	_cleanup_server_row()
 
 
 func test_restart_dispatches_incompatible_state_to_recovery() -> void:
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.status = {"state": McpServerState.INCOMPATIBLE}
-	_dock._plugin = plugin
+	var recorder := _IntentRecorder.new()
+	_dock.lifecycle_action_requested.connect(recorder.on_lifecycle_action)
+	_dock.present_lifecycle_snapshot({"state": McpServerState.INCOMPATIBLE})
 
 	_dock._on_restart_stale_server()
-	var recover_calls := plugin.recover_calls
-	var restart_calls := plugin.force_restart_calls
-	_dock._plugin = null
-	plugin.free()
+	var recover_calls := recorder.recover_calls
+	var restart_calls := recorder.force_restart_calls
 
 	assert_eq(recover_calls, 1)
 	assert_eq(restart_calls, 0)
+	_dock.lifecycle_action_requested.disconnect(recorder.on_lifecycle_action)
+	_dock.present_lifecycle_snapshot({})
 
 
 func test_restart_dispatches_non_incompatible_state_to_force_restart() -> void:
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.status = {"state": McpServerState.READY}
-	_dock._plugin = plugin
+	var recorder := _IntentRecorder.new()
+	_dock.lifecycle_action_requested.connect(recorder.on_lifecycle_action)
+	_dock.present_lifecycle_snapshot({
+		"state": McpServerState.READY,
+		"can_restart_managed": true,
+	})
 
 	_dock._on_restart_stale_server()
-	var recover_calls := plugin.recover_calls
-	var restart_calls := plugin.force_restart_calls
-	_dock._plugin = null
-	plugin.free()
+	var recover_calls := recorder.recover_calls
+	var restart_calls := recorder.force_restart_calls
 
 	assert_eq(recover_calls, 0)
 	assert_eq(restart_calls, 1)
+	_dock.lifecycle_action_requested.disconnect(recorder.on_lifecycle_action)
+	_dock.present_lifecycle_snapshot({})
 
 
 func test_dev_checkout_tooltip_exposes_symlink_target() -> void:
@@ -1229,236 +1155,273 @@ func test_finalize_action_buttons_reenables_after_in_flight() -> void:
 
 
 func test_timed_out_client_refresh_reenables_configure_all() -> void:
-	## A status refresh can outlive the watchdog when an underlying process
-	## blocks in a way GDScript cannot interrupt. The dock should keep the
-	## warning badge, but it must not strand Configure all behind the orphaned
-	## worker forever.
 	_dock._build_ui()
-	_dock._refresh_state = McpClientRefreshState.RUNNING_TIMED_OUT
-	_dock._refresh_clients_summary()
+	_dock.present_client_work_snapshot({
+		"refresh_state": McpClientRefreshState.RUNNING_TIMED_OUT,
+	})
 	assert_contains(_dock._clients_summary_label.text, "client probe still running",
 		"Timed-out refreshes should still be visible in the summary")
 	assert_false(_dock._client_configure_all_btn.disabled,
 		"Timed-out refreshes must not keep client actions disabled")
 
 
-func test_timed_out_client_action_reenables_row_and_ignores_late_result() -> void:
-	## Configure/Remove actions have a separate worker slot from status
-	## refresh. If that worker wedges in a file/process primitive, the row
-	## must recover instead of leaving "Configuring..." up forever.
+func test_timed_out_client_action_keeps_one_slot_until_result_is_inspected() -> void:
 	_dock._build_ui()
 	var any_id := _first_client_id()
 	if any_id.is_empty():
 		skip("No clients registered")
 		return
+	var owner := ClientJobOwnerScript.new()
+	owner.action_timed_out.connect(_dock.present_client_action_timeout)
+	owner.action_completed.connect(_dock.present_client_action_result)
+	owner.snapshot_changed.connect(_dock.present_client_work_snapshot)
 	_dock._set_row_action_in_flight(any_id, "configure")
-	_dock._client_action_threads[any_id] = null
-	_dock._client_action_generations[any_id] = 4
-	_dock._client_action_started_msec[any_id] = Time.get_ticks_msec() - McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC - 1
-	_dock._client_action_names[any_id] = "configure"
-
-	_dock._check_client_action_timeouts()
+	owner._action_threads[any_id] = null
+	owner._action_started_msec[any_id] = 1
+	owner._action_names[any_id] = "configure"
+	owner._check_action_timeouts(ClientJobOwnerScript.ACTION_TIMEOUT_MSEC + 2)
 
 	var row: Dictionary = _dock._client_rows[any_id]
-	assert_false(_dock._client_action_threads.has(any_id),
-		"Timed-out action slot must be cleared so the row can retry")
-	assert_false((row["configure_btn"] as Button).disabled,
-		"Configure button must re-enable after the action watchdog fires")
-	assert_false((row["remove_btn"] as Button).disabled,
-		"Remove button must re-enable too")
+	assert_true(owner._action_threads.has(any_id),
+		"Timed-out action must retain its sole slot until its result is inspected")
+	assert_true((row["configure_btn"] as Button).disabled,
+		"Configure button must remain disabled while the timed-out slot is retained")
 	assert_eq(row.get("status"), McpClient.Status.ERROR,
-		"Timed-out action must leave an error status instead of stale busy UI")
-	assert_contains((row["name_label"] as Label).text, "Configure did not report completion",
-		"Timed-out action error should explain why the row recovered")
-	assert_eq(int(_dock._client_action_generations.get(any_id, 0)), 5,
-		"Watchdog must bump generation so a late worker result is ignored")
-
-	_dock._apply_client_action_result(any_id, "configure", {"status": "ok"}, 4)
-	assert_eq(row.get("status"), McpClient.Status.ERROR,
-		"Late success from the abandoned generation must not overwrite the timeout")
+		"Timed-out action must explain the retained busy state")
+	assert_contains((row["name_label"] as Label).text, "waiting to inspect its result",
+		"Timeout copy must explain why retry remains unavailable")
+	owner._finalize_action(any_id, "configure", {"status": "ok"}, {})
+	assert_false(owner._action_threads.has(any_id),
+		"Only inspected completion may release the client slot")
+	assert_eq(row.get("status"), McpClient.Status.CONFIGURED,
+		"The joined worker's real result is authoritative after timeout")
+	owner.free()
 
 
 func test_completed_client_action_clears_timeout_metadata() -> void:
-	## Mirror for the watchdog path: a normal fast completion must clear the
-	## per-row timeout bookkeeping, so a later tick cannot turn a successful
-	## Configure into a false timeout.
 	_dock._build_ui()
 	var any_id := _first_client_id()
 	if any_id.is_empty():
 		skip("No clients registered")
 		return
+	var owner := ClientJobOwnerScript.new()
+	owner.action_completed.connect(_dock.present_client_action_result)
 	_dock._set_row_action_in_flight(any_id, "configure")
-	_dock._client_action_threads[any_id] = null
-	_dock._client_action_generations[any_id] = 9
-	_dock._client_action_started_msec[any_id] = Time.get_ticks_msec() - McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC - 1
-	_dock._client_action_names[any_id] = "configure"
-
-	_dock._apply_client_action_result(any_id, "configure", {"status": "ok"}, 9)
-	_dock._check_client_action_timeouts()
+	owner._action_threads[any_id] = null
+	owner._action_started_msec[any_id] = Time.get_ticks_msec() - ClientJobOwnerScript.ACTION_TIMEOUT_MSEC - 1
+	owner._action_names[any_id] = "configure"
+	owner._action_timeout_reported[any_id] = true
+	owner._finalize_action(any_id, "configure", {"status": "ok"}, {})
+	owner._check_action_timeouts()
 
 	var row: Dictionary = _dock._client_rows[any_id]
-	assert_false(_dock._client_action_threads.has(any_id),
+	assert_false(owner._action_threads.has(any_id),
 		"Successful completion must clear the action thread slot")
-	assert_false(_dock._client_action_started_msec.has(any_id),
+	assert_false(owner._action_started_msec.has(any_id),
 		"Successful completion must clear timeout start metadata")
-	assert_false(_dock._client_action_names.has(any_id),
+	assert_false(owner._action_names.has(any_id),
 		"Successful completion must clear timeout action metadata")
+	assert_false(owner._action_timeout_reported.has(any_id),
+		"Successful completion must clear the one-shot timeout marker")
 	assert_eq(row.get("status"), McpClient.Status.CONFIGURED,
 		"A completed Configure must remain configured after a later watchdog tick")
-	assert_false((row["configure_btn"] as Button).disabled,
-		"Successful completion must re-enable the configure button")
+	owner.free()
 
 
-func test_client_action_timeout_ticks_without_connection() -> void:
-	## A server reload or transport drop can temporarily clear the dock's
-	## connection object. The row watchdog must still tick in that state;
-	## otherwise a dropped configure result leaves "Configuring..." forever.
+func test_client_action_timeout_is_independent_of_transport_snapshot() -> void:
 	_dock._build_ui()
 	var any_id := _first_client_id()
 	if any_id.is_empty():
 		skip("No clients registered")
 		return
-	_dock._connection = null
+	var owner := ClientJobOwnerScript.new()
+	owner.action_timed_out.connect(_dock.present_client_action_timeout)
+	owner.snapshot_changed.connect(_dock.present_client_work_snapshot)
 	_dock._set_row_action_in_flight(any_id, "configure")
-	_dock._client_action_threads[any_id] = null
-	_dock._client_action_generations[any_id] = 14
-	_dock._client_action_started_msec[any_id] = Time.get_ticks_msec() - McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC - 1
-	_dock._client_action_names[any_id] = "configure"
-
-	_dock._process(0.0)
+	owner._action_threads[any_id] = null
+	owner._action_started_msec[any_id] = 1
+	owner._action_names[any_id] = "configure"
+	owner._check_action_timeouts(ClientJobOwnerScript.ACTION_TIMEOUT_MSEC + 2)
 
 	var row: Dictionary = _dock._client_rows[any_id]
-	assert_false(_dock._client_action_threads.has(any_id),
-		"Action watchdog must clear the stuck slot even without a connection")
-	assert_false((row["configure_btn"] as Button).disabled,
-		"Configure button must recover even while the MCP connection is absent")
-	assert_contains((row["name_label"] as Label).text, "Configure did not report completion",
-		"Recovered row should explain that the action result went missing")
+	assert_true(owner._action_threads.has(any_id),
+		"Action watchdog must retain the slot even without a connection")
+	assert_true((row["configure_btn"] as Button).disabled,
+		"The row cannot recover until the retained worker result is inspected")
+	assert_contains((row["name_label"] as Label).text, "waiting to inspect its result",
+		"The row should explain why it remains locked")
+	owner._finalize_action(any_id, "configure", {"status": "error"}, {})
+	owner.free()
 
 
-func test_completed_orphaned_client_action_requests_status_refresh() -> void:
-	## If a genuinely slow action is still alive at timeout, the immediate
-	## refresh can run before the side effect lands. When that abandoned
-	## worker later finishes, pruning it should request one more status sweep
-	## so the row can reconcile to the final on-disk state.
-	var scene_root := EditorInterface.get_edited_scene_root()
-	assert_true(scene_root != null, "Dock orphan-prune test needs an edited scene root")
-	if scene_root == null:
-		return
+func test_completed_timed_out_action_records_unproven_before_releasing_slot() -> void:
+	Engine.remove_meta(ClientJobOwnerScript.MUTATION_UNPROVEN_META)
+	var client_id := "timed-out-unproven"
 	var thread := Thread.new()
-	var err := thread.start(Callable(self, "_finished_thread_noop"))
-	assert_eq(err, OK, "Finished orphan fixture thread should start")
+	var payload := {
+		"client_id": client_id,
+		"action": "configure",
+		"result": {"status": "error", "termination_failed": true},
+		"prewarm": {},
+	}
+	var err := thread.start(Callable(self, "_finished_thread_payload").bind(payload))
+	assert_eq(err, OK, "Finished timed-out fixture thread should start")
 	while thread.is_alive():
 		OS.delay_msec(1)
-	var dock := _RefreshCountingDock.new()
-	dock._orphaned_client_action_threads.append(thread)
-	scene_root.add_child(dock)
-
-	dock._prune_orphaned_client_action_threads()
-
-	assert_true(dock._orphaned_client_action_threads.is_empty(),
-		"Prune must reap the completed orphan action thread")
-	assert_eq(dock.action_completion_refreshes, 1,
-		"Completed orphan action should request a status refresh")
-	scene_root.remove_child(dock)
-	dock.free()
+	var owner := ClientJobOwnerScript.new()
+	owner._action_threads[client_id] = thread
+	owner._action_names[client_id] = "configure"
+	owner._action_timeout_reported[client_id] = true
+	owner._poll_actions()
+	assert_true(owner._mutation_termination_unproven.has(client_id),
+		"The joined payload must persist safety evidence")
+	assert_false(owner._action_threads.has(client_id),
+		"The slot releases only after the unsafe payload was inspected")
+	owner.free()
+	Engine.remove_meta(ClientJobOwnerScript.MUTATION_UNPROVEN_META)
 
 
 func test_dispatch_client_action_short_circuits_during_self_update() -> void:
-	## Same gate the refresh worker honors: while
-	## `McpUpdateManager._install_zip` is overwriting plugin scripts on
-	## disk, spawning a worker that walks into `_cli_strategy.gd` mid-
-	## bytecode-swap SIGABRTs the editor. The flag lives on the manager;
-	## `_is_self_update_in_progress()` consults it.
 	_dock._build_ui()
 	var any_id := _first_client_id()
 	if any_id.is_empty():
 		skip("No clients registered")
 		return
-	## `_build_ui` already set up a real manager. Swap it out for the
-	## test stub so we can flip the gate without driving a real download.
-	var prior_manager = _dock._update_manager
-	var stub := _StubInstallGate.new()
-	stub.in_flight = true
-	_dock._update_manager = stub
+	var intents: Array = []
+	_dock.client_action_requested.connect(
+		func(client_id: String, action: String) -> void: intents.append([client_id, action])
+	)
+	_dock.present_update_state({"install_in_flight": true})
 	_dock._dispatch_client_action(any_id, "configure")
-	assert_false(_dock._client_action_threads.has(any_id),
-		"No worker thread must be created while self-update is in progress")
-	_dock._update_manager = prior_manager
-	stub.free()
+	assert_true(intents.is_empty(), "No client intent may escape while self-update is active")
+	_dock.present_update_state({"install_in_flight": false})
 
 
 func test_dispatch_client_action_noop_when_slot_already_in_flight() -> void:
-	## Double-click guard: a second click while the first worker is still
-	## running must not start a second thread on the same row. Without
-	## this, the row's button/label state would race between the two
-	## workers' completion payloads.
 	_dock._build_ui()
 	var any_id := _first_client_id()
 	if any_id.is_empty():
 		skip("No clients registered")
 		return
-	## Plant a sentinel in the slot so the dispatch sees it as in-flight
-	## without us having to actually spawn (and then drain) a real
-	## subprocess. Cleared in teardown so we don't leak the entry.
-	var sentinel := Thread.new()
-	_dock._client_action_threads[any_id] = sentinel
+	var intents: Array = []
+	_dock.client_action_requested.connect(
+		func(client_id: String, action: String) -> void: intents.append([client_id, action])
+	)
+	_dock.present_client_work_snapshot({"busy_actions": [any_id]})
 	_dock._dispatch_client_action(any_id, "configure")
-	assert_eq(_dock._client_action_threads[any_id], sentinel,
-		"Dispatch must leave the existing slot untouched while in flight")
-	_dock._client_action_threads.erase(any_id)
+	assert_true(intents.is_empty(), "A busy value snapshot must suppress double-dispatch")
+	_dock.present_client_work_snapshot({"busy_actions": []})
 
 
 func test_completed_action_thread_is_polled_and_applied() -> void:
-	## Regression for the dock showing "Configure did not report completion"
-	## even though the worker finished and the config file landed. The main
-	## thread must reap finished action workers directly instead of relying on
-	## a worker-thread deferred callback.
 	_dock._build_ui()
 	var any_id := _first_client_id()
 	if any_id.is_empty():
 		skip("No clients registered")
 		return
+	var owner := ClientJobOwnerScript.new()
+	owner.action_completed.connect(_dock.present_client_action_result)
 	_dock._set_row_action_in_flight(any_id, "configure")
-	_dock._client_action_generations[any_id] = 12
-	_dock._client_action_started_msec[any_id] = Time.get_ticks_msec()
-	_dock._client_action_names[any_id] = "configure"
+	owner._action_started_msec[any_id] = Time.get_ticks_msec()
+	owner._action_names[any_id] = "configure"
 	var payload := {
 		"client_id": any_id,
 		"action": "configure",
 		"result": {"status": "ok"},
-		"generation": 12,
 	}
 	var thread := Thread.new()
 	var err := thread.start(Callable(self, "_finished_thread_payload").bind(payload))
 	assert_eq(err, OK, "Completed action fixture thread should start")
 	while thread.is_alive():
 		OS.delay_msec(1)
-	_dock._client_action_threads[any_id] = thread
-
-	_dock._process(0.0)
+	owner._action_threads[any_id] = thread
+	owner._poll_actions()
 
 	var row: Dictionary = _dock._client_rows[any_id]
-	assert_false(_dock._client_action_threads.has(any_id),
+	assert_false(owner._action_threads.has(any_id),
 		"Polling must clear the completed action slot")
 	assert_eq(row.get("status"), McpClient.Status.CONFIGURED,
 		"Completed configure payload must repaint the row as configured")
 	assert_contains(_dock._clients_summary_label.text, "1 /",
 		"Summary should reconcile as soon as the completed action is reaped")
+	owner.free()
+
+
+func test_unproven_mutation_survives_owner_restart_until_explicit_recovery() -> void:
+	var client_id := "unproven-client"
+	Engine.remove_meta(ClientJobOwnerScript.MUTATION_UNPROVEN_META)
+	var owner := ClientJobOwnerScript.new()
+	var completions: Array[Dictionary] = []
+	owner.action_completed.connect(func(id: String, action: String, result: Dictionary, _prewarm: Dictionary) -> void:
+		completions.append({"id": id, "action": action, "result": result})
+	)
+	owner.activate()
+	owner._finalize_action(
+		client_id,
+		"configure",
+		{"status": "error", "termination_failed": true},
+		{},
+	)
+	assert_true(owner._mutation_termination_unproven.has(client_id))
+	assert_false(owner.request_action(client_id, "remove"),
+		"a possibly-live old mutation must block the next mutation")
+	assert_eq(completions.size(), 2)
+	assert_contains(str(completions[1].result.get("message", "")), "explicitly remove")
+
+	var quiesced := owner.quiesce()
+	assert_false(bool(quiesced.get("ok", true)),
+		"self-update must not continue across an unproven client mutation")
+	assert_true(bool(quiesced.get("termination_unproven", false)))
+	owner.resume_after_quiesce()
+	assert_false(owner.request_action(client_id, "configure"),
+		"failed-update resume must not erase the durable safety block")
+	owner.quiesce()
+	owner.free()
+
+	var replacement := ClientJobOwnerScript.new()
+	replacement.activate()
+	assert_true(replacement._mutation_termination_unproven.has(client_id),
+		"plugin reload in the same editor process must retain the deny marker")
+	assert_false(replacement.request_action(client_id, "remove"))
+	replacement.quiesce()
+	replacement.free()
+	Engine.remove_meta(ClientJobOwnerScript.MUTATION_UNPROVEN_META)
+
+
+func test_quiesce_records_unproven_prewarm_from_joined_action() -> void:
+	var client_id := "unproven-prewarm"
+	Engine.remove_meta(ClientJobOwnerScript.MUTATION_UNPROVEN_META)
+	var owner := ClientJobOwnerScript.new()
+	var payload := {
+		"client_id": client_id,
+		"action": "configure",
+		"result": {"status": "ok"},
+		"prewarm": {"termination_failed": true},
+	}
+	var thread := Thread.new()
+	var err := thread.start(Callable(self, "_finished_thread_payload").bind(payload))
+	assert_eq(err, OK)
+	owner._action_threads[client_id] = thread
+	var quiesced := owner.quiesce()
+	assert_false(bool(quiesced.get("ok", true)),
+		"a joined prewarm with possible descendants must block script swap")
+	assert_true(owner._mutation_termination_unproven.has(client_id))
+	owner.free()
+	Engine.remove_meta(ClientJobOwnerScript.MUTATION_UNPROVEN_META)
 
 
 func test_completed_status_refresh_thread_is_polled_and_applied() -> void:
-	## A completed status worker with a missed callback used to strand the
-	## dock in "(checking...)" with stale row statuses. Reaping the Thread
-	## return value from `_process` must apply the snapshot and finalize the
-	## refresh state.
 	_dock._build_ui()
 	var any_id := _first_client_id()
 	if any_id.is_empty():
 		skip("No clients registered")
 		return
-	_dock._client_status_refresh_generation = 21
-	_dock._refresh_state = McpClientRefreshState.RUNNING
+	var owner := ClientJobOwnerScript.new()
+	_dock.present_client_work_snapshot({"busy_actions": []})
+	owner.status_refresh_completed.connect(_dock.present_client_status_refresh_results)
+	owner.snapshot_changed.connect(_dock.present_client_work_snapshot)
+	owner._refresh_generation = 21
+	owner._refresh_state = McpClientRefreshState.RUNNING
 	var payload := {
 		"generation": 21,
 		"results": {
@@ -1474,19 +1437,19 @@ func test_completed_status_refresh_thread_is_polled_and_applied() -> void:
 	assert_eq(err, OK, "Completed status fixture thread should start")
 	while thread.is_alive():
 		OS.delay_msec(1)
-	_dock._client_status_refresh_thread = thread
-
-	_dock._process(0.0)
+	owner._refresh_thread = thread
+	owner._poll_refresh()
 
 	var row: Dictionary = _dock._client_rows[any_id]
-	assert_eq(_dock._client_status_refresh_thread, null,
+	assert_eq(owner._refresh_thread, null,
 		"Polling must clear the completed status refresh thread")
-	assert_eq(_dock._refresh_state, McpClientRefreshState.IDLE,
+	assert_eq(owner._refresh_state, McpClientRefreshState.IDLE,
 		"Completed status refresh should finalize back to idle")
 	assert_eq(row.get("status"), McpClient.Status.CONFIGURED,
 		"Status refresh payload must repaint the row")
 	assert_false(_dock._clients_summary_label.text.contains("checking"),
 		"Summary must drop the checking badge after applying the payload")
+	owner.free()
 
 
 func test_apply_status_refresh_results_skips_rows_with_in_flight_action() -> void:
@@ -1500,8 +1463,10 @@ func test_apply_status_refresh_results_skips_rows_with_in_flight_action() -> voi
 		skip("No clients registered")
 		return
 	_dock._set_row_action_in_flight(any_id, "configure")
-	_dock._client_action_threads[any_id] = Thread.new()
-	_dock._client_status_refresh_generation = 1
+	_dock.present_client_work_snapshot({
+		"busy_actions": [any_id],
+		"action_names": {any_id: "configure"},
+	})
 	var results := {
 		any_id: {
 			"status": McpClient.Status.NOT_CONFIGURED,
@@ -1509,96 +1474,93 @@ func test_apply_status_refresh_results_skips_rows_with_in_flight_action() -> voi
 			"error_msg": "",
 		}
 	}
-	_dock._apply_client_status_refresh_results(results, 1)
+	_dock.present_client_status_refresh_results(results)
 	var row: Dictionary = _dock._client_rows[any_id]
 	assert_contains((row["configure_btn"] as Button).text, "Configuring",
 		"In-flight Configuring badge on the button must survive a concurrent refresh result")
 	assert_eq((row["dot"] as ColorRect).color, McpDockScript.COLOR_AMBER,
 		"Dot must stay amber while the action worker hasn't completed")
-	_dock._client_action_threads.erase(any_id)
 
 
-func test_drain_client_action_workers_clears_threads_and_bumps_generation() -> void:
-	## `McpUpdateManager._install_zip` calls this drain (via
-	## `_drain_dock_workers`) before extracting the release zip, same
-	## reason as the refresh worker drain — a worker mid-call into a
-	## half-overwritten script SIGABRTs the editor. The drain bumps
-	## generation per-row so any result from a worker that finished after
-	## the drain detects the mismatch and short-circuits before touching
-	## restored UI state.
-	_dock._client_action_threads["sentinel-id"] = null
-	_dock._client_action_generations["sentinel-id"] = 7
-	_dock._drain_client_action_workers()
-	assert_true(_dock._client_action_threads.is_empty(),
-		"Drain must empty the action-thread map so a follow-up dispatch starts fresh")
-	assert_eq(int(_dock._client_action_generations.get("sentinel-id", 0)), 8,
-		"Drain must bump generation so any late result from the drained worker is rejected as stale")
+func test_drain_client_action_workers_clears_the_single_slot_table() -> void:
+	var owner := ClientJobOwnerScript.new()
+	owner._action_threads["sentinel-id"] = null
+	owner.quiesce()
+	assert_true(owner._action_threads.is_empty(),
+		"Quiesce must empty the action-thread map before scripts are replaced")
+	assert_eq(owner._refresh_state, McpClientRefreshState.SHUTTING_DOWN,
+		"Quiesce closes the owner against new work")
+	owner.free()
 
 
-func test_drain_cancels_active_and_orphaned_action_workers_before_join() -> void:
+func test_drain_cancels_all_active_action_workers_before_join() -> void:
 	## A cold uvx prewarm has a deliberate 180s normal budget. Teardown must
-	## signal all worker rows first, including watchdog-orphaned ones, before
-	## waiting for threads or editor close/update can inherit that full delay.
+	## signal every retained row before waiting for threads or editor close/update
+	## can inherit that full delay.
 	var active_id := "cancel-active"
-	var orphan_id := "cancel-orphan"
+	var second_id := "cancel-second"
+	var owner := ClientJobOwnerScript.new()
 	var active := Thread.new()
-	var orphan := Thread.new()
+	var second := Thread.new()
 	var active_err := active.start(func() -> void:
 		var deadline := Time.get_ticks_msec() + 2000
-		while not _dock._is_client_action_cancel_requested(active_id) \
+		while not owner._is_action_cancelled(active_id) \
 			and Time.get_ticks_msec() < deadline:
 			OS.delay_msec(10)
 	)
-	var orphan_err := orphan.start(func() -> void:
+	var second_err := second.start(func() -> void:
 		var deadline := Time.get_ticks_msec() + 2000
-		while not _dock._is_client_action_cancel_requested(orphan_id) \
+		while not owner._is_action_cancelled(second_id) \
 			and Time.get_ticks_msec() < deadline:
 			OS.delay_msec(10)
 	)
 	assert_eq(active_err, OK)
-	assert_eq(orphan_err, OK)
-	_dock._client_action_threads[active_id] = active
-	McpDockScript._orphaned_client_action_threads.append(orphan)
-	McpDockScript._orphaned_client_action_owners[orphan_id] = [orphan]
+	assert_eq(second_err, OK)
+	owner._action_threads[active_id] = active
+	owner._action_threads[second_id] = second
 	var started_msec := Time.get_ticks_msec()
-
-	_dock._drain_client_action_workers()
+	owner.quiesce()
 
 	var elapsed_msec := Time.get_ticks_msec() - started_msec
 	assert_true(elapsed_msec < 1000,
 		"Drain must cancel both workers before joining (elapsed=%dms)" % elapsed_msec)
-	assert_true(McpDockScript._orphaned_client_action_threads.is_empty())
-	assert_true(McpDockScript._orphaned_client_action_owners.is_empty())
-	assert_false(_dock._is_client_action_cancel_requested(active_id),
+	assert_true(owner._action_threads.is_empty())
+	assert_false(owner._is_action_cancelled(active_id),
 		"Drain must clear cancellation state after every worker has joined")
+	owner.free()
 
 
-func test_watchdog_cancels_live_worker_before_orphaning() -> void:
-	## A worker can cross the 30s base budget just before setting PREWARM. Once
-	## orphaned it is no longer checked by the watchdog, so it must carry a
-	## cancellation request into any uvx poll loop it reaches afterward.
+func test_watchdog_cancels_but_retains_live_worker_until_join() -> void:
+	## A worker can cross the base budget just before setting PREWARM. It must
+	## carry a cancellation request into that poll loop without releasing its
+	## one mutation slot before the result has been joined and inspected.
 	var client_id := "cancel-watchdog"
-	_dock._set_client_action_cancel_requested(client_id, false)
+	var owner := ClientJobOwnerScript.new()
+	owner._set_action_cancelled(client_id, false)
 	var worker := Thread.new()
 	var start_err := worker.start(func() -> void:
 		var deadline := Time.get_ticks_msec() + 2000
-		while not _dock._is_client_action_cancel_requested(client_id) \
+		while not owner._is_action_cancelled(client_id) \
 			and Time.get_ticks_msec() < deadline:
 			OS.delay_msec(10)
 	)
 	assert_eq(start_err, OK)
-	_dock._client_action_threads[client_id] = worker
-	_dock._client_action_started_msec[client_id] = Time.get_ticks_msec() - 100
-	_dock._client_action_names[client_id] = "configure"
+	owner._action_threads[client_id] = worker
+	owner._action_started_msec[client_id] = Time.get_ticks_msec() - 100
+	owner._action_names[client_id] = "configure"
+	owner._report_action_timeout(client_id, 100)
 
-	_dock._abandon_client_action_thread(client_id)
-
-	assert_true(_dock._is_client_action_cancel_requested(client_id),
-		"A live watchdog orphan must be cancelled before it can enter prewarm")
-	worker.wait_to_finish()
-	_dock._prune_orphaned_client_action_threads()
-	_dock._set_client_action_cancel_requested(client_id, false)
-	assert_false(McpDockScript._has_live_orphan(client_id))
+	assert_true(owner._is_action_cancelled(client_id),
+		"A live timed-out worker must be cancelled before it can enter prewarm")
+	assert_true(owner._action_threads.has(client_id),
+		"Cancellation must not release the mutation slot")
+	while worker.is_alive():
+		OS.delay_msec(1)
+	owner._poll_actions()
+	assert_false(owner._action_threads.has(client_id),
+		"Polling releases the slot only after joining the worker")
+	assert_false(owner._is_action_cancelled(client_id))
+	owner.free()
 
 
 func test_drain_client_action_workers_restores_in_flight_row_buttons() -> void:
@@ -1614,9 +1576,12 @@ func test_drain_client_action_workers_restores_in_flight_row_buttons() -> void:
 	if any_id.is_empty():
 		skip("No clients registered")
 		return
-	_dock._set_row_action_in_flight(any_id, "configure")
-	_dock._client_action_threads[any_id] = null
-	_dock._drain_client_action_workers()
+	var owner := ClientJobOwnerScript.new()
+	owner.snapshot_changed.connect(_dock.present_client_work_snapshot)
+	owner._action_threads[any_id] = null
+	owner._action_names[any_id] = "configure"
+	owner._publish_snapshot()
+	owner.quiesce()
 	var row: Dictionary = _dock._client_rows[any_id]
 	assert_false((row["configure_btn"] as Button).disabled,
 		"Drain must re-enable the configure button so the user can retry")
@@ -1624,6 +1589,7 @@ func test_drain_client_action_workers_restores_in_flight_row_buttons() -> void:
 		"Drain must re-enable the remove button too")
 	assert_false(str((row["configure_btn"] as Button).text).contains("Configuring"),
 		"Drain must clear the in-flight badge from the configure button")
+	owner.free()
 
 
 func test_incompatible_server_body_uses_actionable_message() -> void:
@@ -1731,7 +1697,7 @@ func test_recoverable_incompatible_hides_docs_link_button() -> void:
 # These pin the new panel boundary: panels emit; dock owns side effects.
 
 ## Spies for the two panels' signals. Inner-class pattern matches the
-## `_RestartDispatchPlugin` spy at the top of this file — multi-line
+## `_IntentRecorder` spy at the top of this file — multi-line
 ## lambdas with closure-captured locals don't reliably evaluate the body
 ## under the test runner, so a typed receiver is the safe form.
 class _PortApplySpy:
@@ -1744,6 +1710,12 @@ class _LogToggleSpy:
 	var captured: Array[bool] = []
 	func on_toggle(enabled: bool) -> void:
 		captured.append(enabled)
+
+
+class _SettingsApplySpy:
+	var captured: Array[Dictionary] = []
+	func on_apply(changes: Dictionary, reload: bool) -> void:
+		captured.append({"changes": changes.duplicate(true), "reload": reload})
 
 
 func test_port_picker_panel_emits_apply_requested_for_in_range_port() -> void:
@@ -1784,16 +1756,36 @@ func test_port_picker_panel_skips_emit_for_out_of_range_port() -> void:
 	panel.free()
 
 
+func test_dock_emits_copied_endpoint_setting_intents_without_persisting() -> void:
+	var dock := McpDockScript.new()
+	var spy := _SettingsApplySpy.new()
+	dock.settings_apply_requested.connect(spy.on_apply)
+	dock._on_port_apply_requested(23000)
+	dock._tools_pending_excluded = PackedStringArray(["audio"])
+	dock._telemetry_pending_enabled = false
+	dock._on_tools_apply()
+	dock._allow_hosts_edit = LineEdit.new()
+	dock.add_child(dock._allow_hosts_edit)
+	dock._allow_hosts_edit.text = "10.0.0.5"
+	dock._on_allow_hosts_apply()
+	assert_eq(spy.captured.size(), 3)
+	assert_eq(spy.captured[0], {"changes": {"http_port": 23000}, "reload": true})
+	assert_eq(str(spy.captured[1].changes.excluded_domains), "audio")
+	assert_false(bool(spy.captured[1].changes.telemetry_enabled))
+	assert_eq(str(spy.captured[2].changes.allow_hosts), "10.0.0.5")
+	dock.free()
+
+
 func test_log_viewer_emits_logging_enabled_changed_on_toggle() -> void:
-	## The dock routes this signal to `_connection.dispatcher.mcp_logging`
-	## and the buffer's console echo. If LogViewer stops emitting, MCP
+	## The root routes this intent to the dispatcher and log-buffer echo gate.
+	## If LogViewer stops emitting, MCP
 	## request/response logging silently stays whatever it was — easy to
 	## regress, hard to spot.
 	## Instantiate in isolation to keep the test focused on the panel's
 	## emit contract (and consistent with the port-picker tests above).
 	var prev_setting := _save_mcp_logging_setting()
 	var panel := LogViewerScript.new()
-	panel.setup(null)  # buffer not exercised — only signal emission is under test
+	panel.setup()
 	var spy := _LogToggleSpy.new()
 	panel.logging_enabled_changed.connect(spy.on_toggle)
 	panel._on_log_toggled(false)
@@ -1810,7 +1802,7 @@ func test_log_viewer_toggle_persists_across_rebuilds() -> void:
 	## panel must write the EditorSetting on toggle and read it back on build.
 	var prev_setting := _save_mcp_logging_setting()
 	var panel := LogViewerScript.new()
-	panel.setup(null)
+	panel.setup()
 	panel._on_log_toggled(false)
 	var es := EditorInterface.get_editor_settings()
 	assert_true(es.has_setting(McpSettings.SETTING_MCP_LOGGING),
@@ -1820,7 +1812,7 @@ func test_log_viewer_toggle_persists_across_rebuilds() -> void:
 
 	## A freshly built panel (≈ next editor session) restores the choice.
 	var rebuilt := LogViewerScript.new()
-	rebuilt.setup(null)
+	rebuilt.setup()
 	assert_eq(rebuilt._log_toggle.button_pressed, false,
 		"rebuilt panel must restore the persisted (off) state")
 	assert_eq(rebuilt._log_display.visible, false,
@@ -1831,21 +1823,19 @@ func test_log_viewer_toggle_persists_across_rebuilds() -> void:
 	_restore_mcp_logging_setting(prev_setting)
 
 
-func test_dock_log_toggle_mutes_buffer_console_echo() -> void:
-	## #626: the dock only routed the toggle to `dispatcher.mcp_logging`,
+func test_root_routes_dock_log_toggle_to_dispatcher_and_buffer() -> void:
+	## #626: the root must route the Dock intent to `dispatcher.mcp_logging`,
 	## which gates [recv]/[send] lines — connection-level [event]/[defer]
-	## lines log straight to the buffer and kept echoing to the console with
-	## logging off. The dock must also gate the buffer's console echo, while
-	## ring recording stays on so the dock's log panel keeps working.
+	## lines log straight to the buffer and otherwise keep echoing to the console.
 	var dock := McpDockScript.new()
 	var buffer := McpLogBuffer.new()
-	dock._log_buffer = buffer
-	var conn := McpConnection.new()
-	conn.dispatcher = McpDispatcher.new(buffer)
-	dock._connection = conn
+	var plugin := GodotAiPlugin.new()
+	plugin._log_buffer = buffer
+	plugin._dispatcher = McpDispatcher.new(buffer)
+	dock.mcp_logging_changed.connect(plugin._on_dock_mcp_logging_changed)
 	dock._on_log_logging_enabled_changed(false)
 	assert_eq(buffer.enabled, false, "toggle off must mute buffer console echo")
-	assert_eq(conn.dispatcher.mcp_logging, false,
+	assert_eq(plugin._dispatcher.mcp_logging, false,
 		"toggle off must also gate dispatcher [recv]/[send] logging")
 	var prev_echo: bool = McpLogBuffer.console_echo
 	McpLogBuffer.console_echo = false
@@ -1855,10 +1845,10 @@ func test_dock_log_toggle_mutes_buffer_console_echo() -> void:
 		"ring must keep recording while console echo is muted")
 	dock._on_log_logging_enabled_changed(true)
 	assert_eq(buffer.enabled, true, "toggle on must restore buffer console echo")
-	assert_eq(conn.dispatcher.mcp_logging, true,
+	assert_eq(plugin._dispatcher.mcp_logging, true,
 		"toggle on must restore dispatcher [recv]/[send] logging")
-	conn.free()
 	dock.free()
+	plugin.free()
 
 
 func test_configure_phase_labels_the_package_build_instead_of_hanging_silent() -> void:
@@ -1866,126 +1856,104 @@ func test_configure_phase_labels_the_package_build_instead_of_hanging_silent() -
 	## CLIENT spawn is warm. That build can run for tens of seconds on a cold
 	## cache, and a motionless "Configuring…" reads as a hang — so the worker
 	## reports a phase and the poll promotes the label.
-	var dock := McpDockScript.new()
-	var btn := Button.new()
-	btn.text = "Configuring…"
-	dock._client_rows["claude_code"] = {"configure_btn": btn}
-
-	## Config-write phase: the label must not move yet.
-	dock._apply_client_action_phase("claude_code")
-	assert_eq(btn.text, "Configuring…", "label must not move before the warm starts")
-
-	## Worker reports it reached the package warm.
-	dock._set_client_action_phase("claude_code", "prewarm")
-	dock._apply_client_action_phase("claude_code")
+	_dock._build_ui()
+	var any_id := _first_client_id()
+	if any_id.is_empty():
+		skip("No clients registered")
+		return
+	_dock.present_client_work_snapshot({
+		"busy_actions": [any_id],
+		"action_names": {any_id: "configure"},
+		"action_phases": {},
+	})
+	var btn := _dock._client_rows[any_id]["configure_btn"] as Button
+	assert_contains(btn.text, "Configuring", "label must not move before the warm starts")
+	_dock.present_client_work_snapshot({
+		"busy_actions": [any_id],
+		"action_names": {any_id: "configure"},
+		"action_phases": {any_id: "prewarm"},
+	})
 	assert_eq(btn.text, "Installing…", "a cold package build must be labelled, not silent")
-
-	## The poll runs every frame — the rewrite must happen once, not forever.
-	btn.text = "sentinel"
-	dock._apply_client_action_phase("claude_code")
-	assert_eq(btn.text, "sentinel", "the label must be rewritten once, not every frame")
-
-	## Cleared state must not resurrect the label under the next action.
-	dock._clear_client_action_phase("claude_code")
-	btn.text = "Configuring…"
-	dock._apply_client_action_phase("claude_code")
-	assert_eq(btn.text, "Configuring…", "a cleared phase must not relabel a new action")
-
-	btn.free()
-	dock.free()
+	_dock.present_client_work_snapshot({"busy_actions": []})
+	assert_false(btn.text.contains("Installing"), "cleared owner state must restore the row")
 
 
-func test_abandoned_worker_blocks_an_overlapping_action_for_that_row() -> void:
-	## The watchdog abandons a worker by erasing the row's `_client_action_threads`
-	## slot — which is also the dispatch guard. So without a per-client orphan
-	## record, a re-click after a timeout starts a SECOND worker while the first
-	## is still running: two uv builds and two writers on the same config file.
-	var dock := McpDockScript.new()
-	McpDockScript._orphaned_client_action_owners.clear()
-
-	assert_false(
-		McpDockScript._has_live_orphan("claude_code"),
-		"a row with no abandoned worker must be dispatchable"
+func test_finished_but_unjoined_worker_still_blocks_an_overlapping_action() -> void:
+	## is_alive() may flip false between frames. The slot itself, not liveness,
+	## remains the authority until _poll_actions joins and inspects the payload.
+	Engine.remove_meta(ClientJobOwnerScript.MUTATION_UNPROVEN_META)
+	var owner := ClientJobOwnerScript.new()
+	owner._accepting_work = true
+	var finished := Thread.new()
+	finished.start(func() -> Dictionary:
+		return {
+			"client_id": "claude_code",
+			"action": "configure",
+			"result": {"status": "error", "termination_failed": true},
+			"prewarm": {},
+		}
 	)
-
-	## A live orphan holds the row.
-	var live := Thread.new()
-	live.start(func() -> int:
-		## Long enough to still be running when the assertion below reads it.
-		OS.delay_msec(400)
-		return 0
-	)
-	McpDockScript._orphaned_client_action_owners["claude_code"] = [live]
-	assert_true(
-		McpDockScript._has_live_orphan("claude_code"),
-		"a still-running abandoned worker must block a new action on its row"
-	)
-	## A different row is unaffected — the guard is per client, not global.
-	assert_false(
-		McpDockScript._has_live_orphan("codex"),
-		"one row's orphan must not block every other client"
-	)
-
-	live.wait_to_finish()
-	assert_false(
-		McpDockScript._has_live_orphan("claude_code"),
-		"a finished orphan must release the row"
-	)
-
-	## The prune must drop the finished orphan so the row is not held forever.
-	dock._release_finished_orphan_owners()
-	assert_false(
-		McpDockScript._orphaned_client_action_owners.has("claude_code"),
-		"prune must clear the finished orphan record"
-	)
-	McpDockScript._orphaned_client_action_owners.clear()
-	dock.free()
+	while finished.is_alive():
+		OS.delay_msec(1)
+	owner._action_threads["claude_code"] = finished
+	owner._action_names["claude_code"] = "configure"
+	var overlapping := owner._start_action("claude_code", "remove", "")
+	assert_false(bool(overlapping.get("ok", true)),
+		"a finished-but-unjoined slot must reject a second mutation")
+	assert_true(owner._action_threads.has("claude_code"))
+	owner._poll_actions()
+	assert_false(owner._action_threads.has("claude_code"),
+		"polling may release the slot after it records the payload")
+	owner.free()
+	Engine.remove_meta(ClientJobOwnerScript.MUTATION_UNPROVEN_META)
 
 
 func test_prewarm_phase_widens_the_client_action_watchdog() -> void:
 	## Regression (#894 CodeRabbit): the action watchdog abandons a worker after
-	## CLIENT_ACTION_TIMEOUT_MSEC (30s), sized for a CLI registry call. The
+	## ACTION_TIMEOUT_MSEC, sized above the complete CLI registry call. The
 	## Configure pre-warm can legitimately run far longer while uv builds the
 	## pinned environment — so a cold build would trip the watchdog, re-enable
 	## the row, discard the worker's completion, and report a false Configure
 	## timeout for exactly the slow cold start the pre-warm exists to absorb.
-	var dock := McpDockScript.new()
+	var owner := ClientJobOwnerScript.new()
 
 	assert_eq(
-		dock._client_action_budget_msec("claude_code"),
-		McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC,
+		owner._action_budget("claude_code"),
+		ClientJobOwnerScript.ACTION_TIMEOUT_MSEC,
 		"a plain config write keeps the short registry budget"
 	)
 
-	dock._set_client_action_phase("claude_code", "prewarm")
-	var warmed := dock._client_action_budget_msec("claude_code")
+	owner._set_action_phase("claude_code", "prewarm")
+	var warmed := owner._action_budget("claude_code")
 	assert_true(
 		warmed >= McpClientConfigurator.PREWARM_TIMEOUT_MS,
 		"the watchdog must outlast the pre-warm's own ceiling, not fire mid-build"
 	)
 	assert_true(
-		warmed > McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC,
+		warmed > ClientJobOwnerScript.ACTION_TIMEOUT_MSEC,
 		"the prewarm phase must widen the budget"
 	)
 
 	## A cleared phase must fall back to the short budget, or one slow Configure
 	## would leave the row's next action effectively unwatched.
-	dock._clear_client_action_phase("claude_code")
+	owner._clear_action_phase("claude_code")
 	assert_eq(
-		dock._client_action_budget_msec("claude_code"),
-		McpDockScript.CLIENT_ACTION_TIMEOUT_MSEC,
+		owner._action_budget("claude_code"),
+		ClientJobOwnerScript.ACTION_TIMEOUT_MSEC,
 		"a cleared phase must restore the short budget"
 	)
-	dock.free()
+	owner.free()
 
 
 func test_configure_phase_is_ignored_for_an_unknown_row() -> void:
 	## A row can be rebuilt (status refresh) while its worker is still in
 	## flight; the poll must not fault on the vanished row.
 	var dock := McpDockScript.new()
-	dock._set_client_action_phase("ghost", "prewarm")
-	dock._apply_client_action_phase("ghost")
-	dock._clear_client_action_phase("ghost")
+	dock.present_client_work_snapshot({
+		"busy_actions": ["ghost"],
+		"action_names": {"ghost": "configure"},
+		"action_phases": {"ghost": "prewarm"},
+	})
 	assert_true(true, "phase handling must tolerate a missing row")
 	dock.free()
 
@@ -2007,19 +1975,22 @@ func _restore_mcp_logging_setting(prev: Dictionary) -> void:
 		es.erase(McpSettings.SETTING_MCP_LOGGING)
 
 
-func test_log_viewer_tick_recovers_from_buffer_clear() -> void:
+func test_log_viewer_snapshot_recovers_from_buffer_clear() -> void:
 	## Regression: McpLogBuffer.clear() resets the monotonic
 	## `total_logged()` counter to 0, flipping the sequence backward. The
 	## viewer must detect that flip and clear its display — without the
-	## shrink branch, tick() would compute `get_recent(seq - _last_log_seq)`
-	## with a negative argument, append nothing, and the display would stay
-	## stuck on pre-clear lines forever (out of sync with the empty buffer).
+	## reset marker, the view would retain the stale pre-clear presentation.
 	var buffer := McpLogBuffer.new()
 	buffer.log("before clear 1")
 	buffer.log("before clear 2")
 	var panel := LogViewerScript.new()
-	panel.setup(buffer)
-	panel.tick()
+	panel.setup()
+	var dock := McpDockScript.new()
+	dock._log_viewer = panel
+	var plugin := GodotAiPlugin.new()
+	plugin._dock = dock
+	plugin._log_buffer = buffer
+	plugin._on_dock_log_snapshot_requested(panel.sequence())
 	## Display contract: at least the two pre-clear lines are visible. Use
 	## get_parsed_text() because RichTextLabel.text reflects BBCode source,
 	## not what add_text() renders.
@@ -2027,33 +1998,37 @@ func test_log_viewer_tick_recovers_from_buffer_clear() -> void:
 		"precondition: pre-clear lines must paint into the display")
 	assert_contains(panel._log_display.get_parsed_text(), "before clear 2")
 	assert_eq(panel._last_log_seq, 2,
-		"precondition: cursor must track total_logged() after tick()")
+		"precondition: cursor must track the root's sequence snapshot")
 
 	## The bug: buffer is cleared while the panel is still showing the
-	## pre-clear lines. Without the shrink-recovery branch, tick() computes
-	## get_recent(-2), appends nothing, and the display stays stale forever.
+	## pre-clear lines. The root marks the backward sequence as a reset so the
+	## copied presentation cannot stay stale.
 	buffer.clear()
-	panel.tick()
+	plugin._on_dock_log_snapshot_requested(panel.sequence())
 	assert_eq(panel._log_display.get_parsed_text(), "",
 		"display must clear when total_logged() drops below _last_log_seq")
 	assert_eq(panel._last_log_seq, 0,
-		"cursor must reset to 0 after a buffer shrink so subsequent ticks paint from a clean slate")
+		"cursor must reset to 0 so subsequent snapshots paint from a clean slate")
 
 	## After the recovery branch, new lines must paint normally — i.e. the
 	## next round of appends through the same panel doesn't lose lines or
 	## duplicate them.
 	buffer.log("after clear 1")
 	buffer.log("after clear 2")
-	panel.tick()
+	plugin._on_dock_log_snapshot_requested(panel.sequence())
 	assert_contains(panel._log_display.get_parsed_text(), "after clear 1")
 	assert_contains(panel._log_display.get_parsed_text(), "after clear 2")
 	assert_false(panel._log_display.get_parsed_text().contains("before clear"),
 		"pre-clear lines must not reappear after the recovery + re-paint")
 	assert_eq(panel._last_log_seq, 2)
+	plugin._dock = null
+	dock._log_viewer = null
+	plugin.free()
+	dock.free()
 	panel.free()
 
 
-func test_log_viewer_tick_keeps_painting_after_buffer_caps_at_max_lines() -> void:
+func test_log_viewer_snapshot_keeps_painting_after_buffer_caps_at_max_lines() -> void:
 	## Regression: McpLogBuffer caps `_lines` at MAX_LINES (500) by slicing.
 	## Once full, subsequent log() calls keep `_lines.size()` constant. The
 	## previous viewer tracked `total_count()` as its cursor — so once the
@@ -2068,8 +2043,13 @@ func test_log_viewer_tick_keeps_painting_after_buffer_caps_at_max_lines() -> voi
 	for i in range(cap):
 		buffer.log("filler %d" % i)
 	var panel := LogViewerScript.new()
-	panel.setup(buffer)
-	panel.tick()
+	panel.setup()
+	var dock := McpDockScript.new()
+	dock._log_viewer = panel
+	var plugin := GodotAiPlugin.new()
+	plugin._dock = dock
+	plugin._log_buffer = buffer
+	plugin._on_dock_log_snapshot_requested(panel.sequence())
 	assert_eq(buffer.total_count(), cap,
 		"precondition: buffer must be at capacity after %d logs" % cap)
 	assert_eq(buffer.total_logged(), cap,
@@ -2081,13 +2061,17 @@ func test_log_viewer_tick_keeps_painting_after_buffer_caps_at_max_lines() -> voi
 	## to cap+1. Before the fix the viewer's `count == _last_log_count` early-
 	## return swallowed this line silently.
 	buffer.log("at-cap canary")
-	panel.tick()
+	plugin._on_dock_log_snapshot_requested(panel.sequence())
 	assert_eq(buffer.total_count(), cap, "buffer size stays pinned at cap")
 	assert_eq(buffer.total_logged(), cap + 1, "monotonic counter advances past cap")
 	assert_contains(panel._log_display.get_parsed_text(), "at-cap canary",
 		"new line after the buffer capped must reach the display")
 	assert_eq(panel._last_log_seq, cap + 1,
 		"viewer cursor must advance with the monotonic counter, not the bounded size")
+	plugin._dock = null
+	dock._log_viewer = null
+	plugin.free()
+	dock.free()
 	panel.free()
 
 
@@ -2121,7 +2105,7 @@ func test_uv_version_display_hides_trailing_build_metadata() -> void:
 
 
 func test_dev_buttons_rendered_in_dev_checkout() -> void:
-	## Dev checkout's Setup section gets the primary "Restart Dev Server"
+	## Dev checkout's Setup section gets the primary managed-server
 	## button + the small "✕" stop affordance side-by-side. In a non-dev
 	## checkout (release install) the branch isn't entered and neither
 	## button appears; we skip rather than fake the env.
@@ -2179,28 +2163,26 @@ func test_setup_section_should_show_truth_table() -> void:
 
 
 func test_server_launch_pending_tracks_state_connection_and_grace() -> void:
-	var plugin := _RestartDispatchPlugin.new()
-	_dock._plugin = plugin
 	_dock._last_connected = false
 	_dock._startup_grace_until_msec = Time.get_ticks_msec() + 10_000
 
-	plugin.status = {"state": McpServerState.SPAWNING}
+	_dock.present_lifecycle_snapshot({"state": McpServerState.SPAWNING})
 	assert_true(_dock._server_launch_pending(),
 		"Spawning inside the grace window is a pending launch")
 
-	plugin.status = {"state": McpServerState.UNINITIALIZED}
+	_dock.present_lifecycle_snapshot({"state": McpServerState.UNINITIALIZED})
 	assert_true(_dock._server_launch_pending(),
 		"Uninitialized inside the grace window is a pending launch")
 
-	plugin.status = {"state": McpServerState.CRASHED}
+	_dock.present_lifecycle_snapshot({"state": McpServerState.CRASHED})
 	assert_false(_dock._server_launch_pending(),
 		"A terminal diagnosis settles the launch even inside grace")
 
-	plugin.status = {"state": McpServerState.NO_COMMAND}
+	_dock.present_lifecycle_snapshot({"state": McpServerState.NO_COMMAND})
 	assert_false(_dock._server_launch_pending(),
 		"NO_COMMAND settles the launch — that's exactly when Install uv helps")
 
-	plugin.status = {"state": McpServerState.SPAWNING}
+	_dock.present_lifecycle_snapshot({"state": McpServerState.SPAWNING})
 	_dock._last_connected = true
 	assert_false(_dock._server_launch_pending(),
 		"A committed connection settles the launch")
@@ -2212,67 +2194,71 @@ func test_server_launch_pending_tracks_state_connection_and_grace() -> void:
 
 	## Reset shared-suite state so later tests see the defaults.
 	_dock._startup_grace_until_msec = 0
-	_dock._plugin = null
-	plugin.free()
+	_dock.present_lifecycle_snapshot({})
 
 
 ## Mirrors `_seed_server_row` / `_cleanup_server_row`: stand up just enough
 ## of the dock for the per-frame button helpers to run without a full
 ## `_build_ui` pass.
-func _seed_dev_buttons(plugin: _RestartDispatchPlugin) -> void:
-	_dock._plugin = plugin
+func _seed_dev_buttons(
+	managed := false, external := false, normal_start_released := true
+) -> void:
+	_dock.present_lifecycle_snapshot({
+		"server_pid": 4242 if managed else -1,
+		"ready_kind": "adopted" if external else ("owned" if managed else ""),
+		"state": McpServerState.READY if (managed or external) else McpServerState.STOPPED,
+		"normal_start_released": normal_start_released,
+	})
 	_dock._dev_primary_btn = Button.new()
 	_dock._dev_stop_btn = Button.new()
 
 
-func _cleanup_dev_buttons(plugin: _RestartDispatchPlugin) -> void:
+func _cleanup_dev_buttons() -> void:
 	_dock._dev_primary_btn.free()
 	_dock._dev_primary_btn = null
 	_dock._dev_stop_btn.free()
 	_dock._dev_stop_btn = null
-	_dock._plugin = null
-	plugin.free()
+	_dock.present_lifecycle_snapshot({})
 
 
 func test_primary_btn_dispatches_to_force_restart_or_start() -> void:
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.has_managed = true
-	_seed_dev_buttons(plugin)
+	var recorder := _IntentRecorder.new()
+	_dock.dev_server_action_requested.connect(recorder.on_dev_server_action)
+	_seed_dev_buttons(true, false)
 
 	_dock._on_dev_primary_pressed()
-	var calls: int = plugin.primary_calls
+	var calls: int = recorder.primary_calls
 
-	_cleanup_dev_buttons(plugin)
+	_cleanup_dev_buttons()
 	assert_eq(calls, 1,
-		"Click must call force_restart_or_start_dev_server exactly once")
+		"Click must request managed start/restart exactly once")
 
 
-func test_stop_btn_dispatches_to_stop_dev_server() -> void:
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.dev_running = true
-	_seed_dev_buttons(plugin)
+func test_stop_btn_dispatches_to_stop_managed_server() -> void:
+	var recorder := _IntentRecorder.new()
+	_dock.dev_server_action_requested.connect(recorder.on_dev_server_action)
+	_seed_dev_buttons(true, false)
 
 	_dock._on_dev_stop_pressed()
-	var calls: int = plugin.stop_calls
+	var calls: int = recorder.stop_calls
 
-	_cleanup_dev_buttons(plugin)
-	assert_eq(calls, 1, "Stop click must call stop_dev_server exactly once")
+	_cleanup_dev_buttons()
+	assert_eq(calls, 1, "Stop click must request managed stop exactly once")
 
 
 func test_primary_btn_label_when_nothing_running() -> void:
 	## Per-frame refresh must reflect the live plugin state. With nothing
 	## running, the primary button is enabled (a click spawns fresh) and
-	## reads "Start Dev Server".
-	var plugin := _RestartDispatchPlugin.new()
-	_seed_dev_buttons(plugin)
+	## reads "Start Managed Server".
+	_seed_dev_buttons()
 
 	_dock._update_dev_section_buttons()
 	var primary_text: String = _dock._dev_primary_btn.text
 	var primary_disabled: bool = _dock._dev_primary_btn.disabled
 	var stop_disabled: bool = _dock._dev_stop_btn.disabled
 
-	_cleanup_dev_buttons(plugin)
-	assert_eq(primary_text, "Start Dev Server")
+	_cleanup_dev_buttons()
+	assert_eq(primary_text, "Start Managed Server")
 	assert_false(primary_disabled,
 		"Primary stays enabled even with nothing running — click spawns fresh")
 	assert_true(stop_disabled,
@@ -2280,44 +2266,57 @@ func test_primary_btn_label_when_nothing_running() -> void:
 
 
 func test_primary_btn_label_when_managed_running() -> void:
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.has_managed = true
-	_seed_dev_buttons(plugin)
+	_seed_dev_buttons(true, false)
 
 	_dock._update_dev_section_buttons()
 	var primary_text: String = _dock._dev_primary_btn.text
+	var primary_disabled: bool = _dock._dev_primary_btn.disabled
 	var stop_disabled: bool = _dock._dev_stop_btn.disabled
 
-	_cleanup_dev_buttons(plugin)
-	assert_eq(primary_text, "Restart Dev Server",
+	_cleanup_dev_buttons()
+	assert_eq(primary_text, "Restart Managed Server",
 		"Managed running means click will kill+respawn — label says Restart")
-	assert_true(stop_disabled,
-		"Stop button intentionally never targets the managed server")
+	assert_false(stop_disabled,
+		"Stop is enabled only because the lifecycle owns an exact process grant")
 
 
-func test_primary_btn_label_when_dev_running() -> void:
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.dev_running = true
-	_seed_dev_buttons(plugin)
+func test_primary_btn_disables_for_external_server() -> void:
+	_seed_dev_buttons(false, true)
 
 	_dock._update_dev_section_buttons()
 	var primary_text: String = _dock._dev_primary_btn.text
+	var primary_disabled: bool = _dock._dev_primary_btn.disabled
 	var stop_disabled: bool = _dock._dev_stop_btn.disabled
 
-	_cleanup_dev_buttons(plugin)
-	assert_eq(primary_text, "Restart Dev Server")
+	_cleanup_dev_buttons()
+	assert_eq(primary_text, "External Server Running")
+	assert_true(primary_disabled,
+		"An adopted external server must remain the launcher's responsibility")
+	assert_true(stop_disabled,
+		"The plugin has no process authority for an external server")
+
+
+func test_pending_migration_disables_dev_start_but_keeps_owned_stop() -> void:
+	_seed_dev_buttons(true, false, false)
+
+	_dock._update_dev_section_buttons()
+	var primary_text: String = _dock._dev_primary_btn.text
+	var primary_disabled: bool = _dock._dev_primary_btn.disabled
+	var stop_disabled: bool = _dock._dev_stop_btn.disabled
+
+	_cleanup_dev_buttons()
+	assert_eq(primary_text, "Server Start Blocked")
+	assert_true(primary_disabled,
+		"Pending post-update M6 must disable every server-start control")
 	assert_false(stop_disabled,
-		"Dev server running means Stop has a target — must be enabled")
+		"The exact owned server can still be stopped while M6 is pending")
 
 
 func test_primary_btn_shows_restarting_state_during_dispatch() -> void:
-	## Without "Restarting…" feedback, the user sees a 5s editor freeze
-	## (from _wait_for_port_free) with no acknowledgement of their click.
-	## The flag is set before dispatch and cleared after the spawn timer.
-	var plugin := _RestartDispatchPlugin.new()
-	plugin.has_managed = true
-	_seed_dev_buttons(plugin)
-	_dock._dev_primary_btn.text = "Restart Dev Server"
+	## The flag is set before dispatch and cleared after the lifecycle has had
+	## a bounded repaint window.
+	_seed_dev_buttons(true, false)
+	_dock._dev_primary_btn.text = "Restart Managed Server"
 
 	_dock._server_restart_in_progress = true
 	_dock._update_dev_section_buttons()
@@ -2330,13 +2329,13 @@ func test_primary_btn_shows_restarting_state_during_dispatch() -> void:
 	var post_text: String = _dock._dev_primary_btn.text
 	var post_disabled: bool = _dock._dev_primary_btn.disabled
 
-	_cleanup_dev_buttons(plugin)
+	_cleanup_dev_buttons()
 	assert_contains(mid_text, "Restarting",
 		"In-flight click must replace label with Restarting…")
 	assert_true(mid_disabled, "In-flight click must disable the primary button")
 	assert_true(stop_disabled_during,
 		"Stop must also disable while a restart is in flight")
-	assert_eq(post_text, "Restart Dev Server",
+	assert_eq(post_text, "Restart Managed Server",
 		"Once the flag clears, primary label reverts")
 	assert_false(post_disabled,
 		"Cleared flag with managed server still up must re-enable the primary")
@@ -2372,13 +2371,10 @@ func test_server_ownership_tag_distinguishes_backend_flavor() -> void:
 
 func test_client_transport_tag_tracks_descriptor_shape() -> void:
 	## #838: the row tag must always agree with what Configure writes, so it
-	## derives from descriptor command_shape — attach for every migrated
-	## client (any config_type), URL for the deliberate holdouts.
+	## derives from descriptor command_shape — attach for every advertised client.
 	assert_eq(McpDockScript._client_transport_tag("cursor"), "attach")
 	assert_eq(McpDockScript._client_transport_tag("claude_code"), "attach", "CLI clients register attach too")
 	assert_eq(McpDockScript._client_transport_tag("hermes"), "attach", "YAML clients included")
 	assert_eq(McpDockScript._client_transport_tag("codex"), "attach",
 		"TOML COMMAND_ARRAY clients tag attach too")
-	assert_eq(McpDockScript._client_transport_tag("cherry_studio"), "URL",
-		"cherry_studio deliberately stays URL-mode (#838 follow-up)")
 	assert_eq(McpDockScript._client_transport_tag("__missing_client__"), "")

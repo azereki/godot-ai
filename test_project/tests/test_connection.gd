@@ -17,7 +17,7 @@ func test_make_session_id_uses_project_directory_name() -> void:
 	var parts := sid.split("@")
 	assert_eq(parts.size(), 2, "SID should be '<slug>@<hex>'")
 	assert_eq(parts[0], "my-game")
-	assert_eq(parts[1].length(), 4, "suffix should be 4 hex chars")
+	assert_eq(parts[1].length(), 16, "suffix should be 16 hex chars")
 	for c in parts[1]:
 		assert_true(
 			(c >= "0" and c <= "9") or (c >= "a" and c <= "f"),
@@ -35,7 +35,7 @@ func test_make_session_id_empty_path_falls_back_to_project() -> void:
 	var sid := McpConnection._make_session_id("")
 	var parts := sid.split("@")
 	assert_eq(parts[0], "project")
-	assert_eq(parts[1].length(), 4)
+	assert_eq(parts[1].length(), 16)
 
 
 func test_make_session_id_only_slashes_falls_back_to_project() -> void:
@@ -52,6 +52,16 @@ func test_make_session_id_randomizes_suffix() -> void:
 	## Avoid a flaky two-sample comparison: collect many IDs and verify
 	## the suffix is not constant across repeated calls for the same path.
 	assert_true(seen.size() > 1, "suffix should vary across repeated calls")
+
+
+func test_duplicate_session_retry_requires_a_proven_server() -> void:
+	assert_true(
+		McpConnection._should_regenerate_session_id(4001, true, false),
+		"a proven duplicate rejection before final ACK must rotate the ID",
+	)
+	assert_false(McpConnection._should_regenerate_session_id(4001, false, false))
+	assert_false(McpConnection._should_regenerate_session_id(4001, true, true))
+	assert_false(McpConnection._should_regenerate_session_id(4002, true, false))
 
 
 # ----- slugify -----
@@ -78,154 +88,149 @@ func test_slugify_empty_returns_empty() -> void:
 	assert_eq(McpConnection._slugify("!!!"), "")
 
 
-# ----- handshake_ack parsing -----
-#
-# The server's handshake_ack reply carries the TRUE running server version so
-# the dock's Setup-section "Server" line can stop lying about the plugin's
-# expected version and instead flag self-update drift. McpConnection parses the
-# ack in `_handle_message` and stashes the version on `server_version`.
+# ----- secure v4 handshake -----
+
+const _TEST_CAPABILITY := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+const _TEST_CLIENT_NONCE := "0101010101010101010101010101010101010101010101010101010101010101"
+const _TEST_SERVER_NONCE := "0202020202020202020202020202020202020202020202020202020202020202"
 
 
-func test_build_handshake_omits_auth_token_when_empty() -> void:
-	## #690: empty token means "we have no secret" (dev server, older
-	## server, external adoption) — the field must be ABSENT, not "", so
-	## the server takes the compat-accept path instead of comparing "".
-	var conn := McpConnection.new()
-	var payload := conn._build_handshake()
-	assert_false(payload.has("auth_token"), "empty token must omit the field entirely")
-	assert_eq(payload.get("type"), "handshake")
-	conn.free()
+func test_auth_hello_is_metadata_free_and_never_sends_capability() -> void:
+	var payload := McpConnection._build_auth_hello(_TEST_CLIENT_NONCE)
+	assert_eq(payload.size(), 3)
+	assert_eq(payload.get("type"), "auth_hello")
+	assert_eq(payload.get("protocol_version"), 2)
+	assert_eq(payload.get("client_nonce"), _TEST_CLIENT_NONCE)
+	assert_false(payload.has("session_id"))
+	assert_false(payload.has("project_path"))
+	assert_false(payload.has("auth_token"))
 
 
-func test_build_handshake_includes_auth_token_when_set() -> void:
-	var conn := McpConnection.new()
-	conn.auth_token = "per-launch-secret"
-	var payload := conn._build_handshake()
-	assert_eq(payload.get("auth_token"), "per-launch-secret")
-	conn.free()
-
-
-# ----- 4003 auth-token-mismatch fallback -----
-#
-# The server's token is fixed per launch, so redialing with the same wrong
-# token can never succeed — the reproduced multi-editor duplicate-spawn left
-# an editor 4003-looping forever. After repeated rejections the connection
-# must fall back to a token-less handshake, which the server accepts by
-# design (#690).
-
-
-func test_auth_mismatch_fallback_drops_token_after_repeated_4003() -> void:
-	var conn := McpConnection.new()
-	conn.auth_token = "stale-token"
-
-	var first := conn._note_post_open_close(McpConnection.CLOSE_CODE_AUTH_TOKEN_MISMATCH)
-	assert_eq(conn.auth_token, "stale-token",
-		"one rejection may be a transient swap race — keep the token")
-	assert_eq(first.get("reason_code"), "auth_token_mismatch")
-	assert_eq(first.get("occurrence"), 1)
-	assert_eq(first.get("recovery_action"), "retry_authenticated")
-
-	var second := conn._note_post_open_close(McpConnection.CLOSE_CODE_AUTH_TOKEN_MISMATCH)
-	assert_eq(conn.auth_token, "",
-		"repeated 4003 must fall back to a token-less handshake")
-	assert_eq(second.get("reason_code"), "auth_token_mismatch")
-	assert_eq(second.get("occurrence"), 2)
-	assert_eq(second.get("recovery_action"), "retry_tokenless")
-
-	var payload := conn._build_handshake()
-	assert_false(payload.has("auth_token"),
-		"fallback handshake must omit the token field entirely")
-	conn.free()
-
-
-func test_auth_mismatch_streak_resets_on_other_close_codes() -> void:
-	var conn := McpConnection.new()
-	conn.auth_token = "per-launch-secret"
-
-	conn._note_post_open_close(McpConnection.CLOSE_CODE_AUTH_TOKEN_MISMATCH)
-	conn._note_post_open_close(1000)
-	conn._note_post_open_close(McpConnection.CLOSE_CODE_AUTH_TOKEN_MISMATCH)
-
-	assert_eq(conn.auth_token, "per-launch-secret",
-		"non-consecutive rejections must not trigger the fallback")
-	conn.free()
-
-
-func test_auth_mismatch_streak_resets_on_handshake_ack() -> void:
-	## Server swap shape: rejected once, then the next server accepted us.
-	## A later unrelated 4003 must start a fresh streak, not inherit the
-	## pre-ack one.
-	var conn := McpConnection.new()
-	conn.auth_token = "per-launch-secret"
-
-	conn._transient_diagnostic = conn._note_post_open_close(
-		McpConnection.CLOSE_CODE_AUTH_TOKEN_MISMATCH
+func test_proof_helpers_match_python_wire_vectors() -> void:
+	assert_eq(
+		McpConnection._server_proof(
+			_TEST_CAPABILITY, _TEST_CLIENT_NONCE, _TEST_SERVER_NONCE, "4.0.0"
+		),
+		"8e329ffea7bb0a5d61f3ad43c948068d4f4707865df1dcb03551831e6b3de125",
 	)
-	conn._handle_message('{"type":"handshake_ack","server_version":"1.0.0"}')
-	conn._note_post_open_close(McpConnection.CLOSE_CODE_AUTH_TOKEN_MISMATCH)
+	assert_eq(
+		McpConnection._client_proof(
+			_TEST_CAPABILITY,
+			_TEST_CLIENT_NONCE,
+			_TEST_SERVER_NONCE,
+			"4.0.0",
+			"game@a3f2",
+			"4.7.0",
+			"/tmp/game",
+			"4.0.0",
+			"ready",
+			123,
+			"dev_venv",
+		),
+		"9e7fa961162b4d197d909f925c98bcb03a7ecc3d0176dceecaf47f7498daeef0",
+	)
 
-	assert_eq(conn.auth_token, "per-launch-secret",
-		"an accepted handshake must reset the mismatch streak")
-	assert_true(conn._transient_diagnostic.is_empty(),
-		"an accepted handshake must clear the healed reconnect reason")
+
+func test_client_proof_binds_every_metadata_field() -> void:
+	var baseline := McpConnection._client_proof(
+		_TEST_CAPABILITY, _TEST_CLIENT_NONCE, _TEST_SERVER_NONCE, "4.0.0",
+		"game@a3f2", "4.7.0", "/tmp/game", "4.0.0", "ready", 123, "dev_venv",
+	)
+	var changed_path := McpConnection._client_proof(
+		_TEST_CAPABILITY, _TEST_CLIENT_NONCE, _TEST_SERVER_NONCE, "4.0.0",
+		"game@a3f2", "4.7.0", "/tmp/other", "4.0.0", "ready", 123, "dev_venv",
+	)
+	assert_ne(baseline, changed_path, "transcript changes must change the proof")
+
+
+func test_capability_and_proof_shapes_are_strict() -> void:
+	assert_true(McpConnection._is_lower_hex_64(_TEST_CAPABILITY))
+	assert_false(McpConnection._is_lower_hex_64(""))
+	assert_false(McpConnection._is_lower_hex_64("A".repeat(64)))
+	assert_false(McpConnection._is_lower_hex_64("g".repeat(64)))
+	assert_true(McpConnection._constant_time_equal("abc", "abc"))
+	assert_false(McpConnection._constant_time_equal("abc", "abd"))
+	assert_false(McpConnection._constant_time_equal("abc", "ab"))
+
+
+func test_authenticated_response_contains_metadata_but_no_raw_capability() -> void:
+	var conn := McpConnection.new()
+	conn.auth_token = _TEST_CAPABILITY
+	conn._session_id = "game@a3f2"
+	conn._client_nonce = _TEST_CLIENT_NONCE
+	conn._server_nonce = _TEST_SERVER_NONCE
+	conn._challenged_server_version = "4.0.0"
+	conn._last_readiness = "ready"
+	var payload := conn._build_auth_response()
+	assert_eq(payload.get("type"), "auth_response")
+	assert_eq(payload.get("protocol_version"), 2)
+	assert_eq(payload.get("session_id"), "game@a3f2")
+	assert_true(McpConnection._is_lower_hex_64(payload.get("client_proof")))
+	assert_false(payload.has("auth_token"), "the capability must never cross the wire")
 	conn.free()
 
 
-func test_handle_message_stores_server_version_from_ack() -> void:
+func test_simple_ack_only_completes_after_verified_challenge_and_response() -> void:
 	var conn := McpConnection.new()
-	assert_eq(conn.server_version, "", "server_version defaults to empty")
-	conn._handle_message('{"type":"handshake_ack","server_version":"1.4.2"}')
-	assert_eq(conn.server_version, "1.4.2")
+	conn._server_verified = true
+	conn._auth_response_sent = true
+	conn._challenged_server_version = "4.0.0"
+	conn._handle_handshake_ack({
+		"type": "handshake_ack",
+		"protocol_version": 2,
+		"server_version": "4.0.0",
+	})
+	assert_true(conn._handshake_complete)
+	assert_eq(conn.server_version, "4.0.0")
 	conn.free()
 
 
-func test_handle_message_ignores_unknown_type() -> void:
-	## The dispatcher branch requires both `request_id` and `command` — any
-	## other typed message (future protocol additions) must no-op rather
-	## than crash, so a newer server can roll additions without requiring
-	## a plugin bump.
+func test_ack_requires_no_final_hmac_but_rejects_extra_fields() -> void:
 	var conn := McpConnection.new()
-	conn._handle_message('{"type":"future_event","payload":{}}')
-	assert_eq(conn.server_version, "", "unknown types must not touch server_version")
+	conn._server_verified = true
+	conn._auth_response_sent = true
+	conn._challenged_server_version = "4.0.0"
+	conn._handle_handshake_ack({
+		"type": "handshake_ack",
+		"protocol_version": 2,
+		"server_version": "4.0.0",
+		"server_proof": "not-part-of-the-v4-ack",
+	})
+	assert_false(conn._handshake_complete)
+	assert_eq(conn.server_version, "")
 	conn.free()
 
 
-func test_handle_message_survives_malformed_ack() -> void:
-	## Forward-compat guard: if a future server sends handshake_ack with no
-	## `server_version` field, McpConnection must default to empty instead of
-	## crashing on missing-key access.
+func test_close_diagnostics_are_actionable_and_never_downgrade() -> void:
 	var conn := McpConnection.new()
-	conn._handle_message('{"type":"handshake_ack"}')
-	assert_eq(conn.server_version, "", "missing field must default to empty, not crash")
+	conn.auth_token = _TEST_CAPABILITY
+	var auth := conn._handshake_close_diagnostic(McpConnection.CLOSE_CODE_AUTH_FAILED)
+	var protocol := conn._handshake_close_diagnostic(McpConnection.CLOSE_CODE_PROTOCOL_MISMATCH)
+	var old_server := conn._handshake_close_diagnostic(1011, false)
+	assert_eq(auth.get("reason_code"), "ws_auth_failed")
+	assert_eq(protocol.get("reason_code"), "ws_protocol_mismatch")
+	assert_eq(old_server.get("reason_code"), "ws_handshake_failed")
+	assert_contains(str(old_server.get("reason")), "update/restart")
+	assert_false(auth.has("recovery_action"))
+	assert_eq(conn.auth_token, _TEST_CAPABILITY, "auth failures must never erase capability")
 	conn.free()
 
 
-func test_disconnect_clears_server_version() -> void:
-	## `server_version` must NOT survive a reconnect. `force_restart_server`
-	## kills the old process and waits for a new one; if the replacement is
-	## an older build without handshake_ack, it never updates the field, so
-	## the dock would keep showing the killed server's version. Reproduced
-	## live during the PR smoke test (amber "99.0.0-smoke-test" label stayed
-	## visible after the Restart successfully swapped in a v1.4.2 server).
-	## Clearing on the STATE_CLOSED transition keeps the dock honest.
+func test_disconnect_clears_all_handshake_state() -> void:
 	var conn := McpConnection.new()
-	conn._handle_message('{"type":"handshake_ack","server_version":"1.2.3"}')
-	assert_eq(conn.server_version, "1.2.3", "precondition: version stored from ack")
-	## Force the STATE_CLOSED branch by flipping `_connected` true and
-	## calling `disconnect_from_server`. The real path runs through
-	## `_process`, but the observable side-effect we care about
-	## (server_version cleared on the true → false flip) is codified
-	## directly so a future refactor of _process can't silently break it.
-	conn._connected = true
-	conn.disconnect_from_server()
-	## `disconnect_from_server` itself flips `_connected` but doesn't clear
-	## server_version — that happens on the next STATE_CLOSED tick. Simulate
-	## that tick directly via the same clearing idiom we use in _process.
-	conn._connected = true  # re-arm so the branch will fire
-	## Inline the STATE_CLOSED → false transition by calling the private
-	## handler the way _process would; assert version cleared afterwards.
+	conn.server_version = "4.0.0"
+	conn._client_nonce = _TEST_CLIENT_NONCE
+	conn._server_nonce = _TEST_SERVER_NONCE
+	conn._server_verified = true
+	conn._auth_response_sent = true
+	conn._handshake_complete = true
 	conn._clear_on_disconnect()
-	assert_eq(conn.server_version, "", "reconnect must not inherit stale version")
+	assert_eq(conn.server_version, "")
+	assert_eq(conn._client_nonce, "")
+	assert_eq(conn._server_nonce, "")
+	assert_false(conn._server_verified)
+	assert_false(conn._auth_response_sent)
+	assert_false(conn._handshake_complete)
 	conn.free()
 
 
@@ -273,6 +278,36 @@ func test_disconnect_clears_queued_commands() -> void:
 	var responses := dispatcher.tick(100.0)
 	assert_eq(executed.size(), 0, "queued command must not run after disconnect")
 	assert_eq(responses.size(), 0, "no responses should be produced for cleared commands")
+	conn.free()
+
+
+func test_transport_revocation_disconnects_and_prevents_queued_dispatch() -> void:
+	var conn := McpConnection.new()
+	var dispatcher := McpDispatcher.new(McpLogBuffer.new())
+	dispatcher.mcp_logging = false
+	var executed: Array = []
+	dispatcher.register("mutate", func(_p):
+		executed.append(true)
+		return {"data": {}})
+	dispatcher.enqueue({"request_id": "req-revoked", "command": "mutate", "params": {}})
+	conn.dispatcher = dispatcher
+	conn.auth_token = _TEST_CAPABILITY
+	conn._connected = true
+	conn._handshake_complete = true
+	conn.set_process(true)
+	var revoked_peer := conn._peer
+
+	conn.revoke_transport("authority lost")
+
+	assert_false(conn._connected, "revocation must synchronously disconnect the live channel")
+	assert_false(conn.is_connected, "revoked transport must not remain routable")
+	assert_false(conn.is_processing(), "revocation must stop socket polling before returning")
+	assert_ne(conn._peer, revoked_peer, "revocation must discard the old socket peer synchronously")
+	assert_eq(conn._peer.get_ready_state(), WebSocketPeer.STATE_CLOSED)
+	assert_true(conn.connect_blocked)
+	assert_eq(conn.auth_token, "")
+	assert_eq(dispatcher.tick(100.0).size(), 0)
+	assert_eq(executed.size(), 0, "a command queued by the revoked peer must never dispatch")
 	conn.free()
 
 
@@ -392,16 +427,6 @@ func test_reconnect_diagnostics_keep_preopen_and_postopen_failures_distinct() ->
 	assert_contains(opened, "code 4003")
 	assert_contains(opened, "reason auth\\nfailed")
 
-	var tokenless := McpConnection._postopen_close_diagnostic(
-		1.0,
-		McpConnection.CLOSE_CODE_AUTH_TOKEN_MISMATCH,
-		"token mismatch",
-		"ws://127.0.0.1:9500",
-		{"occurrence": 2, "recovery_action": "retry_tokenless"},
-	)
-	assert_contains(tokenless, "token-less handshake (rejection 2/2)",
-		"the post-OPEN line must surface the recovery action before the next ack")
-
 
 func test_preopen_failure_clears_stale_postopen_diagnostic() -> void:
 	var conn := McpConnection.new()
@@ -410,12 +435,9 @@ func test_preopen_failure_clears_stale_postopen_diagnostic() -> void:
 	conn._url = "ws://127.0.0.1:9500"
 	conn._reconnect_timer = 5.0
 	conn._preopen_failure_logged_for_peer = false
-	conn._auth_mismatch_closes = 1
 	conn._transient_diagnostic = {
-		"reason_code": "auth_token_mismatch",
+		"reason_code": "ws_auth_failed",
 		"reason": "stale post-OPEN diagnostic",
-		"occurrence": 1,
-		"recovery_action": "retry_authenticated",
 	}
 
 	## A fresh WebSocketPeer starts CLOSED, exercising the pre-OPEN failure
@@ -424,8 +446,6 @@ func test_preopen_failure_clears_stale_postopen_diagnostic() -> void:
 
 	assert_true(conn._transient_diagnostic.is_empty(),
 		"the new pre-OPEN failure must clear the previous peer's diagnosis")
-	assert_eq(conn._auth_mismatch_closes, 1,
-		"clearing presentation state must not reset the separate auth counter")
 	var snapshot := conn.get_transport_status()
 	assert_false(snapshot.has("reason_code"))
 	assert_false(snapshot.has("reason"))
@@ -673,10 +693,14 @@ class _FakeWebSocketPeer extends RefCounted:
 		_packets.append(s.to_utf8_buffer())
 
 
-## A minimal valid message: handshake_ack just stores `server_version` on
-## the connection — no dispatcher needed, no side effects beyond a string
-## assignment we discard.
-const _DRAIN_TEST_MSG := '{"type":"handshake_ack","server_version":"1.0.0"}'
+## A harmless post-auth runtime extension frame; no dispatcher side effects.
+const _DRAIN_TEST_MSG := '{"type":"runtime_notice"}'
+
+
+func _make_drain_test_connection() -> McpConnection:
+	var conn := McpConnection.new()
+	conn._handshake_complete = true
+	return conn
 
 
 func test_drain_caps_at_PACKET_DRAIN_CAP_PER_TICK() -> void:
@@ -684,7 +708,7 @@ func test_drain_caps_at_PACKET_DRAIN_CAP_PER_TICK() -> void:
 	## drain had no upper bound — a flooding peer or fast batch could
 	## blow the documented 4ms _process budget. Now the loop hard-caps
 	## at PACKET_DRAIN_CAP_PER_TICK and spills the rest to the next tick.
-	var conn := McpConnection.new()
+	var conn := _make_drain_test_connection()
 	var peer := _FakeWebSocketPeer.new()
 	for i in range(McpConnection.PACKET_DRAIN_CAP_PER_TICK + 5):
 		peer.queue_message(_DRAIN_TEST_MSG)
@@ -705,7 +729,7 @@ func test_drain_caps_at_PACKET_DRAIN_CAP_PER_TICK() -> void:
 func test_drain_below_cap_does_not_increment_spillover() -> void:
 	## Normal traffic: a handful of packets all drain in one tick, no
 	## spillover, counter stays at zero.
-	var conn := McpConnection.new()
+	var conn := _make_drain_test_connection()
 	var peer := _FakeWebSocketPeer.new()
 	for i in range(5):
 		peer.queue_message(_DRAIN_TEST_MSG)
@@ -723,7 +747,7 @@ func test_drain_at_exactly_cap_does_not_log_or_count_spillover() -> void:
 	## Boundary: exactly cap packets queued, all drain in one tick. The
 	## drain hit the cap but nothing remains on the peer — that's NOT a
 	## flood signal and must not log or bump the counter.
-	var conn := McpConnection.new()
+	var conn := _make_drain_test_connection()
 	var peer := _FakeWebSocketPeer.new()
 	for i in range(McpConnection.PACKET_DRAIN_CAP_PER_TICK):
 		peer.queue_message(_DRAIN_TEST_MSG)
@@ -740,7 +764,7 @@ func test_drain_spillover_accumulates_across_ticks() -> void:
 	## A sustained flood is multiple consecutive ticks each spilling. The
 	## cumulative counter grows tick-over-tick so `logs_read` operators
 	## can see the flood pattern, not just a single line.
-	var conn := McpConnection.new()
+	var conn := _make_drain_test_connection()
 	var peer := _FakeWebSocketPeer.new()
 
 	# Tick 1: cap+10 queued → drain cap, 10 spilled.
@@ -766,7 +790,7 @@ func test_drain_logs_spillover_line_when_cap_hit_and_packets_remain() -> void:
 	## The issue's "Fix shape" calls out observability: flood patterns
 	## must surface in `logs_read`. Pin the log emission so a future
 	## refactor can't silently drop it.
-	var conn := McpConnection.new()
+	var conn := _make_drain_test_connection()
 	conn.log_buffer = McpLogBuffer.new()
 	var peer := _FakeWebSocketPeer.new()
 	for i in range(McpConnection.PACKET_DRAIN_CAP_PER_TICK + 7):
@@ -795,7 +819,7 @@ func test_drain_does_not_log_when_below_cap() -> void:
 	## Counterpart guard: normal traffic must NOT emit the backpressure
 	## line. A noisy false-positive would train operators to ignore the
 	## one signal that actually means flood.
-	var conn := McpConnection.new()
+	var conn := _make_drain_test_connection()
 	conn.log_buffer = McpLogBuffer.new()
 	var peer := _FakeWebSocketPeer.new()
 	for i in range(5):
@@ -823,7 +847,7 @@ func test_drain_does_not_log_at_exact_cap_with_empty_queue() -> void:
 	## Boundary: drained == cap and the peer is empty. The drain *hit*
 	## the cap but nothing remains to spill — this isn't a flood signal
 	## and must not produce a log line.
-	var conn := McpConnection.new()
+	var conn := _make_drain_test_connection()
 	conn.log_buffer = McpLogBuffer.new()
 	var peer := _FakeWebSocketPeer.new()
 	for i in range(McpConnection.PACKET_DRAIN_CAP_PER_TICK):
@@ -847,7 +871,7 @@ func test_drain_does_not_log_at_exact_cap_with_empty_queue() -> void:
 func test_clear_on_disconnect_resets_spillover_counter() -> void:
 	## A new connection starts with a clean spillover history — the
 	## previous connection's flood shouldn't pollute the new baseline.
-	var conn := McpConnection.new()
+	var conn := _make_drain_test_connection()
 	var peer := _FakeWebSocketPeer.new()
 	for i in range(McpConnection.PACKET_DRAIN_CAP_PER_TICK + 3):
 		peer.queue_message(_DRAIN_TEST_MSG)
@@ -864,6 +888,7 @@ func test_clear_on_disconnect_resets_spillover_counter() -> void:
 
 func _make_conn_with_dispatcher() -> Array:
 	var conn := McpConnection.new()
+	conn._handshake_complete = true
 	var dispatcher := McpDispatcher.new(McpLogBuffer.new())
 	dispatcher.mcp_logging = false
 	conn.dispatcher = dispatcher

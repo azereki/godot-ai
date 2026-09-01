@@ -9,38 +9,41 @@ const GAME_HELPER_AUTOLOAD_PATH := "res://addons/godot_ai/runtime/game_helper.gd
 ## `logs_read(source="editor")`.
 const EditorLogger := preload("res://addons/godot_ai/runtime/editor_logger.gd")
 
-## EditorSettings keys used to remember which server process the plugin
-## spawned — survives editor restarts, lets a later editor session adopt
-## and manage a server it didn't spawn itself. See #135.
-const MANAGED_SERVER_PID_SETTING := "godot_ai/managed_server_pid"
-const MANAGED_SERVER_VERSION_SETTING := "godot_ai/managed_server_version"
-const MANAGED_SERVER_WS_PORT_SETTING := "godot_ai/managed_server_ws_port"
-## Per-launch WS handshake auth token (#690), generated at spawn and handed
-## to the server via the GODOT_AI_WS_TOKEN spawn env. Persisted alongside
-## the managed-server record so a reloaded plugin instance adopting the
-## same server keeps authenticating; cleared with the rest of the record.
-const MANAGED_SERVER_WS_TOKEN_SETTING := "godot_ai/managed_server_ws_token"
-## keep_server_on_exit (#800): records whether the managed server was
-## launched with the keep-alive env opt-outs, so a later session adopting
-## the survivor routes its own editor exit through detach too. The live
-## setting can't answer that — it may have changed since the spawn.
-const MANAGED_SERVER_KEEP_ALIVE_SETTING := "godot_ai/managed_server_keep_alive"
-const UPDATE_RELOAD_RUNNER_SCRIPT := preload("res://addons/godot_ai/update_reload_runner.gd")
+const UpdateCoordinator := preload("res://addons/godot_ai/utils/update_coordinator.gd")
+const UPDATE_TRANSACTION_ENV := "GODOT_AI_UPDATE_TRANSACTION"
+const UPDATE_EDITOR_NONCE_ENV := "GODOT_AI_UPDATE_EDITOR_NONCE"
+const UPDATE_ACTOR_HANDOFF_ENV := "GODOT_AI_UPDATE_ACTOR_HANDOFF"
+## Cross-v4 hot-reload contract: the old actor owns all durable records; the
+## swapped GDScript understands only this bounded command/outcome envelope.
+const UPDATE_ACTOR_HANDOFF_SCHEMA := 1
+const UPDATE_ACTOR_PROTOCOL_VERSION := 1
+const UPDATE_ACTOR_COLD_START_TIMEOUT_MS := 120000
+const UPDATE_ACTOR_HANDOFF_TIMEOUT_MS := 45000
+const UPDATE_ACTOR_COMMAND_TIMEOUT_MS := 60000
+const UPDATE_ACTOR_RELEASE_TIMEOUT_MS := 5000
+const UPDATE_ACTOR_ERROR_PREFIX := "update transaction refused: "
+const MAX_UPDATE_ACTOR_ERROR_BYTES := 1024
+const MANUAL_MIGRATION_MARKER_PATH := "res://.godot/godot-ai-v4-migration.json"
+const MANUAL_MIGRATION_MARKER_KIND := "pre_v4_migration"
+const MANUAL_MIGRATION_MARKER_SCHEMA := 1
+const MAX_MANUAL_MIGRATION_MARKER_BYTES := 4096
+const MIN_GODOT_MAJOR := 4
+const MIN_GODOT_MINOR := 7
+const UNSUPPORTED_GODOT_MESSAGE := \
+	"Godot AI v4 requires Godot 4.7 or newer in the 4.x line; plugin remains inactive."
 
-## Server lifecycle + port discovery extracted from this file (#297 PR 5).
-## State enums + version-check seam extracted in PR 6 (#297). Plugin.gd
-## keeps thin shims so the dock and characterization tests see an
-## unchanged public surface; spawn-machinery state now lives in the
-## lifecycle manager.
+## The lifecycle manager owns the serialized server episode and process
+## authority. This root only captures its immutable launch plan and routes
+## copied snapshots/results to the connection and Dock.
 const ServerLifecycleManager := preload("res://addons/godot_ai/utils/server_lifecycle.gd")
 const PortResolver := preload("res://addons/godot_ai/utils/port_resolver.gd")
 const ServerStateScript := preload("res://addons/godot_ai/utils/mcp_server_state.gd")
 
 ## Plugin-class scripts used by this file. The script-local preload aliases
 ## are ordinary dependency shorthand and keep construction sites compact.
-## They are not the self-update safety boundary; #398 was stale Script-object
-## content from a mixed old/new snapshot, fixed by the runner's single-phase
-## write-before-scan model.
+## They are not the self-update safety boundary. Whole-tree namespace swaps
+## happen in an external Python actor while an old, detached coordinator owns
+## only disable/scan/enable; no script mutates the tree that contains itself.
 const Connection := preload("res://addons/godot_ai/connection.gd")
 const Dispatcher := preload("res://addons/godot_ai/dispatcher.gd")
 const Telemetry := preload("res://addons/godot_ai/telemetry.gd")
@@ -53,6 +56,9 @@ const DebuggerPlugin := preload("res://addons/godot_ai/debugger/mcp_debugger_plu
 const VisionRoutingScript := preload("res://addons/godot_ai/vision_routing.gd")
 const ExportPlugin := preload("res://addons/godot_ai/export/mcp_export_plugin.gd")
 const ClientConfigurator := preload("res://addons/godot_ai/client_configurator.gd")
+const CliExec := preload("res://addons/godot_ai/clients/_cli_exec.gd")
+const ClientJobOwner := preload("res://addons/godot_ai/utils/client_job_owner.gd")
+const UpdateManager := preload("res://addons/godot_ai/utils/update_manager.gd")
 const WindowsPortReservation := preload("res://addons/godot_ai/utils/windows_port_reservation.gd")
 const McpToolRegistry := preload("res://addons/godot_ai/custom_tools/mcp_tool_registry.gd")
 const McpServiceLocator := preload("res://addons/godot_ai/custom_tools/mcp_service_locator.gd")
@@ -73,53 +79,6 @@ const McpServiceLocator := preload("res://addons/godot_ai/custom_tools/mcp_servi
 ## hard-error on plugin enable.
 const HANDLERS_DIR := "res://addons/godot_ai/handlers/"
 
-## The Python server writes its own PID here on startup (passed as
-## `--pid-file`) and unlinks on clean exit. Deterministic replacement
-## for scraping `netstat -ano` to find the port owner — especially on
-## Windows where `OS.kill` on the uvx launcher doesn't take the Python
-## child with it, and the scrape was the only path to the real PID.
-## See issue for #154-era Windows update friction.
-## Re-export of PortResolver.SERVER_PID_FILE so the spawn flags, the
-## resolver, and characterization tests share one source of truth.
-const SERVER_PID_FILE := PortResolver.SERVER_PID_FILE
-
-## How long we watch the spawned server for early exit once it has PROVEN it
-## started — i.e. published its pid-file. If the process is still alive when
-## this expires, we stop watching. Mid-session crashes after this point get
-## caught by the WebSocket disconnect flow.
-const SERVER_WATCH_MS := 30 * 1000
-## Watch ceiling for a spawn that has NOT yet published its pid-file (#896).
-##
-## The short window above justifies itself with "mid-session crashes surface
-## via WebSocket disconnect" — which is only true for a server that got far
-## enough to be connected to. A cold `uvx` spawn on a slow link can still be
-## resolving and downloading its ~67-package environment at 30s, having proven
-## nothing; stopping the watch there means a launcher that dies at 45s is never
-## observed, `_diagnose_spawn_fast_exit` never runs (it is only reachable from
-## inside the watch), and the plugin redials forever while the dock shows a
-## bare "Disconnected".
-##
-## Sized to cover that download. Independent of any pre-warm: this window has
-## to hold even when nothing warmed the cache first.
-const SERVER_COLD_START_WATCH_MS := 180 * 1000
-## Python's import graph (FastMCP + Rich + uvicorn) plus the pid-file write
-## take a beat on cold starts, especially on Windows. Hold off on declaring
-## a spawn a crash until this window elapses so the watch loop has time to
-## observe either the pid-file (dev venv) or the port listening (uvx).
-const SPAWN_GRACE_MS := 5 * 1000
-## Windows only (#797). A uv-created venv launches the real server under a
-## different PID than the one `OS.create_process` returns, and that watched PID
-## has been seen dying on a healthy boot while the server was still starting
-## and had not written its pid-file yet. Past SPAWN_GRACE_MS that reads as
-## "server exited" and only the crash-survivor adoption path rescues the
-## session. While no pid-file has appeared we keep watching until this longer
-## window closes, rather than calling a handoff an exit. Sized to cover a cold
-## uvx resolve on top of the launcher hop, and kept well under SERVER_WATCH_MS
-## so a genuinely dead Windows spawn is still diagnosed inside the watch rather
-## than falling off the end of it.
-const SPAWN_HANDOFF_MS := 15 * 1000
-const SERVER_STATUS_PATH := "/godot-ai/status"
-const SERVER_STATUS_PROBE_TIMEOUT_MS := 800
 const STARTUP_TRACE_COUNTER_NAMES := [
 	"powershell",
 	"netstat",
@@ -148,15 +107,9 @@ const STARTUP_TRACE_COUNTER_NAMES := [
 ##       this entry script's load surface explicit and reviewable.
 ##
 ## Constructors, constants, and static methods on `Mcp*` classes are not the
-## self-update safety metric under the single-phase runner. The old syntactic
-## lint counted bare `Mcp*.MEMBER` references, but #398 was caused by the
-## runner scanning a mixed old/new snapshot and reusing stale Script-object
-## content. Bare names and preload aliases can both be parsed against stale
-## content under an old two-phase runner; from the fixed runner onward the
-## full v(N+1) snapshot is written before the scan. In short: preload aliases
-## are not the self-update safety metric.
-##
-## `tests/unit/test_plugin_self_update_safety.py` locks this wording in.
+## self-update safety metric. The transaction actor publishes one exact tree
+## before the resource scan, so the root never observes an extracted-over-live
+## mixture. In short: preload aliases are not the self-update safety metric.
 ##
 var _connection
 var _dispatcher
@@ -172,31 +125,34 @@ var _vision_routing
 var _export_plugin
 var _custom_tool_registry
 var _custom_tool_service_locator
-## Spawn / stop / adopt orchestration plus state machine; allocated in
-## `_init` so test fixtures (which never enter the tree) can drive
-## `_start_server`. Owns `_server_pid`, `_server_state`, the version-
-## check seam, and the adoption-confirmation deadline — see
-## `utils/server_lifecycle.gd`.
+## Plugin-lifetime owners. The Dock only emits intents and receives copied
+## snapshots/outcomes, so replacing the view cannot abandon a live Thread or
+## an update transaction.
+var _client_jobs
+var _update_manager
+## Process identity continuity and the immutable terminal outcome cross only
+## as values. The coordinator retains neither this plugin nor its objects.
+static var _update_editor_nonce := ""
+var _post_update_outcome: Dictionary = {}
+var _post_update_actor_command = []
+var _post_update_actor_version := ""
+var _post_update_action := ""
+var _manual_migration_record: Dictionary = {}
+var _normal_start_released := false
+var _update_barrier_blocked := false
+## One actor worker is sufficient: startup finishes before composition can
+## reach migration completion, so two thread owners would encode impossible
+## concurrency and double the teardown surface.
+var _update_actor_thread
+var _update_actor_job := ""
+var _update_startup_cancel_mutex := Mutex.new()
+var _update_startup_cancelled := false
+var _update_actor_termination_unproven := false
+## Serialized lifecycle episode owner. Construction is inert; `_enter_tree`
+## supplies a copied plan and starts it only after composition completes.
 var _lifecycle
-static var _server_started_this_session := false  # guard against re-entrant spawns
 static var _resolved_ws_port := ClientConfigurator.DEFAULT_WS_PORT
-## True once a startup walk has published a port via `_set_resolved_ws_port`
-## this editor session. Gates the `_enter_tree` pre-resolution seed: a fresh
-## session seeds `_resolved_ws_port` from the configured EditorSettings
-## value, but a plugin reload must keep the prior instance's published
-## resolution, which can legitimately differ from the configured value
-## (Windows-reservation remap, adopted-server record).
-static var _ws_port_resolution_published := false
-## Per-launch WS handshake auth token (#690). Static for the same reason as
-## _resolved_ws_port: a plugin reload in the same editor session adopts the
-## server the previous instance spawned, and must keep its token. Empty
-## when this editor never spawned a token-carrying server (dev servers,
-## fresh installs) — the handshake then omits the field.
-static var _ws_auth_token := ""
-
-## Server-watch timer lives on the plugin because it's a Node — the
-## manager is RefCounted and can't host children.
-var _server_watch_timer: Timer = null
+var _endpoint_policy: Dictionary = {}
 var _headless_disabled := false
 var _startup_trace_enabled := false
 var _startup_trace_start_ms := 0
@@ -206,24 +162,65 @@ var _startup_trace_counters: Dictionary = {}
 ## counters they bump are shared with the main thread, so serialize.
 var _startup_trace_mutex := Mutex.new()
 var _startup_trace_netsh_start_count := 0
+var _unsupported_engine := false
+var _loaded_plugin_version := ""
 
 
 func _init() -> void:
-	_lifecycle = ServerLifecycleManager.new(self)
+	_unsupported_engine = not _supports_godot_version(Engine.get_version_info())
+	if _unsupported_engine:
+		return
+	_lifecycle = ServerLifecycleManager.new()
 
 
 func _enter_tree() -> void:
+	if _unsupported_engine:
+		push_error(UNSUPPORTED_GODOT_MESSAGE)
+		return
 	_startup_trace_begin()
+	## Startup actor discovery runs off-main, where env_lookup intentionally
+	## refuses live getenv access. Publish only its fixed HOME/PATH-adjacent
+	## inputs now; full descriptor/settings warming still belongs at activation.
+	ClientConfigurator.warm_update_actor_discovery_env()
 
-	## `_process` is only used by the adoption-confirmation watcher; keep
-	## it off until `_watch_for_adoption_confirmation` arms it, so the
-	## plugin has zero per-frame cost in the common case.
+	## Keep main-thread result polling off until the vision worker owner exists.
+	## Unsupported/headless/barrier-blocked startup therefore has no process
+	## callback and constructs no worker-capable object.
 	set_process(false)
 
-	## #740: register the export plugin BEFORE the headless guard so
-	## `godot --headless --export-*` runs strip the game-helper autoload
-	## from exported packs too — CI export pipelines are headless. The
-	## export plugin is inert outside exports: no server, no sockets.
+	## No plugin-owned object, server, or worker is constructed until the
+	## external transaction record says this exact tree may start. This also
+	## leases headless export/import processes: they execute plugin code and may
+	## not straddle a same-install tree swap merely because no server will start.
+	_loaded_plugin_version = get_plugin_version()
+	## Dev checkouts never offer self-update and commonly mount the add-on by a
+	## symlink the transaction actor deliberately rejects. Installed trees must
+	## acquire the lease even when this headless launch will return below.
+	if not ClientConfigurator.is_dev_checkout():
+		_ensure_update_editor_nonce()
+		## Export/import processes have no interactive main thread to protect and
+		## must register the export filter before continuing, so they run the same
+		## bounded command synchronously. An interactive editor returns from
+		## _enter_tree immediately and waits on a worker: a cold/offline uvx resolve
+		## can delay plugin composition, but can never freeze Godot's UI forever.
+		if _mcp_disabled_for_headless_launch():
+			if not _run_update_startup_barrier():
+				_block_update_startup()
+				return
+		elif not _start_update_startup_barrier():
+			_block_update_startup()
+			return
+		else:
+			return
+
+	_continue_enter_tree_after_update_barrier()
+
+
+func _continue_enter_tree_after_update_barrier() -> void:
+
+	## Register only after the update barrier, but before the headless guard:
+	## `godot --headless --export-*` still needs to strip the game-helper
+	## autoload from exported packs. The export plugin is otherwise inert.
 	_export_plugin = ExportPlugin.new()
 	add_export_plugin(_export_plugin)
 
@@ -232,59 +229,46 @@ func _enter_tree() -> void:
 		print("MCP | plugin disabled in headless mode")
 		return
 
-	## Self-update extracts over the live addon and doesn't prune files that
-	## disappeared from the new ZIP. Remove obsolete Logger-loader quarantine
-	## files/folders once so upgraders match a fresh install.
-	_cleanup_legacy_logger_scripts()
-
 	## Register port overrides before spawn so `http_port()` / `ws_port()`
 	## return the user's configured values (if any) when `_start_server`
 	## builds the CLI args.
 	ClientConfigurator.ensure_settings_registered()
 	_startup_trace_phase("settings_registered")
 
-	## With the startup walk's blocking port resolution deferred to a worker
-	## (#678), the Connection below dials before `_set_resolved_ws_port`
-	## publishes. Seed the pre-resolution port from the configured
-	## EditorSettings value (a cheap main-thread read, not a blocking probe)
-	## so the first dial honors a `godot_ai/ws_port` override — without this
-	## it targeted the compile-time default and the override only took
-	## effect on the 1s retry.
-	_resolved_ws_port = _startup_ws_port_seed(
-		_ws_port_resolution_published,
-		_resolved_ws_port,
-		ClientConfigurator.ws_port(),
-	)
-
-	## #691: pre-warm the env snapshot on the main thread before any worker
-	## exists, so worker-thread env reads (dock refresh/action workers, the
-	## #678 startup walk's discovery worker) serve from the snapshot and can
-	## never race the spawn window's setenv/unsetenv around
-	## OS.create_process.
-	ClientConfigurator.warm_env_snapshot()
-
 	_log_buffer = LogBuffer.new()
 	## Apply the persisted dock "Log" toggle before anything logs through the
 	## buffer. Without this the choice only took effect after a manual toggle
 	## and reset to noisy on every editor restart (#626).
 	_log_buffer.enabled = McpSettings.mcp_logging_enabled()
-	## #678: in the real editor, run the startup path's blocking probes and
-	## kill-drain waits off the main thread so a contended port can't freeze
-	## plugin init/reload. Set here (not _init) so test fixtures — which
-	## extend this plugin but never enter the tree — keep the synchronous
-	## default and can call-then-assert.
-	_lifecycle.defer_blocking_work = true
-	## A completed self-update means the user's Update click already
-	## authorized replacing the previous-version backend. Armed BEFORE the
-	## startup walk (a peek, not a drain — `_flush_pending_self_update_telemetry`
-	## below still owns the read-and-clear) so the walk can weak-proof-kill
-	## the stale server an attach bridge kept alive, and bounded retries
-	## absorb the bridge-respawn port race, instead of latching INCOMPATIBLE
-	## and waiting for a manual recovery click.
-	if _pending_self_update_succeeded():
-		_lifecycle.authorize_stale_recovery()
-	_start_server()
-	_startup_trace_phase("server_start")
+
+	## Capture desired endpoint settings without probing the OS. WS reservation
+	## is an activation effect on Windows (`netsh`), so it runs only after every
+	## owner and the Dock have been constructed and wired below.
+	_endpoint_policy = ClientConfigurator.capture_endpoint_policy()
+	_resolved_ws_port = int(_endpoint_policy.ws_port)
+
+	## Construct plugin-lifetime work owners before attaching the replaceable
+	## Dock. Constructors are inert; activate() is the single normal-start seam
+	## that Phase 6's durable activation barrier will guard.
+	_client_jobs = ClientJobOwner.new()
+	_client_jobs.snapshot_changed.connect(_on_client_work_snapshot_changed)
+	_client_jobs.status_refresh_completed.connect(_on_client_status_refresh_completed)
+	_client_jobs.mcp_status_completed.connect(_on_mcp_client_status_completed)
+	_client_jobs.mcp_action_completed.connect(_on_mcp_client_action_completed)
+	_client_jobs.post_update_repin_completed.connect(_on_post_update_repin_completed)
+	_client_jobs.action_completed.connect(_on_client_action_completed)
+	_client_jobs.action_timed_out.connect(_on_client_action_timed_out)
+	add_child(_client_jobs)
+	_update_manager = UpdateManager.new()
+	_update_manager.update_check_completed.connect(_on_update_check_completed)
+	_update_manager.install_state_changed.connect(_on_update_install_state_changed)
+	_update_manager.activation_requested.connect(_on_update_activation_requested)
+	add_child(_update_manager)
+
+	_lifecycle.snapshot_changed.connect(_on_lifecycle_snapshot_changed)
+	_lifecycle.transport_ready.connect(_on_lifecycle_transport_ready)
+	_lifecycle.transport_cleared.connect(_on_lifecycle_transport_cleared)
+	_lifecycle.startup_finished.connect(_startup_trace_finish)
 
 	_game_log_buffer = GameLogBuffer.new()
 	_editor_log_buffer = EditorLogBuffer.new()
@@ -298,23 +282,12 @@ func _enter_tree() -> void:
 	_connection.log_buffer = _log_buffer
 	_connection.surfaced_error_tracker = _surfaced_error_tracker
 	_connection.ws_port = _resolved_ws_port
-	## Restore the token before the first connect: after an editor restart
-	## the static is empty but the managed-server record still names the
-	## token the running server was spawned with (#690). A fresh spawn later
-	## overwrites both via _set_ws_auth_token.
-	if _ws_auth_token.is_empty():
-		_ws_auth_token = str(_read_managed_server_record().get("ws_token", ""))
-	_connection.auth_token = _ws_auth_token
+	_connection.auth_token = ""
 	## Pause-depth restore boundary (#712): the dispatcher rebalances any
 	## pause_processing level a crashed handler leaked.
 	_dispatcher.pause_target = _connection
 	_connection.connect_blocked = _lifecycle.is_connection_blocked()
 	_connection.connect_block_reason = _lifecycle.get_status_dict().get("message", "")
-	if (
-		not _lifecycle.is_connection_blocked()
-		and not ServerStateScript.is_terminal_diagnosis(_lifecycle.get_state())
-	):
-		_arm_server_version_check()
 	## Replay the custom-tool catalog on (re)connect so tools registered
 	## before the initial connection or during a disconnect window reach
 	## the server — send_event silently drops while _connected is false.
@@ -325,6 +298,7 @@ func _enter_tree() -> void:
 	_debugger_plugin = DebuggerPlugin.new(_log_buffer, _game_log_buffer, _editor_log_buffer, _surfaced_error_tracker)
 	_vision_routing = VisionRoutingScript.new()
 	_vision_routing.log_buffer = _log_buffer
+	set_process(true)
 	_debugger_plugin.vision_routing = _vision_routing
 	add_debugger_plugin(_debugger_plugin)
 	_connection.debugger_plugin = _debugger_plugin
@@ -346,7 +320,7 @@ func _enter_tree() -> void:
 	_dispatcher.register_lazy_handler(
 		"client",
 		HANDLERS_DIR + "client_handler.gd",
-		[_connection, ClientConfigurator.capture_launch_context()],
+		[_client_jobs],
 	)
 	_dispatcher.register_lazy_handler("script", HANDLERS_DIR + "script_handler.gd", [undo, _connection])
 	_dispatcher.register_lazy_handler("resource", HANDLERS_DIR + "resource_handler.gd", [undo, _connection])
@@ -535,85 +509,957 @@ func _enter_tree() -> void:
 	_dock = Dock.new()
 	_dock.vision_routing = _vision_routing
 	_dock.name = "Godot AI"
-	_dock.setup(_connection, _log_buffer, self)
+	_dock.update_requested.connect(_on_dock_update_requested)
+	_dock.client_action_requested.connect(_on_dock_client_action_requested)
+	_dock.client_status_refresh_requested.connect(_on_dock_client_status_refresh_requested)
+	_dock.status_snapshot_requested.connect(_on_dock_status_snapshot_requested)
+	_dock.live_server_probe_requested.connect(_on_dock_live_server_probe_requested)
+	_dock.lifecycle_action_requested.connect(_on_dock_lifecycle_action_requested)
+	_dock.dev_server_action_requested.connect(_on_dock_dev_server_action_requested)
+	_dock.mcp_logging_changed.connect(_on_dock_mcp_logging_changed)
+	_dock.log_snapshot_requested.connect(_on_dock_log_snapshot_requested)
+	_dock.plugin_reload_requested.connect(_on_dock_plugin_reload_requested)
+	_dock.settings_apply_requested.connect(_on_dock_settings_apply_requested)
+	_dock.post_update_action_requested.connect(_on_dock_post_update_action_requested)
+	_client_jobs.set_client_health_blocked(_client_health_is_blocked())
+	_publish_dock_status_snapshots()
 	add_control_to_dock(DOCK_SLOT_RIGHT_BL, _dock)
+	_dock.present_client_work_snapshot(_client_jobs.snapshot())
 	_startup_trace_phase("dock_attached")
+	## Activation barrier: no process, socket, or probe effect begins until all
+	## owners and the replaceable Dock have been constructed and wired.
+	var resolved_policy := _endpoint_policy.duplicate(true)
+	resolved_policy["ws_port"] = _resolve_ws_port(int(resolved_policy.ws_port))
+	_set_endpoint_policy(resolved_policy)
+	## #691: publish every environment/setting value before the first worker.
+	ClientConfigurator.warm_env_snapshot(_endpoint_policy)
+	_lifecycle.configure(_capture_lifecycle_plan())
+	_begin_startup_release()
 
+
+func _client_health_is_blocked() -> bool:
+	return ServerStateScript.blocks_client_health(
+		int(_lifecycle.get_status_dict().get("state", ServerStateScript.UNINITIALIZED))
+	)
+
+
+func _on_dock_client_action_requested(client_id: String, action: String) -> void:
+	if _client_jobs == null:
+		return
+	if not _client_jobs.request_action(client_id, action) and _dock != null:
+		_dock.present_client_work_snapshot(_client_jobs.snapshot())
+
+
+func _on_dock_client_status_refresh_requested(client_ids: Array[String], force: bool) -> void:
+	if _client_jobs == null:
+		return
+	_client_jobs.set_client_health_blocked(_client_health_is_blocked())
+	_client_jobs.request_status_refresh(client_ids, force)
+
+
+func _on_client_work_snapshot_changed(snapshot: Dictionary) -> void:
+	if _dock != null:
+		_dock.present_client_work_snapshot(snapshot)
+
+
+func _on_client_status_refresh_completed(results: Dictionary) -> void:
+	if _dock != null:
+		_dock.present_client_status_refresh_results(results)
+
+
+func _on_mcp_client_status_completed(
+	request_ids: Array[String], payload: Dictionary
+) -> void:
+	if _connection == null:
+		return
+	for request_id in request_ids:
+		_connection.send_deferred_response(request_id, payload)
+
+
+func _on_mcp_client_action_completed(request_id: String, payload: Dictionary) -> void:
+	if _connection != null:
+		_connection.send_deferred_response(request_id, payload)
+
+
+func _on_client_action_completed(
+	client_id: String, action: String, result: Dictionary, prewarm: Dictionary
+) -> void:
+	if _dock != null:
+		_dock.present_client_action_result(client_id, action, result, prewarm)
+
+
+func _on_client_action_timed_out(client_id: String, action: String, detail: String) -> void:
+	if _dock != null:
+		_dock.present_client_action_timeout(client_id, action, detail)
+
+
+func _transport_snapshot_for_dock() -> Dictionary:
+	if _connection == null:
+		return {"connected": false, "server_version": "", "status": {}}
+	return {
+		"connected": _connection.is_connected,
+		"server_version": _connection.server_version,
+		"status": _connection.get_transport_status(),
+	}
+
+
+func _lifecycle_snapshot_for_dock() -> Dictionary:
+	if _lifecycle == null:
+		return {
+			"state": ServerStateScript.UNINITIALIZED,
+			"server_pid": -1,
+			"resolved_ws_port": _resolved_ws_port,
+			"can_restart_managed": false,
+			"can_recover_incompatible": false,
+			"normal_start_released": _normal_start_released,
+		}
+	var snapshot: Dictionary = _lifecycle.get_status_dict().duplicate(true)
+	snapshot["server_pid"] = _lifecycle.get_server_pid()
+	snapshot["resolved_ws_port"] = _resolved_ws_port
+	snapshot["can_restart_managed"] = (
+		_normal_start_released and _lifecycle.can_restart_managed_server()
+	)
+	snapshot["can_recover_incompatible"] = (
+		_normal_start_released and bool(snapshot.get("can_recover_incompatible", false))
+	)
+	snapshot["normal_start_released"] = _normal_start_released
+	return snapshot
+
+
+func _publish_dock_status_snapshots() -> void:
+	if _dock == null:
+		return
+	_dock.present_transport_snapshot(_transport_snapshot_for_dock())
+	_dock.present_lifecycle_snapshot(_lifecycle_snapshot_for_dock())
+
+
+func _on_dock_status_snapshot_requested() -> void:
+	_publish_dock_status_snapshots()
+
+
+func _on_dock_live_server_probe_requested(port: int) -> void:
+	if _dock != null:
+		_dock.present_live_server_probe_result(
+			ServerLifecycleManager.probe_live_server_status(port)
+		)
+
+
+func _on_dock_lifecycle_action_requested(action: int) -> void:
+	if not _normal_start_released:
+		if _dock != null:
+			_dock.present_lifecycle_action_result(false)
+		_publish_dock_status_snapshots()
+		return
+	var accepted := false
+	match action:
+		Dock.LifecycleAction.RECOVER_INCOMPATIBLE:
+			accepted = bool(await recover_incompatible_server())
+		Dock.LifecycleAction.RESTART_SERVER:
+			accepted = force_restart_server()
+	if _dock != null:
+		_dock.present_lifecycle_action_result(accepted)
+	_publish_dock_status_snapshots()
+
+
+func _on_dock_dev_server_action_requested(action: int) -> void:
+	if action != Dock.DevServerAction.STOP and not _normal_start_released:
+		_publish_dock_status_snapshots()
+		return
+	match action:
+		Dock.DevServerAction.START_OR_RESTART:
+			if _telemetry != null:
+				_telemetry.record_dev_server_toggle("start")
+			restart_or_start_managed_server()
+		Dock.DevServerAction.STOP:
+			if _telemetry != null:
+				_telemetry.record_dev_server_toggle("stop")
+			stop_managed_server()
+	_publish_dock_status_snapshots()
+
+
+func _on_dock_mcp_logging_changed(enabled: bool) -> void:
+	if _dispatcher != null:
+		_dispatcher.mcp_logging = enabled
+	if _log_buffer != null:
+		_log_buffer.enabled = enabled
+
+
+func _on_dock_log_snapshot_requested(after_sequence: int) -> void:
+	if _dock == null or _log_buffer == null:
+		return
+	var sequence: int = _log_buffer.total_logged()
+	var reset: bool = sequence < after_sequence
+	var count: int = sequence if reset else maxi(0, sequence - after_sequence)
+	_dock.present_log_snapshot({
+		"sequence": sequence,
+		"reset": reset,
+		"lines": _log_buffer.get_recent(count),
+	})
+
+
+func _on_dock_plugin_reload_requested(reason: String) -> void:
+	Telemetry.record_pending_plugin_reload(reason)
+	_reload_plugin_from_dock.call_deferred()
+
+
+func _on_dock_settings_apply_requested(changes: Dictionary, reload: bool) -> void:
+	var applied := ClientConfigurator.apply_endpoint_settings(changes.duplicate(true))
+	if not bool(applied.get("ok", false)):
+		push_error("MCP | refused settings change: %s" % str(applied.get("error", "invalid settings")))
+		return
+	if reload:
+		_on_dock_plugin_reload_requested("endpoint_settings")
+
+
+func _reload_plugin_from_dock() -> void:
+	EditorInterface.set_plugin_enabled("res://addons/godot_ai/plugin.cfg", false)
+	EditorInterface.set_plugin_enabled("res://addons/godot_ai/plugin.cfg", true)
+
+
+func _on_dock_update_requested() -> void:
+	if _update_manager != null and _update_manager.has_install_candidate():
+		_update_manager.start_install(_preflight_update())
+
+
+func _on_update_check_completed(result: Dictionary) -> void:
+	if _dock != null:
+		_dock.present_update_check(result)
+
+
+func _on_update_install_state_changed(state: Dictionary) -> void:
+	if not bool(state.get("install_in_flight", true)) and _client_jobs != null:
+		_client_jobs.resume_after_quiesce()
+	if _dock != null:
+		_dock.present_update_state(state)
+
+
+func _on_update_activation_requested(package: Dictionary) -> void:
+	install_downloaded_update(package)
+
+
+## Hold successful activation behind the client-migration barrier. Rollback
+## resumes normally after recording its terminal outcome.
+func _begin_startup_release() -> void:
+	if _post_update_outcome.is_empty():
+		var manual := _read_manual_migration_marker()
+		match str(manual.get("status", "invalid")):
+			"pending":
+				_manual_migration_record = (manual.get("record", {}) as Dictionary).duplicate(true)
+				_post_update_outcome = {
+					"outcome": "success",
+					"from_version": str(_manual_migration_record.from_version),
+					"to_version": str(_manual_migration_record.to_version),
+					"manual_migration": true,
+				}
+			"none":
+				pass
+			_:
+				_present_post_update_barrier_failure(
+					"The manual v4 migration marker is invalid. Re-run the signed clean installer."
+				)
+				return
+	if str(_post_update_outcome.get("outcome", "")) != "success":
+		_fan_post_update_outcome()
+		_release_normal_startup()
+		return
+	var started: Dictionary = _client_jobs.begin_post_update_repin(
+		str(_post_update_outcome.get("from_version", "")),
+		str(_post_update_outcome.get("to_version", "")),
+		bool(_post_update_outcome.get("manual_migration", false)),
+	)
+	if not bool(started.get("ok", false)):
+		_present_post_update_barrier_failure(str(started.get("error", "Client migration could not start.")))
+		return
+	_post_update_action = ""
+	if _dock != null:
+		_dock.present_update_state({
+			"install_in_flight": true,
+			"button_text": "Migrating client configuration…",
+			"button_disabled": true,
+			"label_text": "The server remains stopped until configured clients are repinned.",
+			"banner_visible": true,
+			"post_update_action": "",
+		})
+
+
+func _on_post_update_repin_completed(result: Dictionary) -> void:
+	if str(_post_update_outcome.get("outcome", "")) != "success":
+		return
+	if not bool(result.get("ok", false)):
+		_present_post_update_barrier_failure(str(result.get("error", "Client migration failed.")))
+		return
+	## A click cannot prove that an external client restarted. The enforceable
+	## boundary is the one we own: repin its configuration, durably acknowledge
+	## the exact activated tree, then start and authenticate that server. Clients
+	## reconnect to the stable endpoint; a stale client can still be restarted as
+	## remediation, but it must not hold a healthy installation behind ceremony.
+	_complete_post_update_startup()
+
+
+func _present_post_update_barrier_failure(error: String) -> void:
+	_post_update_action = "retry"
+	push_error("MCP | post-update client migration blocked startup: %s" % error)
+	if _dock != null:
+		_dock.present_update_state({
+			"install_in_flight": false,
+			"button_text": "Retry client migration",
+			"button_disabled": false,
+			"label_text": "Server startup is blocked: %s" % error,
+			"banner_visible": true,
+			"post_update_action": "retry",
+		})
+
+
+func _on_dock_post_update_action_requested(action: String) -> void:
+	if action != _post_update_action:
+		return
+	if action == "retry":
+		_begin_startup_release()
+
+
+func _present_post_update_complete() -> void:
+	_post_update_action = ""
+	if _dock != null:
+		_dock.present_update_state({
+			"install_in_flight": false,
+			"button_text": "Update complete",
+			"button_disabled": true,
+			"label_text": "",
+			"banner_visible": false,
+			"post_update_action": "",
+			"outcome": "success",
+		})
+
+
+func _complete_post_update_startup() -> void:
+	if bool(_post_update_outcome.get("manual_migration", false)):
+		if not _remove_manual_migration_marker():
+			_present_post_update_barrier_failure(
+				"The manual migration marker could not be removed; server startup remains blocked."
+			)
+			return
+		print("MCP | client migration completed")
+	else:
+		if not _start_post_update_completion():
+			_present_post_update_barrier_failure(
+				"The transaction actor could not durably complete client migration."
+			)
+		return
+	_present_post_update_complete()
+	_fan_post_update_outcome()
+	_release_normal_startup()
+
+
+func _start_post_update_completion() -> bool:
+	if _update_actor_thread != null:
+		return false
+	var command: Array[String] = []
+	command.assign(_post_update_actor_command)
+	var recovery_root := str(_post_update_outcome.get("recovery_root", ""))
+	var transaction := str(_post_update_outcome.get("transaction", ""))
+	if command.is_empty() or recovery_root.is_empty() or transaction.is_empty():
+		return false
+	var arguments: Array[String] = ["complete-migration"]
+	arguments.append_array(_transaction_identity_arguments())
+	arguments.append_array([
+		"--recovery-root", recovery_root,
+		"--transaction", transaction,
+	])
+	_set_update_startup_cancelled(false)
+	_update_actor_thread = Thread.new()
+	_update_actor_job = "migration_completion"
+	var error := int(_update_actor_thread.start(
+		Callable(self, "_run_post_update_completion_job").bind({
+			"arguments": arguments,
+			"command": command,
+			"expected_actor_version": _post_update_actor_version,
+			"transaction": transaction,
+		}, Callable(self, "_update_startup_cancel_requested"))
+	))
+	if error != OK:
+		_update_actor_thread = null
+		_update_actor_job = ""
+		return false
+	if _dock != null:
+		_dock.present_update_state({
+			"install_in_flight": true,
+			"button_text": "Recording completed migration…",
+			"button_disabled": true,
+			"label_text": "The server remains stopped until migration completion is durable.",
+			"banner_visible": true,
+			"post_update_action": "",
+		})
+	set_process(true)
+	return true
+
+
+static func _run_post_update_completion_job(
+	job: Dictionary,
+	cancel_check: Callable,
+) -> Dictionary:
+	var command: Array[String] = []
+	command.assign(job.get("command", []))
+	var arguments: Array[String] = []
+	arguments.assign(job.get("arguments", []))
+	var checked := _execute_update_command_value(
+		command,
+		arguments,
+		str(job.get("expected_actor_version", "")),
+		UPDATE_ACTOR_COMMAND_TIMEOUT_MS,
+		cancel_check,
+	)
+	if not bool(checked.get("ok", false)):
+		return checked
+	if not _migration_completion_matches(
+		checked.get("data", {}), str(job.get("transaction", ""))
+	):
+		return {"ok": false, "error": "transaction actor returned an invalid migration completion"}
+	return {"ok": true}
+
+
+static func _migration_completion_matches(data: Variant, transaction: String) -> bool:
+	return (
+		data is Dictionary
+		and not transaction.is_empty()
+		and str(data.get("status", "")) == "migration_complete"
+		and str(data.get("transaction", "")) == transaction
+	)
+
+
+## Sole release point for ordinary work and the server lifecycle. Keeping
+## these effects together makes the post-update legal ordering reviewable.
+func _release_normal_startup() -> void:
+	if _normal_start_released:
+		return
+	_normal_start_released = true
+	_client_jobs.set_client_health_blocked(_client_health_is_blocked())
+	_client_jobs.activate()
+	_update_manager.check_for_updates.call_deferred()
+	_start_server()
+	_startup_trace_phase("server_start")
 	_log_buffer.log("plugin loaded")
 	if _telemetry != null:
 		_telemetry.record_dock_startup()
-		_flush_pending_self_update_telemetry()
 		_telemetry.flush_pending_plugin_reload()
-	## The startup-trace 'done' line is stamped by _start_server after the
-	## (possibly suspended) walk completes — not here (#682 review).
 
 
-## Public wrapper around the dev-server-toggle telemetry emit. Lets the
-## dock (or any other caller) record without reaching into ``_telemetry``
-## directly — keeps the plugin's internal field encapsulated. The dev
-## server is a Python subprocess unrelated to the plugin's own
-## lifecycle, so emission can be synchronous (no EditorSettings persist
-## dance like ``plugin_reload`` / ``self_update``).
-func record_dev_server_toggle(action: String) -> void:
-	if _telemetry == null:
+## Fan one immutable terminal transaction value. It is held only in this
+## instance's memory, never EditorSettings, and is cleared exactly once.
+func _fan_post_update_outcome() -> void:
+	if _post_update_outcome.is_empty():
 		return
-	_telemetry.record_dev_server_toggle(action)
+	var outcome := str(_post_update_outcome.get("outcome", ""))
+	var status := "unknown"
+	match outcome:
+		"success":
+			status = "success"
+		"rolled_back":
+			status = "failed_clean"
+		"repair_required", "quarantined":
+			status = "failed_mixed"
+	var error := "" if outcome == "success" else outcome.replace("_", " ")
+	var from_version := str(_post_update_outcome.get("from_version", ""))
+	var to_version := str(_post_update_outcome.get("to_version", ""))
+	if _telemetry != null and not bool(_post_update_outcome.get("manual_migration", false)):
+		_telemetry.record_self_update(status, from_version, to_version, error)
+	_post_update_outcome.clear()
+	_manual_migration_record.clear()
+	_post_update_actor_command.clear()
+	_post_update_actor_version = ""
 
 
-## Non-draining read of the runner's pending self-update marker. Peeked
-## before `_start_server` (the drain in `_flush_pending_self_update_telemetry`
-## runs later, after the dock attaches) so the startup walk knows an update
-## just completed. Only a `status == "success"` marker counts: a failed
-## install left the OLD plugin version enabled, and killing a same-version
-## backend is not this path's business.
-func _pending_self_update_succeeded() -> bool:
-	var settings := EditorInterface.get_editor_settings()
-	if settings == null:
-		return false
-	var key := UPDATE_RELOAD_RUNNER_SCRIPT.PENDING_SELF_UPDATE_TELEMETRY_KEY
-	if not settings.has_setting(key):
-		return false
-	var raw := str(settings.get_setting(key))
-	if raw.is_empty():
-		return false
-	var parsed = JSON.parse_string(raw)
-	if typeof(parsed) != TYPE_DICTIONARY:
-		return false
-	return str(parsed.get("status", "")) == "success"
+func _read_manual_migration_marker() -> Dictionary:
+	if not FileAccess.file_exists(MANUAL_MIGRATION_MARKER_PATH):
+		return {"status": "none"}
+	var file := FileAccess.open(MANUAL_MIGRATION_MARKER_PATH, FileAccess.READ)
+	if file == null:
+		return {"status": "invalid"}
+	var size := file.get_length()
+	if size <= 0 or size > MAX_MANUAL_MIGRATION_MARKER_BYTES:
+		return {"status": "invalid"}
+	return _parse_manual_migration_marker(
+		file.get_buffer(size).get_string_from_utf8(), _loaded_plugin_version
+	)
 
 
-## Drain any self_update event written by `update_reload_runner` during the
-## previous disable -> enable window.
-func _flush_pending_self_update_telemetry() -> void:
-	var key := UPDATE_RELOAD_RUNNER_SCRIPT.PENDING_SELF_UPDATE_TELEMETRY_KEY
-	var parsed = Telemetry._drain_editor_setting_dict(key)
-	if parsed == null:
+static func _parse_manual_migration_marker(raw: String, loaded_version: String) -> Dictionary:
+	var parsed: Variant = JSON.parse_string(raw)
+	if not parsed is Dictionary or (parsed as Dictionary).size() != 5:
+		return {"status": "invalid"}
+	for key in ["from_version", "kind", "schema_version", "source_commit", "to_version"]:
+		if not parsed.has(key):
+			return {"status": "invalid"}
+	var from_version := str(parsed.from_version)
+	var source_commit := str(parsed.source_commit)
+	if (
+		int(parsed.schema_version) != MANUAL_MIGRATION_MARKER_SCHEMA
+		or str(parsed.kind) != MANUAL_MIGRATION_MARKER_KIND
+		or from_version.is_empty()
+		or from_version.length() > 64
+		or str(parsed.to_version) != loaded_version
+		or source_commit.length() != 40
+	):
+		return {"status": "invalid"}
+	for character in from_version:
+		if character.unicode_at(0) < 0x20:
+			return {"status": "invalid"}
+	for character in source_commit:
+		if not "0123456789abcdef".contains(character):
+			return {"status": "invalid"}
+	return {"status": "pending", "record": (parsed as Dictionary).duplicate(true)}
+
+
+func _remove_manual_migration_marker() -> bool:
+	var current := _read_manual_migration_marker()
+	if (
+		str(current.get("status", "")) != "pending"
+		or (current.get("record", {}) as Dictionary) != _manual_migration_record
+	):
+		return false
+	var absolute := ProjectSettings.globalize_path(MANUAL_MIGRATION_MARKER_PATH)
+	return (
+		DirAccess.remove_absolute(absolute) == OK
+		and not FileAccess.file_exists(MANUAL_MIGRATION_MARKER_PATH)
+	)
+
+
+func _ensure_update_editor_nonce() -> void:
+	var inherited := OS.get_environment(UPDATE_EDITOR_NONCE_ENV)
+	if _valid_update_nonce(inherited):
+		_update_editor_nonce = inherited
+	elif not _valid_update_nonce(_update_editor_nonce):
+		_update_editor_nonce = Crypto.new().generate_random_bytes(16).hex_encode()
+
+
+static func _valid_update_nonce(value: String) -> bool:
+	if value.length() < 16 or value.length() > 128:
+		return false
+	for character in value:
+		if not "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-".contains(character):
+			return false
+	return true
+
+
+static func _update_roots() -> Dictionary:
+	return {
+		"project": ProjectSettings.globalize_path("res://").trim_suffix("/"),
+		"install": ProjectSettings.globalize_path("res://addons/godot_ai"),
+	}
+
+
+func _execute_update_command(
+	arguments: Array[String],
+	frozen_command: Array[String] = [],
+	expected_package_version: String = "",
+	timeout_ms: int = UPDATE_ACTOR_COMMAND_TIMEOUT_MS,
+) -> Dictionary:
+	if _update_actor_termination_unproven:
+		return {
+			"ok": false,
+			"error": "transaction actor termination is unproven; restart Godot before continuing",
+			"termination_unproven": true,
+		}
+	var command := (
+		frozen_command.duplicate()
+		if not frozen_command.is_empty()
+		else ClientConfigurator.get_update_transaction_command()
+	)
+	if command.is_empty():
+		return {"ok": false, "error": "transaction actor is unavailable"}
+	var expected := (
+		expected_package_version
+		if not expected_package_version.is_empty()
+		else ClientConfigurator.get_plugin_version()
+	)
+	var checked := _execute_update_command_value(
+		command,
+		arguments,
+		expected,
+		timeout_ms,
+		Callable(),
+	)
+	if bool(checked.get("termination_unproven", false)):
+		_update_actor_termination_unproven = true
+	return checked
+
+
+static func _execute_update_command_value(
+	command: Array[String],
+	arguments: Array[String],
+	expected_package_version: String,
+	timeout_ms: int,
+	cancel_check: Callable,
+) -> Dictionary:
+	if command.is_empty():
+		return {"ok": false, "error": "transaction actor is unavailable"}
+	var process_args: Array[String] = []
+	process_args.assign(command.slice(1))
+	process_args.append_array(arguments)
+	var executed := CliExec.run(
+		command[0],
+		process_args,
+		timeout_ms,
+		true,
+		cancel_check,
+		ClientConfigurator.update_actor_requires_uv_environment_isolation(command),
+	)
+	if bool(executed.get("termination_failed", false)):
+		return {
+			"ok": false,
+			"error": "transaction actor exceeded its deadline and could not be stopped safely",
+			"termination_unproven": true,
+		}
+	if bool(executed.get("timed_out", false)):
+		return {"ok": false, "error": "transaction actor timed out"}
+	if bool(executed.get("cancelled", false)):
+		return {"ok": false, "error": "transaction actor was cancelled"}
+	if bool(executed.get("spawn_failed", false)):
+		return {"ok": false, "error": "transaction actor could not be started"}
+	if int(executed.get("exit_code", -1)) != 0:
+		return {
+			"ok": false,
+			"error": _update_actor_refusal_message(str(executed.get("stderr", ""))),
+		}
+	var data: Variant = {}
+	var raw := str(executed.get("stdout", "")).strip_edges()
+	if not raw.is_empty():
+		data = JSON.parse_string(raw)
+		if not data is Dictionary:
+			return {"ok": false, "error": "transaction actor returned invalid JSON"}
+	if not _update_actor_identity_matches(data, expected_package_version):
+		return {"ok": false, "error": "transaction actor identity is incompatible"}
+	return {"ok": true, "data": data, "command": command.duplicate()}
+
+
+static func _update_actor_refusal_message(stderr_text: String) -> String:
+	## uvx/bootstrap diagnostics may echo credential-bearing index URLs. Reflect
+	## only the transaction actor's own stable error envelope, never arbitrary
+	## process output, and keep even that line bounded/control-free.
+	for raw_line in stderr_text.split("\n"):
+		var line := raw_line.strip_edges()
+		if (
+			not line.begins_with(UPDATE_ACTOR_ERROR_PREFIX)
+			or line.to_utf8_buffer().size() > MAX_UPDATE_ACTOR_ERROR_BYTES
+		):
+			continue
+		var safe := true
+		for index in line.length():
+			var code := line.unicode_at(index)
+			if code < 0x20 or code == 0x7f:
+				safe = false
+				break
+		if safe:
+			return line
+	return "transaction actor or exact-package resolver refused"
+
+
+static func _update_actor_identity_matches(data: Variant, expected_package: String) -> bool:
+	return (
+		data is Dictionary
+		and not expected_package.is_empty()
+		and int(data.get("protocol_version", 0)) == UPDATE_ACTOR_PROTOCOL_VERSION
+		and str(data.get("package_version", "")) == expected_package
+	)
+
+
+func _transaction_identity_arguments() -> Array[String]:
+	var roots := _update_roots()
+	return [
+		"--project", str(roots.project),
+		"--install", str(roots.install),
+		"--editor-pid", str(OS.get_process_id()),
+		"--editor-nonce", _update_editor_nonce,
+	]
+
+
+func _prepare_update_startup_barrier() -> Dictionary:
+	if not _loaded_update_version_matches(
+		_loaded_plugin_version, ClientConfigurator.get_plugin_version()
+	):
+		return {
+			"ok": false,
+			"error": "loaded plugin version differs from the current add-on tree",
+		}
+	var transaction := OS.get_environment(UPDATE_TRANSACTION_ENV)
+	var handoff := (
+		_parse_update_actor_handoff(
+			OS.get_environment(UPDATE_ACTOR_HANDOFF_ENV), transaction, _update_editor_nonce
+		)
+		if not transaction.is_empty()
+		else {}
+	)
+	var command: Array[String] = []
+	if not transaction.is_empty():
+		command.assign(handoff.get("command", []))
+	if not transaction.is_empty() and command.is_empty():
+		return {
+			"ok": false,
+			"error": "frozen transaction actor unavailable; refusing swapped-tree startup",
+		}
+	var arguments: Array[String] = ["startup"]
+	arguments.append_array(_transaction_identity_arguments())
+	if not transaction.is_empty():
+		arguments.append_array(["--transaction", transaction])
+	var expected_actor_version := str(
+		handoff.get("package_version", "")
+		if not transaction.is_empty()
+		else _loaded_plugin_version
+	)
+	return {
+		"ok": true,
+		"arguments": arguments,
+		"command": command,
+		"current_version": _loaded_plugin_version,
+		"discover_command": transaction.is_empty(),
+		"expected_actor_version": expected_actor_version,
+		"timeout_ms": (
+			UPDATE_ACTOR_HANDOFF_TIMEOUT_MS
+			if not transaction.is_empty()
+			else UPDATE_ACTOR_COLD_START_TIMEOUT_MS
+		),
+		"transaction": transaction,
+	}
+
+
+func _run_update_startup_barrier_job(
+	job: Dictionary,
+	cancel_check: Callable = Callable(),
+) -> Dictionary:
+	var command: Array[String] = []
+	command.assign(job.get("command", []))
+	if command.is_empty() and bool(job.get("discover_command", false)):
+		## Discovery may fork bounded login-shell/which probes. Keep it in this
+		## worker for interactive startup; the headless/export caller deliberately
+		## runs the same job synchronously because it has no editor UI to freeze.
+		command = ClientConfigurator.get_update_transaction_command()
+	if command.is_empty():
+		return {
+			"ok": false,
+			"error": "transaction actor unavailable; refusing unleased plugin startup",
+		}
+	var arguments: Array[String] = []
+	arguments.assign(job.get("arguments", []))
+	var checked := _execute_update_command_value(
+		command,
+		arguments,
+		str(job.get("expected_actor_version", "")),
+		int(job.get("timeout_ms", UPDATE_ACTOR_COLD_START_TIMEOUT_MS)),
+		cancel_check,
+	)
+	if not bool(checked.get("ok", false)):
+		return checked
+	var outcome: Dictionary = checked.get("data", {})
+	var transaction := str(job.get("transaction", ""))
+	if not _update_outcome_matches_startup(outcome, transaction):
+		return {"ok": false, "error": "transaction actor returned an invalid startup outcome"}
+	if transaction.is_empty() and str(outcome.get("status", "")) == "none":
+		return {"ok": true, "outcome": {}}
+	var current := str(job.get("current_version", ""))
+	match str(outcome.get("outcome", "")):
+		"success":
+			if current != str(outcome.get("to_version", "")):
+				return {"ok": false, "error": "successful update outcome targets another version"}
+		"rolled_back":
+			if current != str(outcome.get("from_version", "")):
+				return {"ok": false, "error": "rollback outcome targets another version"}
+		_:
+			return {"ok": false, "error": "transaction outcome is not startable"}
+	return {
+		"ok": true,
+		"actor_command": checked.get("command", []).duplicate(),
+		"actor_version": str(job.get("expected_actor_version", "")),
+		"outcome": outcome.duplicate(true),
+	}
+
+
+func _accept_update_startup_result(result: Dictionary) -> bool:
+	if bool(result.get("termination_unproven", false)):
+		_update_actor_termination_unproven = true
+	if not bool(result.get("ok", false)):
+		push_error("MCP | update startup refused: %s" % str(result.get("error", "")))
+		return false
+	var outcome: Dictionary = result.get("outcome", {})
+	if not outcome.is_empty():
+		_post_update_outcome = outcome.duplicate(true)
+		_post_update_actor_command.assign(result.get("actor_command", []))
+		_post_update_actor_version = str(result.get("actor_version", ""))
+	return true
+
+
+func _run_update_startup_barrier() -> bool:
+	var job := _prepare_update_startup_barrier()
+	if not bool(job.get("ok", false)):
+		push_error("MCP | update startup refused: %s" % str(job.get("error", "")))
+		return false
+	return _accept_update_startup_result(_run_update_startup_barrier_job(job))
+
+
+func _start_update_startup_barrier() -> bool:
+	var job := _prepare_update_startup_barrier()
+	if not bool(job.get("ok", false)):
+		push_error("MCP | update startup refused: %s" % str(job.get("error", "")))
+		return false
+	_set_update_startup_cancelled(false)
+	_update_actor_thread = Thread.new()
+	_update_actor_job = "startup"
+	var error: int = int(_update_actor_thread.start(
+		Callable(self, "_run_update_startup_barrier_job").bind(
+			job,
+			Callable(self, "_update_startup_cancel_requested"),
+		)
+	))
+	if error != OK:
+		_update_actor_thread = null
+		_update_actor_job = ""
+		push_error("MCP | update startup worker could not start")
+		return false
+	set_process(true)
+	print("MCP | checking the bounded update startup barrier in the background")
+	return true
+
+
+func _set_update_startup_cancelled(cancelled: bool) -> void:
+	_update_startup_cancel_mutex.lock()
+	_update_startup_cancelled = cancelled
+	_update_startup_cancel_mutex.unlock()
+
+
+func _update_startup_cancel_requested() -> bool:
+	_update_startup_cancel_mutex.lock()
+	var cancelled := _update_startup_cancelled
+	_update_startup_cancel_mutex.unlock()
+	return cancelled
+
+
+func _cancel_update_actor_thread() -> void:
+	if _update_actor_thread == null:
 		return
-	var status := str(parsed.get("status", "unknown"))
-	var error := str(parsed.get("error", ""))
-	## Positional args: GDScript doesn't support keyword args in calls
-	## (unlike Python). from/to versions ride the marker since the repin
-	## gate landed; markers written by older runners simply lack them.
-	var from_version := str(parsed.get("from_version", ""))
-	var to_version := str(parsed.get("to_version", ""))
-	_telemetry.record_self_update(status, from_version, to_version, error)
-	## After a successful update, previously-configured client entries still
-	## pin the old server version; arm the dock's one-shot auto-repin so its
-	## first healthy status sweep rewrites them without the user having to
-	## click through the drift banner. The dock repins ONLY entries whose
-	## sole drift is the old version pin — it needs `from_version` to render
-	## that comparison, so a marker from an older runner (no version fields)
-	## arms nothing and the drift banner stays the manual path. `has_method`
-	## (not a typed call): the dock script is one of the files the update
-	## just overwrote, and the untyped-reference convention applies across
-	## that boundary.
-	if status == "success" and _dock != null and _dock.has_method("notify_self_update_success"):
-		_dock.notify_self_update_success(from_version)
+	_set_update_startup_cancelled(true)
+	var result: Variant = _update_actor_thread.wait_to_finish()
+	_update_actor_thread = null
+	_update_actor_job = ""
+	if result is Dictionary and bool(result.get("termination_unproven", false)):
+		_update_actor_termination_unproven = true
 
 
+func _block_update_startup() -> void:
+	_update_barrier_blocked = true
+	push_error("MCP | update recovery barrier blocked plugin startup")
+	_disable_after_update_barrier.call_deferred()
+
+
+static func _update_outcome_matches_startup(outcome: Dictionary, transaction: String) -> bool:
+	if transaction.is_empty():
+		var status := str(outcome.get("status", ""))
+		return (
+			status == "none"
+			or (
+				status == "migration_pending"
+				and not str(outcome.get("transaction", "")).is_empty()
+			)
+		)
+	return (
+		str(outcome.get("status", "")) == "claimed"
+		and str(outcome.get("transaction", "")) == transaction
+	)
+
+
+static func _loaded_update_version_matches(loaded: String, on_disk: String) -> bool:
+	return not loaded.is_empty() and loaded == on_disk
+
+
+static func _parse_update_actor_handoff(
+	raw: String, transaction: String, editor_nonce: String
+) -> Dictionary:
+	## The old, already-running actor owns the entire durable reducer across a
+	## v4 swap. New code only consumes this bounded versioned command envelope,
+	## so startup never resolves/downloads the new Python package mid-transaction.
+	if raw.is_empty() or raw.length() > 8192:
+		return {}
+	var parsed: Variant = JSON.parse_string(raw)
+	if not parsed is Dictionary or (parsed as Dictionary).size() != 6:
+		return {}
+	if (
+		int(parsed.get("schema_version", 0)) != UPDATE_ACTOR_HANDOFF_SCHEMA
+		or int(parsed.get("protocol_version", 0)) != UPDATE_ACTOR_PROTOCOL_VERSION
+		or str(parsed.get("package_version", "")).is_empty()
+		or str(parsed.get("transaction", "")) != transaction
+		or str(parsed.get("editor_nonce", "")) != editor_nonce
+	):
+		return {}
+	var values: Variant = parsed.get("command", [])
+	if not values is Array or values.is_empty() or values.size() > 32:
+		return {}
+	var command: Array[String] = []
+	for value in values:
+		if not value is String or value.is_empty() or value.length() > 2048:
+			return {}
+		for index in value.length():
+			var code: int = value.unicode_at(index)
+			if code < 0x20 or code == 0x7f:
+				return {}
+		command.append(value)
+	if not command[0].is_absolute_path():
+		return {}
+	return {
+		"command": command,
+		"package_version": str(parsed.package_version),
+		"protocol_version": UPDATE_ACTOR_PROTOCOL_VERSION,
+	}
+
+
+func _disable_after_update_barrier() -> void:
+	## An editor without the transaction actor cannot publish a trustworthy
+	## cross-editor lease. Remove the blocked shell as well as withholding all
+	## owners/update UI, so another editor never swaps beneath an active plugin.
+	if _update_barrier_blocked:
+		print("MCP | disabling plugin after update barrier refusal")
+		EditorInterface.set_plugin_enabled("res://addons/godot_ai/plugin.cfg", false)
+
+
+func _preflight_update() -> Dictionary:
+	var download_id := "download-" + Crypto.new().generate_random_bytes(16).hex_encode()
+	var arguments: Array[String] = ["lease", "preflight"]
+	arguments.append_array(_transaction_identity_arguments())
+	arguments.append_array(["--download-id", download_id])
+	var checked := _execute_update_command(arguments)
+	var data: Dictionary = checked.get("data", {})
+	var recovery_root := str(data.get("recovery_root", "")).replace("\\", "/").trim_suffix("/")
+	var download_root := str(data.get("download_root", "")).replace("\\", "/").trim_suffix("/")
+	var expected_root := recovery_root.path_join("downloads").path_join(download_id)
+	var accepted := (
+		bool(checked.get("ok", false))
+		and not recovery_root.is_empty()
+		and download_root == expected_root
+	)
+	return {
+		"ok": accepted,
+		"error": (
+			str(checked.get("error", ""))
+			if not bool(checked.get("ok", false))
+			else "transaction actor returned an unbound download directory"
+		),
+		"download_root": download_root if accepted else "",
+	}
+
+
+func _release_update_lease() -> void:
+	if (
+		_update_editor_nonce.is_empty()
+		or _update_actor_termination_unproven
+		or not OS.get_environment(UPDATE_TRANSACTION_ENV).is_empty()
+	):
+		return
+	var arguments: Array[String] = ["lease", "release"]
+	arguments.append_array(_transaction_identity_arguments())
+	_execute_update_command(arguments, [], "", UPDATE_ACTOR_RELEASE_TIMEOUT_MS)
 
 
 func _exit_tree() -> void:
+	if _unsupported_engine:
+		return
+	_cancel_update_actor_thread()
+	set_process(false)
 	## Registered before the headless guard in _enter_tree, so it must be
 	## removed before the headless early-return here too.
 	if _export_plugin != null:
@@ -621,9 +1467,25 @@ func _exit_tree() -> void:
 		_export_plugin = null
 
 	if _headless_disabled:
-		_server_started_this_session = false
+		_release_update_lease()
 		_headless_disabled = false
+		## Ported from upstream PR #936 at
+		## 537a490c865837bedb96042d10ee0fc74673cd99: `_lifecycle` is built in
+		## _init(), before the headless guard in _enter_tree() runs, so it exists
+		## even on this path — null it here too (full teardown below is skipped).
+		_lifecycle = null
 		return
+
+	if _update_barrier_blocked:
+		_release_update_lease()
+		_update_barrier_blocked = false
+		_lifecycle = null
+		return
+
+	## Client work has plugin lifetime, independent of the Dock. Realize every
+	## thread before either owner script can be reloaded or freed.
+	if _client_jobs != null:
+		_client_jobs.quiesce()
 
 	if _custom_tool_registry != null:
 		_custom_tool_registry.clear()
@@ -655,6 +1517,13 @@ func _exit_tree() -> void:
 		remove_control_from_docks(_dock)
 		_dock.queue_free()
 		_dock = null
+	if _update_manager:
+		_update_manager.cancel_install()
+		_update_manager.queue_free()
+		_update_manager = null
+	if _client_jobs:
+		_client_jobs.queue_free()
+		_client_jobs = null
 	if _connection:
 		_connection.queue_free()
 		_connection = null
@@ -674,20 +1543,49 @@ func _exit_tree() -> void:
 	_editor_log_buffer = null
 	_surfaced_error_tracker = null
 
-	## keep_server_on_exit (#800): the manager routes on the spawn-time
-	## keep-alive flag (persisted in the managed-server record), NOT the
-	## live setting — detach leaves the server for the next session (or a
-	## same-session disable/enable cycle) to adopt. Explicit stops (dock
-	## Restart, update reload) still kill via _stop_server.
+	## Teardown follows the immutable launch plan: keep-on-exit or an active
+	## lease detaches; otherwise the exact owned-process grant is stopped.
 	_lifecycle.teardown_for_editor_exit()
-	## Symmetric with prepare_for_update_reload: the static guard persists
-	## across disable/enable within a single editor session, so the re-enabled
-	## plugin instance's _start_server would short-circuit and never respawn.
-	## Pre-#159 this was masked — the old kill path usually left Python alive
-	## and the new instance adopted it on port 8000. Now that _stop_server is
-	## deterministic, nothing is left to adopt and the reload hangs.
-	_server_started_this_session = false
+	_lifecycle = null
 	print("MCP | plugin unloaded")
+	## Keep the cross-editor lease until every worker is joined, every
+	## plugin-script-holding owner is gone, and teardown has emitted its final
+	## diagnostic. This must remain the last effect in the normal exit path.
+	_release_update_lease()
+
+
+func _process(_delta: float) -> void:
+	if _update_actor_thread != null and not _update_actor_thread.is_alive():
+		var result: Variant = _update_actor_thread.wait_to_finish()
+		var job := _update_actor_job
+		_update_actor_thread = null
+		_update_actor_job = ""
+		if job == "migration_completion":
+			if result is Dictionary and bool(result.get("termination_unproven", false)):
+				_update_actor_termination_unproven = true
+			if not result is Dictionary or not bool(result.get("ok", false)):
+				_present_post_update_barrier_failure(
+					str(result.get("error", "Migration completion failed."))
+					if result is Dictionary
+					else "Migration completion failed."
+				)
+				return
+			print("MCP | client migration durably completed")
+			_present_post_update_complete()
+			_fan_post_update_outcome()
+			_release_normal_startup()
+			return
+		if job != "startup":
+			_block_update_startup()
+			return
+		set_process(false)
+		if not result is Dictionary or not _accept_update_startup_result(result):
+			_block_update_startup()
+			return
+		_continue_enter_tree_after_update_barrier()
+		return
+	if _vision_routing != null:
+		_vision_routing.poll_completed()
 
 
 ## Attach editor_logger.gd as a Godot logger so editor-process script
@@ -705,46 +1603,6 @@ func _exit_tree() -> void:
 func _attach_editor_logger() -> void:
 	_editor_logger = EditorLogger.new(_editor_log_buffer)
 	OS.add_logger(_editor_logger)
-
-
-## Remove old Logger-quarantine artifacts left by extract-over-live
-## self-update. Idempotent: existence-guarded, so it's a no-op on fresh
-## installs and symlinked dev checkouts.
-func _cleanup_legacy_logger_scripts() -> void:
-	var legacy_files := [
-		"res://addons/godot_ai/runtime/logger_loader.gd",
-		"res://addons/godot_ai/runtime/logger_loader.gd.uid",
-		"res://addons/godot_ai/testing/script_error_capture_loader.gd",
-		"res://addons/godot_ai/testing/script_error_capture_loader.gd.uid",
-	]
-	for res_path in legacy_files:
-		if FileAccess.file_exists(res_path):
-			DirAccess.remove_absolute(ProjectSettings.globalize_path(res_path))
-	var legacy_dirs := [
-		"res://addons/godot_ai/runtime/loggers",
-		"res://addons/godot_ai/testing/loggers",
-	]
-	for res_path in legacy_dirs:
-		var absolute := ProjectSettings.globalize_path(res_path)
-		if DirAccess.dir_exists_absolute(absolute):
-			_remove_dir_recursive_absolute(absolute)
-
-
-static func _remove_dir_recursive_absolute(path: String) -> void:
-	var dir := DirAccess.open(path)
-	if dir == null:
-		return
-	dir.list_dir_begin()
-	var name := dir.get_next()
-	while not name.is_empty():
-		var child := path.path_join(name)
-		if dir.current_is_dir():
-			_remove_dir_recursive_absolute(child)
-		else:
-			DirAccess.remove_absolute(child)
-		name = dir.get_next()
-	dir.list_dir_end()
-	DirAccess.remove_absolute(path)
 
 
 func _detach_editor_logger() -> void:
@@ -877,348 +1735,75 @@ func _startup_trace_finish(path: String) -> void:
 
 
 func _start_server() -> void:
-	## Fire-and-forget: the walk is a coroutine in production (#678). Its
-	## completion continuation must NOT live in this method — a reload can
-	## free this plugin while the walk is suspended, and resuming a freed
-	## Node's coroutine errors out. The manager calls
-	## `_finish_startup_trace_after_walk` on walk completion instead,
-	## guarded by is_instance_valid.
+	if not _normal_start_released:
+		push_error("MCP | server start refused before normal startup release")
+		return
 	_lifecycle.start_server()
 
 
-## Called by the lifecycle manager when the (possibly suspended) startup
-## walk completes — the point where the real startup outcome is known, so
-## the trace 'done' line reports the true contended-port path and duration
-## instead of a pre-walk placeholder (#682 review).
-func _finish_startup_trace_after_walk() -> void:
-	var startup_path: String = str(_lifecycle.get_startup_path())
-	_startup_trace_finish(startup_path if not startup_path.is_empty() else "loaded")
-
-
-## Test-fixture shim — characterization tests in test_plugin_lifecycle
-## reach for this instance method directly. Delegates to the manager's
-## state-owning copy.
-func _set_incompatible_server(live: Dictionary, expected_version: String, port: int) -> void:
-	_lifecycle._set_incompatible_server(live, expected_version, port)
-
-
-## Static shim — kept on the plugin class because the characterization
-## tests assert against `GodotAiPlugin._incompatible_server_message`.
-## Implementation moved to ServerLifecycleManager.
-static func _incompatible_server_message(
-	live: Dictionary,
-	expected_version: String,
-	port: int,
-	expected_ws_port: int
-) -> String:
-	return ServerLifecycleManager._incompatible_server_message(
-		live, expected_version, port, expected_ws_port
-	)
-
-
-static func _server_version_compatibility(
-	actual_version: String, expected_version: String
-) -> Dictionary:
-	return ServerLifecycleManager._server_version_compatibility(
-		actual_version, expected_version
-	)
-
-
-static func _server_status_compatibility(
-	actual_version: String,
-	expected_version: String,
-	actual_ws_port: int,
-	expected_ws_port: int,
-) -> Dictionary:
-	return ServerLifecycleManager._server_status_compatibility(
-		actual_version, expected_version, actual_ws_port, expected_ws_port
-	)
-
-
-static func _managed_record_has_version_drift(record_version: String, current_version: String) -> bool:
-	return ServerLifecycleManager._managed_record_has_version_drift(record_version, current_version)
-
-
-static func _probe_live_server_status(port: int, timeout_ms: int = SERVER_STATUS_PROBE_TIMEOUT_MS) -> Dictionary:
-	var result := {
-		"reachable": false,
-		"version": "",
-		"name": "",
-		"ws_port": 0,
-		"status_code": 0,
-		"error": "",
+func _capture_lifecycle_plan() -> Dictionary:
+	var policy := _endpoint_policy.duplicate(true)
+	var http_port := int(policy.get("http_port", ClientConfigurator.DEFAULT_HTTP_PORT))
+	var worktree_src := ""
+	if ClientConfigurator.is_dev_checkout():
+		worktree_src = ClientConfigurator.find_worktree_src_dir(
+			ProjectSettings.globalize_path("res://")
+		)
+	return {
+		"http_port": http_port,
+		"ws_port": int(policy.get("ws_port", ClientConfigurator.DEFAULT_WS_PORT)),
+		"expected_version": ClientConfigurator.get_plugin_version(),
+		"server_command": ClientConfigurator.get_server_command(),
+		"pid_file": ProjectSettings.globalize_path(PortResolver.SERVER_PID_FILE),
+		"http_port_reserved": WindowsPortReservation.is_port_excluded(http_port),
+		"excluded_domains": str(policy.get("excluded_domains", "")),
+		"allow_hosts": str(policy.get("allow_hosts", "")),
+		"keep_alive": bool(policy.get("keep_alive", false)),
+		"worktree_src": worktree_src,
+		"ambient_pythonpath": OS.get_environment("PYTHONPATH"),
+		"disable_telemetry": not bool(policy.get("telemetry_enabled", true)),
+		"automatic_effects": true,
+		"defer_effects": true,
 	}
-	var client := HTTPClient.new()
-	var err := client.connect_to_host("127.0.0.1", port)
-	if err != OK:
-		result["error"] = "connect_%d" % err
-		return result
-	var deadline := Time.get_ticks_msec() + timeout_ms
-	while client.get_status() == HTTPClient.STATUS_RESOLVING or client.get_status() == HTTPClient.STATUS_CONNECTING:
-		client.poll()
-		if Time.get_ticks_msec() >= deadline:
-			result["error"] = "connect_timeout"
-			return result
-		OS.delay_msec(10)
-	if client.get_status() != HTTPClient.STATUS_CONNECTED:
-		result["error"] = "connect_status_%d" % client.get_status()
-		return result
-	err = client.request(HTTPClient.METHOD_GET, SERVER_STATUS_PATH, ["Accept: application/json"])
-	if err != OK:
-		result["error"] = "request_%d" % err
-		return result
-	var body := PackedByteArray()
-	while true:
-		var status := client.get_status()
-		if status == HTTPClient.STATUS_REQUESTING:
-			client.poll()
-		elif status == HTTPClient.STATUS_BODY:
-			client.poll()
-			var chunk := client.read_response_body_chunk()
-			if chunk.size() > 0:
-				body.append_array(chunk)
-		elif status == HTTPClient.STATUS_CONNECTED:
-			break
-		else:
-			result["error"] = "response_status_%d" % status
-			return result
-		if Time.get_ticks_msec() >= deadline:
-			result["error"] = "response_timeout"
-			return result
-		OS.delay_msec(10)
-	var response_code := client.get_response_code()
-	result["status_code"] = response_code
-	if response_code != 200:
-		result["error"] = "http_%d" % response_code
-		return result
-	var parsed = JSON.parse_string(body.get_string_from_utf8())
-	if not (parsed is Dictionary):
-		result["error"] = "invalid_json"
-		return result
-	result.merge(_project_status_payload(parsed), true)
-	return result
 
 
-## Project a parsed `/godot-ai/status` body into the probe's result shape.
-##
-## Extracted from the probe so it can be tested against a real payload. The
-## probe is a whitelist — a field the server publishes does not reach callers
-## unless it is copied here — and that is silent: the consumer just sees a
-## missing key. #824's lease check shipped reading `active_lease_count` while
-## this projection dropped it, so the branch was dead on every platform, and
-## the tests could not see it because they hand-built the result dict this
-## function is supposed to produce. Add new fields here, and cover them with a
-## projection test rather than a fabricated `live_status`.
-static func _project_status_payload(parsed: Dictionary) -> Dictionary:
-	var projected := {
-		"reachable": true,
-		"name": str(parsed.get("name", "")),
-		"version": _extract_server_version(parsed),
-		"ws_port": int(parsed.get("ws_port", 0)),
-		## `package_path` was added in v2.4.4 (#416) so the dock's
-		## "Incompatible server" banner can name the source of a version
-		## skew. Older servers omit it; treat the missing field as "".
-		"package_path": str(parsed.get("package_path", "")),
-	}
-	## #824: advisory attach-lease count, consumed by teardown to decide
-	## detach-vs-kill. Absent stays absent rather than defaulting to 0, so
-	## `ServerLifecycleManager.active_lease_count` keeps distinguishing "backend
-	## too old to publish this" from "backend reports zero leases" — both stop
-	## the server, but only one of them is a compatibility statement.
-	## Anything that is not a finite whole number is dropped, for the same
-	## reason the value is clamped downstream: a malformed count must not read
-	## as occupancy and keep a server alive. Godot parses every JSON number as
-	## a float, so the whole-number test is what distinguishes a real count
-	## from junk — truncating 1.5 to 1 would manufacture a held lease.
-	var raw: Variant = parsed.get("active_lease_count")
-	if raw is int or raw is float:
-		var numeric := float(raw)
-		if is_finite(numeric) and numeric == floor(numeric):
-			projected["active_lease_count"] = int(numeric)
-	return projected
+static func _supports_godot_version(version_info: Dictionary) -> bool:
+	var major := int(version_info.get("major", 0))
+	var minor := int(version_info.get("minor", 0))
+	return major == MIN_GODOT_MAJOR and minor >= MIN_GODOT_MINOR
 
 
-func _probe_live_server_status_for_port(port: int) -> Dictionary:
-	_startup_trace_count("http_status_probe")
-	return _probe_live_server_status(port)
+func _on_lifecycle_snapshot_changed(snapshot: Dictionary) -> void:
+	if _connection != null and bool(snapshot.get("connection_blocked", true)):
+		_connection.connect_blocked = true
+		_connection.connect_block_reason = str(snapshot.get("message", ""))
+	if _client_jobs != null:
+		_client_jobs.set_client_health_blocked(
+			ServerStateScript.blocks_client_health(
+				int(snapshot.get("state", ServerStateScript.UNINITIALIZED))
+			)
+		)
+	_publish_dock_status_snapshots()
 
 
-static func _extract_server_version(payload: Dictionary) -> String:
-	var version := str(payload.get("server_version", ""))
-	if version.is_empty():
-		version = str(payload.get("version", ""))
-	return version
+func _on_lifecycle_transport_ready(ws_port: int, ws_capability: String) -> void:
+	_set_resolved_ws_port(ws_port)
+	if _client_jobs != null:
+		_client_jobs.set_client_health_blocked(false)
+		_client_jobs.request_status_refresh(ClientConfigurator.client_ids(), true)
+	if _connection != null:
+		_connection.auth_token = ws_capability
+		_connection.connect_blocked = false
+		_connection.connect_block_reason = ""
+		_connection.server_version = ""
+		_connection.set_process(true)
+	_publish_dock_status_snapshots()
 
 
-static func _live_status_identifies_godot_ai(live: Dictionary) -> bool:
-	return ServerLifecycleManager._live_status_identifies_godot_ai(live)
-
-
-func _verified_status_version(live: Dictionary) -> String:
-	if not ServerLifecycleManager._live_status_identifies_godot_ai(live):
-		return ""
-	return str(live.get("version", ""))
-
-
-func _verified_status_ws_port(live: Dictionary) -> int:
-	if not ServerLifecycleManager._live_status_identifies_godot_ai(live):
-		return 0
-	return int(live.get("ws_port", 0))
-
-
-func _refresh_dock_client_statuses() -> bool:
-	if _dock == null:
-		return false
-	if not _dock.has_method("_refresh_all_client_statuses"):
-		return false
-	_dock.call("_refresh_all_client_statuses")
-	return true
-
-
-## Test-fixture shim — characterization tests in test_plugin_lifecycle
-## still drive the first-writer-wins terminal-diagnosis behaviour through
-## this method. Delegates to the manager's `set_terminal_diagnosis`
-## (which preserves the same first-writer-wins contract).
-func _set_spawn_state(state: int) -> void:
-	_lifecycle.set_terminal_diagnosis(state)
-
-
-## Arm the one-shot connection watcher. Called from `_start_server`'s
-## FOREIGN_PORT branch: we flagged the diagnostic preemptively assuming
-## the port holder doesn't speak MCP, but if it turns out to be another
-## editor's server our WebSocket will open and we need to retract the
-## diagnostic.
-##
-## We intentionally poll `_connection.is_connected` from `_process`
-## instead of wiring a new signal on McpConnection. A signal added in the
-## same release as a new consumer would be another shape-coupled update:
-## old two-phase runners can parse the consumer while the McpConnection
-## Script object still reflects v(N). Polling only reads `is_connected`
-## (present on every shipped McpConnection), so old-runner upgrade windows
-## do not depend on a same-release signal addition.
-##
-## The watch self-disarms after SPAWN_GRACE_MS so per-frame cost drops
-## back to zero if it is ever armed by a legacy adoption path.
-func _watch_for_adoption_confirmation() -> void:
-	_lifecycle.arm_adoption_watch()
-	_update_process_enabled()
-
-
-func _arm_server_version_check() -> void:
-	## `arm_version_check` resolves an empty expected via the plugin
-	## version, so we can pass the raw field value through.
-	_lifecycle.arm_version_check(_connection, str(_lifecycle._server_expected_version))
-	_update_process_enabled()
-
-
-func _update_process_enabled() -> void:
-	if _lifecycle == null:
-		set_process(false)
-		return
-	set_process(
-		_lifecycle.get_adoption_watch_deadline_ms() > 0
-		or _lifecycle.is_awaiting_server_version()
-	)
-
-
-func _process(_delta: float) -> void:
-	## Guard: during script-reload / dual-plugin enable races `_lifecycle`
-	## can be null while process is still armed — spam would otherwise flood
-	## the Output dock every frame.
-	if _lifecycle == null:
-		set_process(false)
-		return
-	var now := Time.get_ticks_msec()
-	var version_check = _lifecycle.get_version_check()
-	if version_check != null:
-		version_check.tick(now)
-	_lifecycle.tick_adoption_watch(now)
-	_update_process_enabled()
-
-
-## A WebSocket opening only proves the occupant speaks enough of the editor
-## protocol to accept a session. Compatibility is decided by the server
-## version in `handshake_ack`, so this only arms that check.
-func _on_connection_established() -> void:
-	if _lifecycle.get_state() == ServerStateScript.FOREIGN_PORT:
-		_arm_server_version_check()
-
-
-## Test-fixture shim — characterization tests poke the verified path
-## directly. Delegates to the version-check seam; the manager resolves
-## an empty expected version via `_resolve_expected_version`.
-func _on_server_version_verified(version: String) -> void:
-	_lifecycle.handle_server_version_verified(
-		str(_lifecycle._server_expected_version), version
-	)
-	_update_process_enabled()
-
-
-## Test-fixture shim — same shape as `_on_server_version_verified`.
-func _on_server_version_unverified() -> void:
-	_lifecycle.handle_server_version_unverified(
-		str(_lifecycle._server_expected_version)
-	)
-	_update_process_enabled()
-
-
-## Start a 1s-tick timer that watches the spawned server through its cold-start
-## window, then for SERVER_WATCH_MS after pid-file publication. If the process
-## dies inside the active window we drain the captured pipes and mark the server
-## as crashed so the dock can surface what went wrong. After the window expires
-## we close the pipes so they don't pin file descriptors or fill their kernel
-## buffers. See #146 and #896.
-func _start_server_watch() -> void:
-	_stop_server_watch()
-	_server_watch_timer = Timer.new()
-	_server_watch_timer.wait_time = 1.0
-	_server_watch_timer.one_shot = false
-	_server_watch_timer.timeout.connect(_check_server_health)
-	add_child(_server_watch_timer)
-	_server_watch_timer.start()
-
-
-func _stop_server_watch() -> void:
-	if _server_watch_timer != null:
-		_server_watch_timer.stop()
-		_server_watch_timer.queue_free()
-		_server_watch_timer = null
-
-
-func _check_server_health() -> void:
-	_lifecycle.check_server_health()
-
-
-## True when the first spawn looks like a stale-uvx-index failure and we
-## haven't already retried. Fail signal: launcher process already declared
-## dead by the caller, pid-file was never written (Python never got to
-## argparse), and we're on the uvx tier (the only tier where `--refresh`
-## means anything). Bug #172 — after a fresh PyPI publish, uvx's local
-## index metadata keeps saying the new version doesn't exist for ~10 min,
-## which cascaded into an infinite reconnect loop pre-#171. Retry-at-spawn
-## catches every entry path (Update, Reload Plugin, Reconnect, editor
-## restart, crash recovery) — unlike the older Update-only precheck.
-func _should_retry_with_refresh() -> bool:
-	return _retry_with_refresh_allowed(
-		_lifecycle._refresh_retried,
-		ClientConfigurator.get_server_launch_mode(),
-		_read_pid_file(),
-	)
-
-
-## Pure decision helper — environment-state readers stay in the instance
-## method above, the logic lives here so tests can drive the three inputs
-## directly without spoofing static caches or pid-files on disk.
-static func _retry_with_refresh_allowed(already_retried: bool, launch_mode: String, pid_from_file: int) -> bool:
-	return (
-		not already_retried
-		and launch_mode == "uvx"
-		and pid_from_file == 0
-	)
-
-
-func _respawn_with_refresh() -> void:
-	_lifecycle.respawn_with_refresh()
+func _on_lifecycle_transport_cleared(reason: String) -> void:
+	if _connection != null:
+		_connection.revoke_transport(reason)
+	_publish_dock_status_snapshots()
 
 
 ## Snapshot of the server-spawn outcome for the dock.
@@ -1230,10 +1815,8 @@ func get_server_status() -> Dictionary:
 	return _lifecycle.get_status_dict()
 
 
-## Diagnostic accessor for the dock's ownership label. Positive = a PID this
-## plugin instance spawned (or re-acquired via the managed record); -1 = an
-## adopted external/attach-owned backend. Display only — adoption transfers
-## end-of-life responsibility, so this value is never kill proof (#669).
+## Diagnostic accessor for the Dock. Positive means this lifecycle owns an
+## exact process grant; adoption always reports -1 and cannot authorize stop.
 func get_server_pid() -> int:
 	return _lifecycle.get_server_pid()
 
@@ -1243,860 +1826,202 @@ func get_resolved_ws_port() -> int:
 
 
 func _set_resolved_ws_port(port: int) -> void:
-	_ws_port_resolution_published = true
-	_resolved_ws_port = port
+	var policy := _endpoint_policy.duplicate(true)
+	if policy.is_empty():
+		policy = ClientConfigurator.capture_endpoint_policy(port)
+	policy["ws_port"] = port
+	_set_endpoint_policy(policy)
 	if _connection != null:
 		_connection.ws_port = port
 
 
-## Pure decision helper — environment-state reads (the published flag, the
-## EditorSettings port) stay in `_enter_tree`; the logic lives here so tests
-## can drive the three inputs directly without mutating the shared statics.
-static func _startup_ws_port_seed(
-	resolution_published: bool,
-	session_ws_port: int,
-	configured_ws_port: int
-) -> int:
-	return session_ws_port if resolution_published else configured_ws_port
+func _set_endpoint_policy(policy: Dictionary) -> void:
+	_endpoint_policy = policy.duplicate(true)
+	_resolved_ws_port = int(_endpoint_policy.get(
+		"ws_port", ClientConfigurator.DEFAULT_WS_PORT
+	))
+	ClientConfigurator.capture_launch_context(_endpoint_policy)
 
 
-func _resolve_ws_port() -> int:
+func _resolve_ws_port(configured_port: int) -> int:
 	return PortResolver.resolve_ws_port(
-		ClientConfigurator.ws_port(),
+		configured_port,
 		ClientConfigurator.MAX_PORT,
 		_log_buffer,
 	)
 
 
-## Test-compat shim — characterization tests call this static directly.
-static func _resolved_ws_port_for_existing_server(
-	record_ws_port: int,
-	record_version: String,
-	current_version: String,
-	fresh_resolved: int
-) -> int:
-	return PortResolver.resolved_ws_port_for_existing_server(
-		record_ws_port,
-		record_version,
-		current_version,
-		fresh_resolved,
-	)
-
-
-static func _resolve_ws_port_from_output(
-	configured_port: int,
-	netsh_output: String,
-	span: int = 2048
-) -> int:
-	return PortResolver.resolve_ws_port_from_output(
-		configured_port,
-		netsh_output,
-		ClientConfigurator.MAX_PORT,
-		span,
-	)
-
-
-## Plugin-level shim around the resolver — keeps the startup-trace
-## counter wiring and the `_ProofPlugin` override hook on the plugin.
-## The scrape takes `_startup_trace_count` directly so the counter names
-## track the scraper that actually ran (Windows can fall through netstat
-## → PowerShell; the fallback used to hide under the `netstat` count).
-func _is_port_in_use(port: int) -> bool:
-	if PortResolver.can_bind_local_port(port):
-		## POSIX can still have an IPv6 wildcard listener on this port
-		## even when an IPv4 loopback bind succeeds. Confirm through
-		## lsof so startup and kill-path discovery agree.
-		if OS.get_name() != "Windows":
-			return PortResolver.is_port_in_use_via_scrape(port, _startup_trace_count)
-		return false
-	return PortResolver.is_port_in_use_via_scrape(port, _startup_trace_count)
-
-
-## Pass `_startup_trace_count` so the resolver bumps the right counter
-## per scraper that actually ran (Windows can fall through netstat →
-## PowerShell — counting both unconditionally would over-report).
-func _find_pid_on_port(port: int) -> int:
-	return PortResolver.find_pid_on_port(port, _startup_trace_count)
-
-
-func _find_all_pids_on_port(port: int) -> Array[int]:
-	return PortResolver.find_all_pids_on_port(port, _startup_trace_count)
-
-
-static func _execute_windows_powershell(script: String, output: Array) -> int:
-	return PortResolver.execute_windows_powershell(script, output)
-
-
-static func _windows_listener_pids_from_execute_result(exit_code: int, output: Array) -> Array[int]:
-	return PortResolver.windows_listener_pids_from_execute_result(exit_code, output)
-
-
-static func _windows_listener_execute_result_in_use(exit_code: int, output: Array) -> bool:
-	return PortResolver.windows_listener_execute_result_in_use(exit_code, output)
-
-
-static func _parse_lsof_pids(raw: String) -> Array[int]:
-	return PortResolver.parse_lsof_pids(raw)
-
-
-static func _parse_pid_lines(raw: String) -> Array[int]:
-	return PortResolver.parse_pid_lines(raw)
-
-
-## Find the managed server PID deterministically: prefer the pid-file
-## the Python server writes on startup (see runtime_info.py), fall back
-## to scraping `netstat -ano` / `lsof` only when the file is missing or
-## stale. This is the replacement for raw port-scraping: on Windows the
-## uvx launcher PID doesn't cover the Python child, and netstat parsing
-## is fragile.
-##
-## Returns 0 when no server can be identified.
-func _find_managed_pid(port: int) -> int:
-	var pid := _read_pid_file()
-	if pid > 0 and _pid_alive(pid):
-		return pid
-	return _find_pid_on_port(port)
-
-
-## `live` is the result of a prior `_probe_live_server_status_for_port`
-## call that the caller already has on hand. When non-empty it short-
-## circuits the internal probe at the bottom of this helper, so a single
-## `_start_server` invocation that probes once at the top can thread the
-## same snapshot through compatibility check + recovery without paying
-## for a second ~500 ms localhost HTTPClient poll loop. Default `{}`
-## preserves the historical behavior for callers outside the spawn flow
-## (`can_recover_incompatible_server`, the dock's UI buttons), where a
-## fresh probe is the right thing.
-## `record_override`: a managed-server record snapshot the caller already
-## read. Non-empty skips the internal `_read_managed_server_record()` —
-## required when this helper runs on a worker thread (#678), because the
-## record lives in EditorSettings, which is main-thread-only. `{}` keeps
-## the historical read-it-here behavior for synchronous callers
-## (`_read_managed_server_record` never returns a bare `{}`, so the
-## sentinel is unambiguous).
-func _evaluate_strong_port_occupant_proof(port: int, live: Dictionary = {}, record_override: Dictionary = {}) -> Dictionary:
-	var result := {"proof": "", "pids": []}
-	var listener_pids := _find_all_pids_on_port(port)
-	if listener_pids.is_empty():
-		return result
-
-	var record: Dictionary = record_override if not record_override.is_empty() else _read_managed_server_record()
-	var record_pid := int(record.get("pid", 0))
-	var record_version := str(record.get("version", ""))
-
-	if record_pid > 1 and record_pid != OS.get_process_id():
-		## Brand-verify the recorded PID before trusting it as a kill target.
-		## A recorded PID can outlive the server it named and be recycled by
-		## the kernel for an unrelated process that happens to bind the same
-		## port — without the cmdline brand gate (the same one the
-		## `pidfile_listener` branch enforces) that process could be killed.
-		## See #525.
-		if (
-			listener_pids.has(record_pid)
-			and _pid_alive_for_proof(record_pid)
-			and _pid_cmdline_is_godot_ai_for_proof(record_pid)
-		):
-			return {"proof": "managed_record", "pids": [record_pid]}
-
-	var legacy_targets := _legacy_pidfile_kill_targets(port, listener_pids)
-	if not legacy_targets.is_empty():
-		return {"proof": "pidfile_listener", "pids": legacy_targets}
-
-	var current_live: Dictionary = live if not live.is_empty() else _probe_live_server_status_for_port(port)
-	if (
-		_live_status_identifies_godot_ai(current_live)
-		and not record_version.is_empty()
-		and str(current_live.get("version", "")) == record_version
-	):
-		## Brand-check every listener before returning it as a kill target
-		## (#686): the /godot-ai/status match proves *a* godot-ai server owns
-		## the port, but `listener_pids` is a raw scrape that can include an
-		## unrelated process sharing the port number (e.g. a ::1-only
-		## listener lsof reports alongside our IPv4 one). The other two tiers
-		## brand-check every target (#525); this tier feeds the fully
-		## automatic start_server drift-kill path, so it must too.
-		var branded_listeners: Array[int] = []
-		for pid in listener_pids:
-			var listener_pid := int(pid)
-			if _pid_cmdline_is_godot_ai_for_proof(listener_pid):
-				branded_listeners.append(listener_pid)
-		if not branded_listeners.is_empty():
-			return {"proof": "status_matches_record", "pids": branded_listeners}
-
-	return result
-
-
-## See `_evaluate_strong_port_occupant_proof` for the `live` and
-## `record_override` contracts. Threads both through the strong-proof
-## delegate so neither helper probes when the caller already knows the
-## port-owner status, and so callers running this on a worker thread
-## (#712) can inject the EditorSettings record read on the main thread.
-func _evaluate_recovery_port_occupant_proof(
-	port: int, live: Dictionary = {}, record_override: Dictionary = {}
-) -> Dictionary:
-	var proof := _evaluate_strong_port_occupant_proof(port, live, record_override)
-	if not str(proof.get("proof", "")).is_empty():
-		return proof
-
-	var current_live: Dictionary = live if not live.is_empty() else _probe_live_server_status_for_port(port)
-	if _live_status_identifies_godot_ai(current_live):
-		return {"proof": "status_name", "pids": _find_all_pids_on_port(port)}
-
-	return {"proof": "", "pids": []}
-
-
-## Seam over the static pre-warm so lifecycle recovery flows can fire it
-## through the host (`_host._prewarm_server_package(...)`) and test stubs
-## can record the call instead of spawning a real uvx process. Worker-safe:
-## the static touches only CliFinder (mutex-guarded) and OS.create_process.
-func _prewarm_server_package(version: String) -> int:
-	return ClientConfigurator.prewarm_server_package(version)
-
-
-func _recover_strong_port_occupant(port: int, wait_s: float, pre_kill_live: Dictionary = {}) -> bool:
-	## `await` because the manager method is a coroutine in production
-	## (#678); with `defer_blocking_work` off it completes synchronously
-	## and this await is a pass-through.
-	return await _lifecycle.recover_strong_port_occupant(port, wait_s, pre_kill_live)
-
-
-func _legacy_pidfile_kill_targets(_port: int, listener_pids: Array[int]) -> Array[int]:
-	var targets: Array[int] = []
-	var pidfile_pid := _read_pid_file_for_proof()
-	if pidfile_pid <= 1 or pidfile_pid == OS.get_process_id():
-		return targets
-	## An alive, branded pid-file PID is sufficient ownership proof. Under
-	## `uvicorn --reload` the reloader writes the pid-file but a child worker
-	## binds the port, so `listener_pids` never contains the reloader PID.
-	## Requiring `listener_pids.has(pidfile_pid)` here used to silently skip
-	## the kill path for the entire reload-shaped server family. The branded
-	## listener loop below still does the per-PID brand check so we never
-	## kill an unrelated process that happens to share the port.
-	if not _pid_alive_for_proof(pidfile_pid) or not _pid_cmdline_is_godot_ai_for_proof(pidfile_pid):
-		return targets
-
-	for pid in listener_pids:
-		if pid <= 1 or pid == OS.get_process_id():
-			continue
-		## Reuse the brand result already proven above when this listener is
-		## the same PID as the pidfile — saves a parent-chain walk and a
-		## shell-out (PowerShell on Windows, /proc on Linux, ps on macOS) per
-		## startup proof evaluation.
-		if pid == pidfile_pid or _pid_cmdline_is_godot_ai_for_proof(pid):
-			targets.append(pid)
-	## Also kill the reloader/launcher itself when it isn't already a listener.
-	## Without this, `--reload` workers would be killed but their parent would
-	## immediately respawn a replacement and the port would never free.
-	if not targets.has(pidfile_pid):
-		targets.append(pidfile_pid)
-	return targets
-
-
-func _read_pid_file_for_proof() -> int:
-	return _read_pid_file()
-
-
-func _pid_alive_for_proof(pid: int) -> bool:
-	return _pid_alive(pid)
-
-
-func _pid_cmdline_is_godot_ai_for_proof(pid: int) -> bool:
-	return _pid_cmdline_is_godot_ai(pid)
-
-
-static func _parse_windows_netstat_pid(stdout: String, port: int) -> int:
-	return PortResolver.parse_windows_netstat_pid(stdout, port)
-
-
-static func _parse_windows_netstat_pids(stdout: String, port: int) -> Array[int]:
-	return PortResolver.parse_windows_netstat_pids(stdout, port)
-
-
-static func _parse_windows_netstat_listening(stdout: String, port: int) -> bool:
-	return PortResolver.parse_windows_netstat_listening(stdout, port)
-
-
-static func _split_on_whitespace(s: String) -> PackedStringArray:
-	return PortResolver.split_on_whitespace(s)
-
-
-static func _read_pid_file() -> int:
-	return PortResolver.read_pid_file()
-
-
-static func _clear_pid_file() -> void:
-	PortResolver.clear_pid_file()
-
-
-func _stop_server() -> void:
-	_lifecycle.stop_server()
-
-
-
-
-## Clear the managed-server record and pid-file only if `port` is free.
-## Returns true when state was cleared. Extracted from `_stop_server` so
-## the "preserve on failed kill" contract is independently testable.
-func _finalize_stop_if_port_free(port: int) -> bool:
-	if _is_port_in_use(port):
-		return false
-	_clear_managed_server_record()
-	_clear_pid_file()
-	return true
-
-
-## Shared tail of the server CLI: transport, ports, and `--pid-file`. Both
-## the initial spawn in `_start_server` and the `--refresh` retry in
-## `_respawn_with_refresh` go through here so a new flag added in one place
-## can't silently drop out of the other.
-static func _build_server_flags(port: int, ws_port: int) -> Array[String]:
-	var flags: Array[String] = []
-	flags.assign([
-		"--transport", "streamable-http",
-		"--port", str(port),
-		"--ws-port", str(ws_port),
-		"--pid-file", ProjectSettings.globalize_path(SERVER_PID_FILE),
-	])
-	## Append `--exclude-domains` only when the user has actually picked at
-	## least one domain to drop. Skipping the empty case keeps spawns
-	## compatible with older (pre-1.4.2) servers that don't know the flag —
-	## relevant during staggered plugin/server upgrades in user-mode installs.
-	var excluded := ClientConfigurator.excluded_domains()
-	if not excluded.is_empty():
-		flags.append("--exclude-domains")
-		flags.append(excluded)
-	## LAN opt-in (#507, server core #421): pass `--allow-host` only when the
-	## developer-mode Settings tab named at least one CIDR / bare IP. Skipping
-	## the empty case keeps the default spawn byte-for-byte identical and
-	## compatible with older servers that don't know the flag — same pattern
-	## as `--exclude-domains` above.
-	var allow_hosts := ClientConfigurator.allow_hosts()
-	if not allow_hosts.is_empty():
-		flags.append("--allow-host")
-		flags.append(allow_hosts)
-	return flags
-
-
-## Returns true only when we can prove `pid`'s command line carries the
-## `godot-ai` brand AND a server flag (`--pid-file` / `--transport`). Used by
-## automatic kill paths (`_legacy_pidfile_kill_targets`) so a stale pidfile
-## whose PID has been recycled by an unrelated listener can't hand us a
-## kill target. If the OS lookup fails or returns an empty cmdline we
-## conservatively return false — better to surface incompatible-server and
-## let the user click Restart than to kill the wrong process.
-func _pid_cmdline_is_godot_ai(pid: int) -> bool:
-	## Walks up the parent chain so a uvicorn `--reload` worker whose
-	## cmdline is just `multiprocessing.spawn` still matches when its
-	## parent reloader carries the godot_ai brand. Bound the walk so a
-	## hypothetical loop or runaway PPID can't stall the editor.
-	var current := pid
-	for _i in range(5):
-		if current <= 1:
-			return false
-		var cmd := ""
-		if OS.get_name() == "Windows":
-			cmd = _windows_pid_commandline(current)
-		else:
-			cmd = _posix_pid_commandline(current)
-		if _commandline_is_godot_ai_server(cmd):
-			return true
-		current = _pid_parent(current)
-	return false
-
-
-func _pid_parent(pid: int) -> int:
-	if pid <= 1:
-		return 0
-	if OS.get_name() == "Windows":
-		var output: Array = []
-		var script := (
-			"Get-CimInstance Win32_Process -Filter 'ProcessId = %d' | "
-			+ "Select-Object -ExpandProperty ParentProcessId"
-		) % pid
-		_startup_trace_count("powershell")
-		if _execute_windows_powershell(script, output) != 0 or output.is_empty():
-			return 0
-		return int(str(output[0]).strip_edges())
-	var output_posix: Array = []
-	if OS.execute("ps", ["-o", "ppid=", "-p", str(pid)], output_posix, true) != 0 or output_posix.is_empty():
-		return 0
-	return int(str(output_posix[0]).strip_edges())
-
-
-static func _commandline_is_godot_ai_server(cmd: String) -> bool:
-	if cmd.is_empty():
-		return false
-	var lower := cmd.to_lower()
-	## The server is invoked with `--pid-file <user>/godot_ai_server.pid`,
-	## so the path itself contains "godot_ai". A naive substring brand
-	## search would falsely match an unrelated process whose cmdline
-	## happens to reference a similarly-named pidfile path. Strip the
-	## value (but leave the bare flag for the has_flag check) before
-	## brand matching.
-	var brand_search := _strip_pidfile_value(lower)
-	var has_brand := brand_search.find("godot-ai") >= 0 or brand_search.find("godot_ai") >= 0
-	var has_flag := lower.find("--pid-file") >= 0 or lower.find("--transport") >= 0
-	return has_brand and has_flag
-
-
-static func _strip_pidfile_value(cmd: String) -> String:
-	var rx := RegEx.new()
-	## Match `--pid-file=<token>` and `--pid-file <token>`; keep the bare
-	## flag so the flag-presence check still succeeds for a real server.
-	if rx.compile("--pid-file(?:=|\\s+)\\S+") != OK:
-		return cmd
-	return rx.sub(cmd, "--pid-file ", true)
-
-
-func _windows_pid_commandline(pid: int) -> String:
-	var output: Array = []
-	var script := (
-		"Get-CimInstance Win32_Process -Filter 'ProcessId = %d' | "
-		+ "Select-Object -ExpandProperty CommandLine"
-	) % pid
-	_startup_trace_count("powershell")
-	var exit_code := _execute_windows_powershell(script, output)
-	if exit_code != 0 or output.is_empty():
-		return ""
-	return str(output[0])
-
-
-## POSIX command-line lookup. Linux exposes `/proc/<pid>/cmdline` as
-## NUL-separated argv — read it directly so we avoid a `ps` fork on Linux
-## and get the full argv rather than the truncated/quoted form some `ps`
-## builds emit. Falls back to `ps -ww -p <pid> -o args=` on macOS / *BSD,
-## which lack a Linux-style `/proc/<pid>/cmdline`. Returns "" on failure
-## so callers conservatively reject the PID rather than killing it blind.
-func _posix_pid_commandline(pid: int) -> String:
-	var proc_path := "/proc/%d/cmdline" % pid
-	if FileAccess.file_exists(proc_path):
-		var f := FileAccess.open(proc_path, FileAccess.READ)
-		if f != null:
-			## procfs pseudo-files report length 0 (the kernel generates
-			## content on read). `get_length()` therefore returns 0 and
-			## `get_buffer(0)` reads nothing. Read in chunks until EOF
-			## instead. Cap at ARG_MAX-class bound so a hypothetically
-			## misbehaving file can never stall the editor frame.
-			var bytes := PackedByteArray()
-			var max_bytes := 1 << 20  # 1 MiB
-			while bytes.size() < max_bytes:
-				var chunk := f.get_buffer(4096)
-				if chunk.is_empty():
-					break
-				bytes.append_array(chunk)
-				if f.eof_reached():
-					break
-			f.close()
-			## /proc cmdline is NUL-separated argv; convert NULs to spaces
-			## so the substring fingerprint matches the same way it does on
-			## the Windows path. Empty (kernel threads, exited processes)
-			## bubbles up as "" via the strip below.
-			for i in range(bytes.size()):
-				if bytes[i] == 0:
-					bytes[i] = 0x20
-			return bytes.get_string_from_utf8().strip_edges()
-	## `-ww` removes ps's column-width truncation so trailing flags like
-	## --pid-file / --transport aren't dropped from the args= field.
-	## Both procps (Linux) and BSD ps (macOS / *BSD) accept the
-	## double-w form.
-	var output: Array = []
-	var exit_code := OS.execute("ps", ["-ww", "-p", str(pid), "-o", "args="], output, true)
-	if exit_code != 0 or output.is_empty():
-		return ""
-	return str(output[0]).strip_edges()
-
-
-## True if the given PID corresponds to a live (non-zombie) process.
-## POSIX uses `ps -o stat=` (see inline comment for the zombie rationale);
-## Windows uses `tasklist`. Called by `_start_server` to distinguish a live
-## managed server that outlived its editor from a stale EditorSettings
-## record, and by `_check_server_health` to detect a fast-failing launcher.
-static func _pid_alive(pid: int) -> bool:
-	return PortResolver.pid_alive(pid)
-
-
-## Calls `_is_port_in_use` (not `PortResolver.wait_for_port_free`) so
-## `_ProofPlugin` overrides keep driving the loop.
-func _wait_for_port_free(port: int, timeout_s: float) -> void:
-	var deadline := Time.get_ticks_msec() + int(timeout_s * 1000.0)
-	while _is_port_in_use(port):
-		if Time.get_ticks_msec() >= deadline:
-			push_warning("MCP | port %d still in use after %.1fs — proceeding anyway" % [port, timeout_s])
-			return
-		OS.delay_msec(100)
-
-
-func _read_managed_server_record() -> Dictionary:
-	var es := EditorInterface.get_editor_settings()
-	if es == null:
-		return {"pid": 0, "version": "", "ws_port": 0, "ws_token": "", "keep_alive": false}
-	var pid: int = 0
-	if es.has_setting(MANAGED_SERVER_PID_SETTING):
-		pid = int(es.get_setting(MANAGED_SERVER_PID_SETTING))
-	var version: String = ""
-	if es.has_setting(MANAGED_SERVER_VERSION_SETTING):
-		version = str(es.get_setting(MANAGED_SERVER_VERSION_SETTING))
-	var ws_port: int = 0
-	if es.has_setting(MANAGED_SERVER_WS_PORT_SETTING):
-		ws_port = int(es.get_setting(MANAGED_SERVER_WS_PORT_SETTING))
-	var ws_token: String = ""
-	if es.has_setting(MANAGED_SERVER_WS_TOKEN_SETTING):
-		ws_token = str(es.get_setting(MANAGED_SERVER_WS_TOKEN_SETTING))
-	var keep_alive := false
-	if es.has_setting(MANAGED_SERVER_KEEP_ALIVE_SETTING):
-		keep_alive = bool(es.get_setting(MANAGED_SERVER_KEEP_ALIVE_SETTING))
-	return {
-		"pid": pid,
-		"version": version,
-		"ws_port": ws_port,
-		"ws_token": ws_token,
-		"keep_alive": keep_alive,
-	}
-
-
-func _write_managed_server_record(pid: int, version: String, keep_alive: bool = false) -> void:
-	var es := EditorInterface.get_editor_settings()
-	if es == null:
-		return
-	es.set_setting(MANAGED_SERVER_PID_SETTING, pid)
-	es.set_setting(MANAGED_SERVER_VERSION_SETTING, version)
-	es.set_setting(MANAGED_SERVER_WS_PORT_SETTING, _resolved_ws_port)
-	es.set_setting(MANAGED_SERVER_WS_TOKEN_SETTING, _ws_auth_token)
-	es.set_setting(MANAGED_SERVER_KEEP_ALIVE_SETTING, keep_alive)
-
-
-## Keep the in-memory token, the connection's handshake field, and (via the
-## next _write_managed_server_record) the persisted record in one place so
-## the three can't drift. Empty token = "send no auth_token field".
-func _set_ws_auth_token(token: String) -> void:
-	_ws_auth_token = token
-	if _connection != null:
-		_connection.auth_token = token
-
-
-func _clear_managed_server_record() -> void:
-	## Drop the in-memory token together with the persisted one: a cleared
-	## record means "no managed server", and a surviving static would make
-	## the next handshake send a stale token — the exact present-but-wrong
-	## shape a newer spawned server rejects with 4003. (Runs before the
-	## es == null early return on purpose: the in-memory scrub must not
-	## depend on EditorSettings being available.)
-	_set_ws_auth_token("")
-	var es := EditorInterface.get_editor_settings()
-	if es == null:
-		return
-	if es.has_setting(MANAGED_SERVER_PID_SETTING):
-		es.set_setting(MANAGED_SERVER_PID_SETTING, 0)
-	if es.has_setting(MANAGED_SERVER_VERSION_SETTING):
-		es.set_setting(MANAGED_SERVER_VERSION_SETTING, "")
-	if es.has_setting(MANAGED_SERVER_WS_PORT_SETTING):
-		es.set_setting(MANAGED_SERVER_WS_PORT_SETTING, 0)
-	if es.has_setting(MANAGED_SERVER_WS_TOKEN_SETTING):
-		es.set_setting(MANAGED_SERVER_WS_TOKEN_SETTING, "")
-	if es.has_setting(MANAGED_SERVER_KEEP_ALIVE_SETTING):
-		es.set_setting(MANAGED_SERVER_KEEP_ALIVE_SETTING, false)
-
-
-func prepare_for_update_reload() -> void:
+func prepare_for_update_reload() -> Dictionary:
+	## Stop the exact managed process first: this is the only expected refusal
+	## point and leaves command/vision composition untouched on failure.
+	var lifecycle_quiesced: Dictionary = _lifecycle.prepare_for_update_reload()
+	if not bool(lifecycle_quiesced.get("ok", false)):
+		return lifecycle_quiesced
+	if _vision_routing != null:
+		_vision_routing.shutdown()
 	if _dispatcher != null:
-		# Stop accepting handler work and hand any live status worker to its
-		# frame-polled teardown coroutine. _exit_tree() calls clear() again; the
-		# second call is intentionally inert because the caches are empty.
-		_dispatcher.clear()
-	_lifecycle.prepare_for_update_reload()
+		var quiesced: Dictionary = _dispatcher.quiesce_for_script_swap()
+		if not bool(quiesced.get("ok", false)):
+			quiesced["reload_required"] = true
+			return quiesced
+		var cleared: Dictionary = _dispatcher.clear()
+		if not bool(cleared.get("ok", false)):
+			cleared["reload_required"] = true
+			return cleared
+	return {"ok": true}
 
 
-func _adopt_compatible_server(
-	record_version: String,
-	current_version: String,
-	owner: int,
-	record_owns_listener: bool = false
-) -> String:
-	return _lifecycle.adopt_compatible_server(
-		record_version,
-		current_version,
-		owner,
-		record_owns_listener
-	)
-
-
-static func _compatible_adoption_log_message(
-	owner_label: String,
-	owned_pid: int,
-	observed_owner_pid: int,
-	live_version: String,
-	live_ws_port: int,
-	current_version: String
-) -> String:
-	if owner_label == "managed":
-		return "MCP | adopted managed server (PID %d, live v%s, WS %d, plugin v%s)" % [
-			owned_pid,
-			live_version,
-			live_ws_port,
-			current_version
-		]
-	return "MCP | adopted external server owner_pid=%d (live v%s, WS %d, plugin v%s)" % [
-		observed_owner_pid,
-		live_version,
-		live_ws_port,
-		current_version
+## Authenticate and stage while the old plugin is fully live. Only after that
+## succeeds do we quiesce and detach a value-only coordinator. The coordinator
+## survives disable because it is parented under the editor, but its already-
+## compiled script never reads or writes the tree the Python actor swaps.
+func install_downloaded_update(package: Dictionary) -> void:
+	_ensure_update_editor_nonce()
+	var command := ClientConfigurator.get_update_transaction_command()
+	if command.is_empty():
+		_on_update_install_state_changed({
+			"install_in_flight": false,
+			"button_text": "Update blocked — transaction actor unavailable",
+			"button_disabled": false,
+		})
+		return
+	var transaction := Crypto.new().generate_random_bytes(16).hex_encode()
+	var roots := _update_roots()
+	var arguments: Array[String] = [
+		"prepare",
+		"--archive", str(package.get("archive", "")),
+		"--manifest", str(package.get("manifest", "")),
+		"--signature", str(package.get("signature", "")),
+		"--project", str(roots.project),
+		"--install", str(roots.install),
+		"--transaction", transaction,
+		"--channel", str(package.get("channel", "")),
+		"--tag", str(package.get("tag", "")),
+		"--version", str(package.get("version", "")),
+		"--source", str(package.get("source", "")),
+		"--editor-pid", str(OS.get_process_id()),
+		"--editor-nonce", _update_editor_nonce,
 	]
-
-
-## Hand the self-update over to a tiny runner that is not owned by this
-## EditorPlugin. The runner keeps the editor process alive, but disables this
-## plugin before extracting/scanning the new scripts so every plugin-owned
-## instance tears down on pre-update bytecode and pre-update field storage.
-func install_downloaded_update(zip_path: String, temp_dir: String, source_dock: Control) -> void:
-	prepare_for_update_reload()
-
-	var detached_dock = null
-	if _dock != null and is_instance_valid(_dock):
-		detached_dock = _dock
-		remove_control_from_docks(_dock)
-		_dock = null
-	elif source_dock != null and is_instance_valid(source_dock):
-		detached_dock = source_dock
-		remove_control_from_docks(source_dock)
-
-	var runner = UPDATE_RELOAD_RUNNER_SCRIPT.new()
+	var checked := _execute_update_command(arguments, command)
+	if _update_manager != null:
+		_update_manager.discard_downloads()
+	if not bool(checked.get("ok", false)):
+		_on_update_install_state_changed({
+			"install_in_flight": false,
+			"button_text": "Update verification failed",
+			"button_disabled": false,
+		})
+		push_error("MCP | signed update refused: %s" % str(checked.get("error", "")))
+		return
+	var prepared: Dictionary = checked.get("data", {})
+	prepared.merge({
+		"project_root": str(roots.project),
+		"install_root": str(roots.install),
+		"from_version": ClientConfigurator.get_plugin_version(),
+		"to_version": str(package.get("version", "")),
+	}, true)
+	if _client_jobs != null:
+		var jobs_quiesced: Dictionary = _client_jobs.quiesce(
+			Time.get_ticks_msec() + ClientConfigurator.PREWARM_TIMEOUT_MS
+		)
+		if not bool(jobs_quiesced.get("ok", false)):
+			_abort_prepared_update(prepared, command)
+			push_error("MCP | client workers refused update quiescence")
+			return
+	var script_quiesced := prepare_for_update_reload()
+	if not bool(script_quiesced.get("ok", false)):
+		_abort_prepared_update(prepared, command)
+		if bool(script_quiesced.get("reload_required", false)):
+			_reload_plugin_after_failed_update.call_deferred()
+		push_error("MCP | command workers refused update quiescence")
+		return
+	_on_update_install_state_changed({
+		"install_in_flight": true,
+		"button_text": "Activating verified update…",
+		"button_disabled": true,
+	})
+	var coordinator = UpdateCoordinator.new()
 	var parent: Node = EditorInterface.get_base_control()
 	if parent == null:
 		parent = get_tree().root
-	parent.add_child(runner)
-	runner.start(zip_path, temp_dir, detached_dock)
+	parent.add_child(coordinator)
+	coordinator.start(prepared, command, _update_editor_nonce)
+
+
+func _reload_plugin_after_failed_update() -> void:
+	## The signed prepared tree was aborted before mutation. Reconstruct the
+	## unchanged old composition if any later quiescence step had already
+	## stopped vision or released handler references.
+	EditorInterface.set_plugin_enabled("res://addons/godot_ai/plugin.cfg", false)
+	EditorInterface.set_plugin_enabled("res://addons/godot_ai/plugin.cfg", true)
+
+
+func _abort_prepared_update(prepared: Dictionary, command: Array[String]) -> bool:
+	var arguments: Array[String] = [
+		"abort-prepared",
+		"--project", str(prepared.project_root),
+		"--install", str(prepared.install_root),
+		"--recovery-root", str(prepared.recovery_root),
+		"--transaction", str(prepared.transaction),
+		"--editor-pid", str(OS.get_process_id()),
+		"--editor-nonce", _update_editor_nonce,
+	]
+	var checked := _execute_update_command(arguments, command)
+	_on_update_install_state_changed({
+		"install_in_flight": false,
+		"button_text": (
+			"Update cancelled safely"
+			if bool(checked.get("ok", false))
+			else "Update blocked — cleanup required"
+		),
+		"button_disabled": false,
+	})
+	return bool(checked.get("ok", false))
 
 
 func can_recover_incompatible_server() -> bool:
-	return _lifecycle.can_recover_incompatible_server()
+	return _normal_start_released and _lifecycle.can_recover_incompatible_server()
 
 
-func _resume_connection_after_recovery() -> void:
-	if _connection == null:
-		return
-	var state: int = _lifecycle.get_state()
-	if (
-		_lifecycle.is_connection_blocked()
-		or (
-			state != ServerStateScript.SPAWNING
-			and state != ServerStateScript.READY
-		)
-	):
-		return
-	_connection.connect_blocked = false
-	_connection.connect_block_reason = ""
-	_connection.server_version = ""
-	_connection.set_process(true)
-	_arm_server_version_check()
-
-
-func recover_incompatible_server(user_initiated: bool = true, stale_version: String = "") -> bool:
-	## A user's click (the dock's Restart) authorizes the bounded
-	## stale-occupant retry for this episode, so a bridge respawning the old
-	## version and winning the post-kill bind race gets re-killed
-	## automatically instead of dead-ending the click in a terminal state.
-	## The automatic triggers (post-update handshake mismatch, fast-exit
-	## re-walk) call with `user_initiated=false` and only SPEND from the
-	## already-authorized budget — re-arming there would unbound the
-	## kill/respawn loop against a persistent respawner.
-	if user_initiated:
-		_lifecycle.authorize_stale_recovery()
-	## `await` because the manager's recovery is a coroutine in production
-	## (#678): `_resume_connection_after_recovery` gates on the post-walk
-	## state, so it must not run until the respawn walk has completed. With
-	## `defer_blocking_work` off this completes synchronously.
-	if not await _lifecycle.recover_incompatible_server(stale_version):
+func recover_incompatible_server(_user_initiated: bool = true, _stale_version: String = "") -> bool:
+	## The Dock click is the sole source of replacement authority. The manager
+	## binds, spends, and discards one authorization for this exact target.
+	if not _normal_start_released:
 		return false
-	_resume_connection_after_recovery()
+	return _lifecycle.request_replacement()
+
+
+## Managed restart uses the exact owned grant. An unowned incompatible server
+## can only reach replacement through the separate explicit Dock intent.
+func force_restart_server() -> bool:
+	if not _normal_start_released:
+		return false
+	return _lifecycle.force_restart_server()
+
+
+## Developer controls use the same lifecycle owner as ordinary startup. The
+## plugin may restart only its exact process grant; a compatible external
+## server is adopted for transport but remains the launcher's responsibility.
+func restart_or_start_managed_server() -> bool:
+	if not _normal_start_released:
+		return false
+	if has_managed_server():
+		_lifecycle.force_restart_server()
+		return true
+	var port := ClientConfigurator.http_port()
+	if PortResolver.is_port_in_use(port):
+		push_warning(
+			"MCP | refusing to restart the unowned server on port %d; stop it from its launcher"
+			% port
+		)
+		return false
+	_lifecycle.start_server()
 	return true
 
 
-## Kill whichever process is holding `http_port()` right now — by resolving
-## the port-owning PID via pid-file / netstat / lsof, independent of whether
-## we ever set the manager's `_server_pid` — then clear ownership state
-## and respawn via the lifecycle manager. The dock's version-mismatch
-## banner wires here when the plugin adopted a foreign server whose
-## `server_version` drifts from the current plugin version.
-func force_restart_server() -> void:
-	_lifecycle.force_restart_server()
-
-
-## Single entry point for the dock's primary "Restart Dev Server" button.
-## The user clicking Restart is explicit consent to take over the HTTP port,
-## so this is aggressive: any PID holding the port gets killed (managed,
-## branded-dev, or orphan multiprocessing.spawn workers whose parent died
-## so brand detection misses them). After the port frees we spawn a fresh
-## --reload dev server. Returns true if a kill happened, false if the port
-## was already free and we just spawned.
-func force_restart_or_start_dev_server() -> bool:
-	var port := ClientConfigurator.http_port()
-	var killed := false
+func stop_managed_server() -> void:
 	if has_managed_server():
-		_lifecycle.reset_for_force_restart()
-	if _is_port_in_use(port):
-		_kill_processes_and_windows_spawn_children(_find_all_pids_on_port(port))
-		killed = true
-	if killed:
-		## OS.kill returns synchronously but uvicorn's listener can take
-		## longer to release the port. Without this wait, start_dev_server's
-		## fixed 500ms timer races the old shutdown and the new --reload
-		## spawn fails to bind.
-		_wait_for_port_free(port, 5.0)
-	start_dev_server()
-	return killed
-
-
-func start_dev_server() -> void:
-	## Start a dev server with --reload that survives plugin reloads.
-	## Kills any managed server first, waits for the port to free, then spawns.
-	##
-	## PYTHONPATH handling: when `res://` sits inside a checkout that owns a
-	## `src/godot_ai/` (root repo or a git worktree), prepend that `src/` to
-	## PYTHONPATH so `import godot_ai` and uvicorn's `reload_dirs` both pick
-	## up *this* tree's source rather than the root repo's editable install.
-	## On the root repo the path matches the installed package, so this is a
-	## no-op; in a worktree it's what makes `--reload` actually watch the
-	## worktree's Python. See #84.
-	_stop_server()
-	get_tree().create_timer(0.5).timeout.connect(func():
-		var server_cmd := ClientConfigurator.get_server_command()
-		if server_cmd.is_empty():
-			push_warning("MCP | could not find server command for dev server")
-			return
-
-		var cmd: String = server_cmd[0]
-		_set_resolved_ws_port(_resolve_ws_port())
-		var inner_args: Array[String] = []
-		inner_args.assign(server_cmd.slice(1))
-		inner_args.append_array([
-			"--transport", "streamable-http",
-			"--port", str(ClientConfigurator.http_port()),
-			"--ws-port", str(_resolved_ws_port),
-			"--reload",
-		])
-
-		var worktree_src := ClientConfigurator.find_worktree_src_dir(ProjectSettings.globalize_path("res://"))
-		var prev_pythonpath := OS.get_environment("PYTHONPATH")
-		if not worktree_src.is_empty():
-			var sep := ";" if OS.get_name() == "Windows" else ":"
-			var new_pp := worktree_src if prev_pythonpath.is_empty() else worktree_src + sep + prev_pythonpath
-			OS.set_environment("PYTHONPATH", new_pp)
-
-		var injected_telemetry: bool = _lifecycle._inject_telemetry_env()
-		var pid := OS.create_process(cmd, inner_args)
-		if injected_telemetry:
-			OS.unset_environment("GODOT_AI_DISABLE_TELEMETRY")
-
-		## Restore PYTHONPATH immediately — the spawned child has already
-		## copied the env, so the editor's own process state returns to
-		## baseline. Leaving it set would leak to any later OS.create_process
-		## from unrelated paths.
-		if not worktree_src.is_empty():
-			if prev_pythonpath.is_empty():
-				OS.unset_environment("PYTHONPATH")
-			else:
-				OS.set_environment("PYTHONPATH", prev_pythonpath)
-
-		if pid > 0:
-			## Match `server_lifecycle.gd::start_server`'s log wording —
-			## "prefix" since we prepended to any pre-existing PYTHONPATH,
-			## not replaced it. See #429 review.
-			var suffix := " (PYTHONPATH prefix=%s)" % worktree_src if not worktree_src.is_empty() else ""
-			print("MCP | started dev server with --reload (PID %d): %s %s%s" % [pid, cmd, " ".join(inner_args), suffix])
-		else:
-			push_warning("MCP | failed to start dev server")
-	)
-
-
-func stop_dev_server() -> void:
-	## Stop any server running on the HTTP port (by port, not PID).
-	## Used for dev servers whose PID we don't track across reloads.
-	if _lifecycle.get_server_pid() > 0:
-		# We have a managed server — use normal stop
-		_stop_server()
-		return
-	## A suspended startup walk holds pre-kill probe results; without this
-	## it can resume against the listener we are about to kill and adopt a
-	## dead server.
-	_lifecycle._invalidate_async_startup()
-	var port := ClientConfigurator.http_port()
-	var candidates: Array[int] = []
-	for pid in _find_all_pids_on_port(port):
-		var candidate := int(pid)
-		if _pid_cmdline_is_godot_ai(candidate):
-			candidates.append(candidate)
-	var killed := _kill_processes_and_windows_spawn_children(candidates)
-	if not killed.is_empty():
-		print("MCP | stopped dev server on port %d" % port)
-
-
-## `verify_brand`: re-check `pid_alive` + the godot-ai cmdline brand
-## immediately before the kill (#686). Pass true when the proof that
-## nominated `pids` was evaluated in an earlier scheduling window (e.g.
-## `recover_strong_port_occupant`'s proof runs in one `_run_blocking` task
-## and the kill in a second, with main-thread frames in between) — a branded
-## target that exits in that gap can have its PID recycled to an innocent
-## process. Default false preserves the intentionally-unbranded call sites
-## (the dock's explicit-consent Restart button, orphan spawn workers whose
-## parent died so brand detection misses them).
-func _kill_processes_and_windows_spawn_children(pids: Array[int], verify_brand: bool = false) -> Array[int]:
-	var unique: Array[int] = []
-	for pid in pids:
-		if pid <= 0 or unique.has(pid):
-			continue
-		if verify_brand and not (_pid_alive_for_proof(pid) and _pid_cmdline_is_godot_ai_for_proof(pid)):
-			continue
-		unique.append(pid)
-	if OS.get_name() == "Windows":
-		for child_pid in _find_windows_spawn_children(unique):
-			if not unique.has(child_pid):
-				unique.append(child_pid)
-	var killed: Array[int] = []
-	for pid in unique:
-		if OS.get_name() == "Windows":
-			var output: Array = []
-			var exit_code := OS.execute("taskkill", ["/PID", str(pid), "/T", "/F"], output, true)
-			if exit_code == 0 or not _pid_alive(pid):
-				killed.append(pid)
-		else:
-			## Mirror the Windows branch: only report the PID as killed if
-			## the kill succeeded or the process is verifiably gone.
-			if OS.kill(pid) == OK or not _pid_alive(pid):
-				killed.append(pid)
-	return killed
-
-
-func _find_windows_spawn_children(parent_pids: Array[int]) -> Array[int]:
-	if parent_pids.is_empty():
-		var empty: Array[int] = []
-		return empty
-	var found: Array[int] = []
-	for parent_pid in parent_pids:
-		var output: Array = []
-		var script := (
-			"Get-CimInstance Win32_Process | "
-			+ "Where-Object { $_.CommandLine -like '*spawn_main(parent_pid=%d*' } | "
-			+ "ForEach-Object { $_.ProcessId }"
-		) % parent_pid
-		_startup_trace_count("powershell")
-		var exit_code := _execute_windows_powershell(script, output)
-		if exit_code != 0 or output.is_empty():
-			continue
-		for pid in _parse_pid_lines(str(output[0])):
-			if not found.has(pid):
-				found.append(pid)
-	return found
-
-
-func is_dev_server_running() -> bool:
-	## Returns true if a branded dev server is running on the HTTP port
-	## that we didn't start as managed.
-	if _lifecycle.get_server_pid() > 0:
-		return false
-	for pid in _find_all_pids_on_port(ClientConfigurator.http_port()):
-		if _pid_cmdline_is_godot_ai(int(pid)):
-			return true
-	return false
+		_lifecycle.stop_server()
 
 
 func has_managed_server() -> bool:
@@ -2105,10 +2030,8 @@ func has_managed_server() -> bool:
 
 
 func can_restart_managed_server() -> bool:
-	## Restart is allowed only when we have ownership proof. A live PID
-	## means this plugin spawned/adopted a managed server; a non-empty
-	## managed record is the cross-session proof used by the drift branch.
-	return _lifecycle.can_restart_managed_server()
+	## Restart needs an owned grant or a currently replaceable blocked target.
+	return _normal_start_released and _lifecycle.can_restart_managed_server()
 
 
 func _on_custom_tools_changed() -> void:
@@ -2141,5 +2064,9 @@ func _on_custom_tools_changed() -> void:
 ## _connected is false (connection.gd::_send_json), so without this
 ## replay those tools only surface on the next registry mutation.
 func _on_connection_state_changed(is_open: bool) -> void:
-	if is_open and _custom_tool_registry != null:
-		_on_custom_tools_changed()
+	if is_open:
+		_lifecycle.transport_authenticated(_connection.server_version)
+		if _custom_tool_registry != null:
+			_on_custom_tools_changed()
+	else:
+		_lifecycle.transport_lost()

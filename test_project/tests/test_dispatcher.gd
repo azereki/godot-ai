@@ -523,12 +523,13 @@ func test_lazy_commands_share_one_cached_handler_instance() -> void:
 		"both commands must resolve against the same cached handler instance")
 
 
-func test_clear_prepares_lazy_handlers_for_teardown_before_release() -> void:
+func test_clear_quiesces_lazy_handlers_before_release() -> void:
 	var d := _make_lazy_dispatcher()
 	d.dispatch_direct("lazy_echo", {"value": 1})
 	var instance = d._lazy_handler_cache.get("fixture")
 	assert_true(instance != null)
-	d.clear()
+	var result := d.clear()
+	assert_true(bool(result.get("ok", false)))
 	assert_eq(instance.teardown_calls, 1, "clear must invoke the worker-drain lifecycle hook")
 	assert_true(d._lazy_handler_cache.is_empty())
 

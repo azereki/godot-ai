@@ -21,7 +21,7 @@ import pytest
 from godot_ai.godot_client.circuit_breaker import EditorBridgeCircuitBreaker
 from godot_ai.godot_client.client import GodotClient, GodotCommandError
 from godot_ai.protocol.envelope import CommandResponse, ErrorDetail
-from godot_ai.sessions.registry import Session, SessionRegistry
+from godot_ai.sessions.registry import PendingCommandLimitError, Session, SessionRegistry
 
 
 class _FakeClock:
@@ -49,7 +49,8 @@ class _StubWsServer:
     ``recorded_calls`` lets tests assert what actually reached the wire.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, registry: SessionRegistry) -> None:
+        self.registry = registry
         self.script: list[tuple[str | None, Exception | dict | ErrorDetail]] = []
         self.recorded_calls: list[tuple[str, str]] = []  # (command, session_id)
 
@@ -78,8 +79,10 @@ class _StubWsServer:
         if isinstance(action, Exception):
             raise action
         if isinstance(action, ErrorDetail):
-            return CommandResponse(request_id="r", status="error", data={}, error=action)
-        return CommandResponse(request_id="r", status="ok", data=action)
+            return CommandResponse(
+                request_id="r", status="error", data={}, error=action, readiness="ready"
+            )
+        return CommandResponse(request_id="r", status="ok", data=action, readiness="ready")
 
 
 def _make_registry(*session_ids: str, active: str | None = None) -> SessionRegistry:
@@ -99,14 +102,14 @@ def _make_registry(*session_ids: str, active: str | None = None) -> SessionRegis
 
 
 def _client(registry, *, threshold: int = 3, initial_open_ms: int = 1000):
-    ws = _StubWsServer()
+    ws = _StubWsServer(registry)
     breaker = EditorBridgeCircuitBreaker(
         threshold=threshold,
         initial_open_ms=initial_open_ms,
         max_open_ms=30_000,
         time_fn=_FakeClock(),
     )
-    return GodotClient(ws, registry, circuit_breaker=breaker), ws, breaker
+    return GodotClient(ws, circuit_breaker=breaker), ws, breaker
 
 
 class TestPreThresholdBehavior:
@@ -211,6 +214,33 @@ class TestCircuitOpens:
 
 
 class TestCircuitDoesNotOpen:
+    async def test_pending_limit_is_structured_retryable_backpressure(self) -> None:
+        client, ws, breaker = _client(_make_registry("sess", active="sess"), threshold=3)
+        ws.queue(
+            PendingCommandLimitError(
+                scope="peer",
+                count=32,
+                limit=32,
+                session_id="sess",
+            )
+        )
+
+        with pytest.raises(GodotCommandError) as exc_info:
+            await client.send("ping", session_id="sess")
+
+        error = exc_info.value
+        assert error.code == "TRANSPORT_OVERLOADED"
+        assert error.data == {
+            "retryable": True,
+            "reason": "pending_command_limit",
+            "scope": "peer",
+            "pending_count": 32,
+            "pending_limit": 32,
+            "session_id": "sess",
+            "hint": "Wait for an in-flight editor command to finish before retrying.",
+        }
+        assert breaker.snapshot("sess")["consecutive_failures"] == 0
+
     async def test_plugin_error_response_does_not_count_as_transport_failure(self) -> None:
         ## F-006 rationale: a plugin-side error (NODE_NOT_FOUND, etc.) is a
         ## *successful* bridge round-trip — the transport works, the request
@@ -256,7 +286,7 @@ class TestReset:
         assert breaker.check_open(None) is not None
 
         ## Register a session and serve one call.
-        client.registry.register(
+        ws.registry.register(
             Session(
                 session_id="late",
                 godot_version="4.4.1",
@@ -319,11 +349,7 @@ class TestErrorPayloadShape:
 class TestSettingsViaConstructor:
     async def test_default_threshold_does_not_open_until_5_failures(self) -> None:
         ## Pin the production default — the docstring claims threshold=5.
-        client = GodotClient(
-            _StubWsServer(),
-            _make_registry(),
-            # default breaker
-        )
+        client = GodotClient(_StubWsServer(_make_registry()))
         for _ in range(4):
             with pytest.raises(GodotCommandError):
                 await client.send("anything")

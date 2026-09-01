@@ -14,8 +14,48 @@ source "$SCRIPT_DIR/_ci_env.sh"
 source "$SCRIPT_DIR/_ci_session_guard.sh"
 
 SERVER_URL="$MCP_SERVER_URL"
-HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
+ci_load_http_auth
+readonly MANAGED_RELOAD_TIMEOUT_SECONDS=60
+readonly MANAGED_RELOAD_POLL_SECONDS=0.5
+HEADERS=()
+SESSION_ID=""
 REQ_ID=0
+
+refresh_http_headers() {
+  HEADERS=(
+    "${HTTP_AUTH_HEADERS[@]}"
+    -H "Content-Type: application/json"
+    -H "Accept: application/json, text/event-stream"
+  )
+}
+
+initialize_mcp_session() {
+  local response
+  local new_session_id
+  if ! response=$(curl -fsiS --connect-timeout 3 --max-time 10 \
+    "$SERVER_URL" -X POST "${HEADERS[@]}" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci-reload","version":"1.0"}}}'); then
+    return 1
+  fi
+  new_session_id=$(printf '%s\n' "$response" | tr -d '\r' | awk '
+    tolower($1) == "mcp-session-id:" {
+      print $2
+      exit
+    }
+  ')
+  if [ -z "$new_session_id" ]; then
+    return 1
+  fi
+  if ! curl -fsS --connect-timeout 3 --max-time 10 \
+    "$SERVER_URL" -X POST "${HEADERS[@]}" \
+    -H "Mcp-Session-Id: $new_session_id" \
+    -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' > /dev/null; then
+    return 1
+  fi
+  SESSION_ID="$new_session_id"
+}
+
+refresh_http_headers
 
 # Helper: call an MCP tool and extract the content JSON from the SSE response.
 # Prints parsed content to stdout; diagnostics to stderr. Returns 1 on failure.
@@ -67,22 +107,133 @@ mcp_call_or_die() {
   echo "$result"
 }
 
-# Initialize MCP session
-echo "Initializing MCP session..."
-SESSION_ID=$(curl -si "$SERVER_URL" -X POST "${HEADERS[@]}" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci-reload","version":"1.0"}}}' \
-  2>&1 | grep -i 'mcp-session-id' | tr -d '\r' | awk '{print $2}' || true)
-  # `|| true`: under pipefail a header miss would abort the script instead of
-  # falling through to the empty-SESSION_ID check below (#668).
+wait_for_managed_reload() {
+  local old_capability="$1"
+  local old_godot_session="$2"
+  local expected_project="$3"
+  local deadline=$((SECONDS + MANAGED_RELOAD_TIMEOUT_SECONDS))
+  local candidate_capability=""
+  local initialized_capability=""
+  local latest_sessions='{"sessions":[]}'
+  local replacement=""
+  local selection_status=0
+  local saw_rotated_capability=0
 
-if [ -z "$SESSION_ID" ]; then
+  while (( SECONDS < deadline )); do
+    if ci_load_http_auth 2>/dev/null && \
+      [ "$HTTP_AUTH_CAPABILITY" != "$old_capability" ]; then
+      saw_rotated_capability=1
+      if [ "$HTTP_AUTH_CAPABILITY" != "$candidate_capability" ]; then
+        candidate_capability="$HTTP_AUTH_CAPABILITY"
+        initialized_capability=""
+        SESSION_ID=""
+        refresh_http_headers
+      fi
+
+      if [ "$initialized_capability" != "$candidate_capability" ]; then
+        if initialize_mcp_session; then
+          initialized_capability="$candidate_capability"
+        else
+          sleep "$MANAGED_RELOAD_POLL_SECONDS"
+          continue
+        fi
+      fi
+
+      if latest_sessions=$(mcp_call session_manage '{"op":"list"}' 2>/dev/null); then
+        if replacement=$(ci_select_replacement_session \
+          "$latest_sessions" "$expected_project" "$old_godot_session" 2>/dev/null); then
+          TARGET_GODOT_SESSION="$replacement"
+          echo "Managed reload reconnected: ${old_godot_session:0:12}... -> ${replacement:0:12}..."
+          return 0
+        else
+          selection_status=$?
+          if [ "$selection_status" -ne 2 ]; then
+            echo "ERROR: replacement Godot session selection failed closed" >&2
+            ci_select_replacement_session \
+              "$latest_sessions" "$expected_project" "$old_godot_session" diagnose || true
+            return 1
+          fi
+        fi
+      else
+        # The capability record can be published just before the new listener
+        # is stable. Reinitialize rather than reusing an uncertain HTTP session.
+        initialized_capability=""
+        SESSION_ID=""
+      fi
+    fi
+    sleep "$MANAGED_RELOAD_POLL_SECONDS"
+  done
+
+  if [ "$saw_rotated_capability" -eq 0 ]; then
+    echo "ERROR: managed reload timed out before the old HTTP capability disappeared" >&2
+  else
+    echo "ERROR: managed reload timed out before a fresh exact-project session appeared" >&2
+    ci_select_replacement_session \
+      "$latest_sessions" "$expected_project" "$old_godot_session" diagnose || true
+  fi
+  return 1
+}
+
+accept_reload_result() {
+  local result="$1"
+  local old_capability="$2"
+  local expected_project="$3"
+  local expected_old_session="$TARGET_GODOT_SESSION"
+  local parsed
+  local status
+  local new_session_id
+
+  if ! parsed=$(python3 -c '
+import json
+import sys
+
+expected_old = sys.argv[1]
+try:
+    content = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    raise SystemExit(f"FAIL: editor_reload_plugin returned invalid JSON: {exc}") from None
+if not isinstance(content, dict):
+    raise SystemExit("FAIL: editor_reload_plugin response is not an object")
+status = content.get("status")
+old_id = content.get("old_session_id")
+new_id = content.get("new_session_id")
+if old_id != expected_old:
+    raise SystemExit(
+        f"FAIL: reload acknowledged old_session_id={old_id!r}, expected {expected_old!r}"
+    )
+if status == "reloaded":
+    if not isinstance(new_id, str) or not new_id or new_id == old_id:
+        raise SystemExit("FAIL: reloaded response has no distinct new_session_id")
+    print(f"reloaded\t{new_id}")
+elif status == "reload_initiated":
+    if content.get("transport_will_drop") is not True:
+        raise SystemExit("FAIL: reload_initiated response does not promise a transport drop")
+    if new_id not in (None, ""):
+        raise SystemExit("FAIL: reload_initiated response unexpectedly claims new_session_id")
+    print("reload_initiated\t")
+else:
+    raise SystemExit(
+        f"FAIL: editor_reload_plugin returned unsupported status={status!r}"
+    )
+' "$expected_old_session" <<< "$result"); then
+    return 1
+  fi
+
+  IFS=$'\t' read -r status new_session_id <<< "$parsed"
+  if [ "$status" = "reloaded" ]; then
+    TARGET_GODOT_SESSION="$new_session_id"
+    echo "External reload completed: ${expected_old_session:0:12}... -> ${new_session_id:0:12}..."
+    return 0
+  fi
+  wait_for_managed_reload "$old_capability" "$expected_old_session" "$expected_project"
+}
+
+# Initialize MCP session.
+echo "Initializing MCP session..."
+if ! initialize_mcp_session; then
   echo "ERROR: Could not initialize MCP session"
   exit 1
 fi
-
-curl -s "$SERVER_URL" -X POST "${HEADERS[@]}" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
-  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' > /dev/null
 
 # Resolve and pin the exact editor before the first scene mutation. An
 # explicit pin intentionally bypasses the checkout path check for supported
@@ -94,6 +245,10 @@ if ! TARGET_GODOT_SESSION=$(ci_select_godot_session \
   exit 1
 fi
 echo "Godot session selected: $TARGET_GODOT_SESSION"
+if ! EXPECTED_GODOT_PROJECT=$(ci_project_for_session \
+  "$SESSIONS" "$TARGET_GODOT_SESSION"); then
+  exit 1
+fi
 
 # --- Step 1: Create a cube with the OLD plugin ---
 echo "Creating test node with old plugin..."
@@ -110,29 +265,12 @@ print(f'Created node: {path}')
 
 # --- Step 2: Reload the plugin ---
 echo "Calling editor_reload_plugin..."
+OLD_HTTP_CAPABILITY="$HTTP_AUTH_CAPABILITY"
 RELOAD_RESULT=$(mcp_call_or_die "editor_reload_plugin" editor_reload_plugin '{}')
-echo "$RELOAD_RESULT" | python3 -c "
-import json, sys
-content = json.loads(sys.stdin.read())
-status = content.get('status', '')
-old_id = content.get('old_session_id', '')
-new_id = content.get('new_session_id', '')
-if status != 'reloaded':
-    print(f'FAIL: editor_reload_plugin returned status={status!r}, expected \"reloaded\"')
-    print(f'Full response: {content}')
-    sys.exit(1)
-if old_id == new_id:
-    print(f'FAIL: old and new session IDs are the same: {old_id}')
-    sys.exit(1)
-print(f'editor_reload_plugin OK: {old_id[:12]}... -> {new_id[:12]}...')
-"
-TARGET_GODOT_SESSION=$(python3 -c "
-import json, sys
-new_id = json.loads(sys.stdin.read()).get('new_session_id', '')
-if not new_id:
-    raise SystemExit('FAIL: editor_reload_plugin did not return new_session_id')
-print(new_id)
-" <<< "$RELOAD_RESULT")
+if ! accept_reload_result \
+  "$RELOAD_RESULT" "$OLD_HTTP_CAPABILITY" "$EXPECTED_GODOT_PROJECT"; then
+  exit 1
+fi
 
 # --- Step 3: Verify log buffer is fresh (proves plugin fully rebuilt) ---
 echo "Checking log buffer..."
@@ -209,14 +347,12 @@ print(f'Game-logs path OK: total={total}, returned={content.get(\"returned_count
 # calls — catches both single-reload and cumulative-state regressions.
 echo "Running 9 more reload iterations..."
 for i in $(seq 2 10); do
+  OLD_HTTP_CAPABILITY="$HTTP_AUTH_CAPABILITY"
   RELOAD_ITER_RESULT=$(mcp_call_or_die "editor_reload_plugin #$i" editor_reload_plugin '{}')
-  TARGET_GODOT_SESSION=$(python3 -c "
-import json, sys
-new_id = json.loads(sys.stdin.read()).get('new_session_id', '')
-if not new_id:
-    raise SystemExit('FAIL: editor_reload_plugin did not return new_session_id')
-print(new_id)
-" <<< "$RELOAD_ITER_RESULT")
+  if ! accept_reload_result \
+    "$RELOAD_ITER_RESULT" "$OLD_HTTP_CAPABILITY" "$EXPECTED_GODOT_PROJECT"; then
+    exit 1
+  fi
   # Rotate the post-reload probe across the three reported-stable tools.
   case $(( i % 3 )) in
     0)

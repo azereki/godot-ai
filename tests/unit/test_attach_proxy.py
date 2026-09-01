@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 
@@ -34,6 +35,7 @@ from godot_ai.attach.proxy import (
 )
 from godot_ai.fastmcp_compat import ToolResult
 from godot_ai.protocol.attach import ATTACH_PROTOCOL_VERSION
+from tests.conftest import TEST_HTTP_CAPABILITY
 
 
 def _status() -> BackendStatus:
@@ -361,7 +363,7 @@ async def test_second_laundered_initialize_failure_is_not_outcome_unknown() -> N
 
 
 async def test_downstream_http_client_has_no_read_deadline() -> None:
-    client = _http_client_factory()
+    client = _http_client_factory(lambda: TEST_HTTP_CAPABILITY)
     try:
         assert client.timeout.connect == 5.0
         assert client.timeout.read is None
@@ -369,6 +371,22 @@ async def test_downstream_http_client_has_no_read_deadline() -> None:
         assert client.timeout.pool == 5.0
     finally:
         await client.aclose()
+
+
+async def test_downstream_http_client_reads_capability_for_each_new_client() -> None:
+    current = [TEST_HTTP_CAPABILITY]
+    first = _http_client_factory(
+        lambda: current[0],
+        headers={"authorization": "Bearer stale-secret"},
+    )
+    current[0] = "r" * 32
+    second = _http_client_factory(lambda: current[0])
+    try:
+        assert first.headers["authorization"] == f"Bearer {TEST_HTTP_CAPABILITY}"
+        assert second.headers["authorization"] == f"Bearer {'r' * 32}"
+    finally:
+        await first.aclose()
+        await second.aclose()
 
 
 def test_exception_chain_descends_exception_groups() -> None:
@@ -629,13 +647,19 @@ def test_create_attach_proxy_wires_fresh_client_provider_and_outer_middleware(
     monkeypatch.setattr(proxy_module, "StreamableHttpTransport", FakeTransport)
     monkeypatch.setattr(proxy_module, "Client", FakeClient)
 
-    proxy = create_attach_proxy("http://127.0.0.1:8123/mcp", ensure, observe)
+    proxy = create_attach_proxy(
+        "http://127.0.0.1:8123/mcp",
+        ensure,
+        observe,
+        lambda: TEST_HTTP_CAPABILITY,
+    )
     provider = proxy.providers[1]
     client = provider.client_factory()
 
     assert isinstance(client, FakeClient)
     assert captured["url"] == "http://127.0.0.1:8123/mcp"
-    assert captured["factory"] is proxy_module._http_client_factory
+    assert isinstance(captured["factory"], partial)
+    assert captured["factory"].func is proxy_module._http_client_factory
     assert captured["timeout"] is None
     assert captured["init_timeout"] == proxy_module.DEFAULT_INIT_TIMEOUT_SECONDS
     assert isinstance(proxy.middleware[0], AttachRecoveryMiddleware)

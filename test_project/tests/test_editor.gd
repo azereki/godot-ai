@@ -3166,8 +3166,7 @@ func test_debugger_plugin_log_batch_no_buffer_is_safe() -> void:
 
 # ----- GameLogger._log_error arg routing (PR #78 smoke bug) -----
 
-# game_logger is a normal preloaded Logger script now that Godot 4.5 is the
-# support floor.
+# game_logger is a normal preloaded Logger script on every v4-supported engine.
 
 
 func test_game_logger_single_arg_push_warning_preserves_user_message() -> void:

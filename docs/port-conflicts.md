@@ -1,86 +1,62 @@
 # Port 8000 is in use by another process
 
-Godot AI's Python server listens on HTTP port `8000` (and WebSocket port
-`9500`). Port `8000` is a popular default for other dev tools — Django,
-`python -m http.server`, and many local servers grab it — so a genuinely
-foreign occupant is not rare.
+Godot AI's local Python backend listens on HTTP port `8000`; its authenticated
+editor WebSocket listens on `9500`. Port `8000` is also a common default for
+Django, `python -m http.server`, and other development servers.
 
-When a **non-godot-ai** process is already bound to `8000`, the dock can't
-reclaim the port (it has no proof it owns whatever is there), so it stops and
-shows a message like:
+When a foreign process owns either port, Godot AI does not kill or reuse it.
+The dock reports the conflict and suggests free replacements, for example:
 
 > Port 8000 is occupied by an incompatible server. Port 8001 is free — set
-> `godot_ai/http_port` in Editor Settings, then update your client config.
+> `godot_ai/http_port` in Editor Settings, then reconfigure your clients.
 
-The crash panel names a concrete free port for you. This guide covers the
-second half: changing the port and pointing your MCP clients at the new one.
+This guide covers that foreign-process case. If the dock identifies a stale
+Godot AI process that it can prove belongs to the same local account, use the
+dock's recovery action instead.
 
-> If the dock instead offers a **Restart Server** button, the occupant is an
-> older godot-ai server it *can* reclaim — click that rather than changing the
-> port. This guide is only for the foreign-process case.
+## 1. Choose free ports
 
-## 1. Pick free ports
+The plugin needs both an HTTP port and a WebSocket port. The conflict message
+suggests values checked by the plugin (for example `8001` and `9501`). On
+Windows the check also excludes Hyper-V, WSL2, and Docker reserved ranges.
 
-The plugin uses **two** ports: HTTP (`8000`, the one your MCP clients talk to)
-and WebSocket (`9500`, used internally between the server and the editor). The
-crash body suggests a free value for each (e.g. HTTP `8001`, WS `9501`). On
-Windows those suggestions are checked against the Hyper-V / WSL2 / Docker
-reservation table, so they won't themselves fail with `WinError 10013`. You can
-use the suggested ports or choose your own free ones.
+Move only the occupied port if the other one is free. Moving both is often
+simpler when another tool owns the same pair.
 
-If only port `8000` is taken, you technically only need to move the HTTP port —
-but the incompatible-server case that lands you here can hold both, so changing
-both settings is the reliable fix.
+## 2. Change the Editor Settings
 
-## 2. Change `godot_ai/http_port` and `godot_ai/ws_port` in Editor Settings
+1. Open **Editor → Editor Settings**.
+2. Set `godot_ai/http_port` to the chosen HTTP port.
+3. Set `godot_ai/ws_port` to the chosen WebSocket port.
+4. Reload the plugin from **Project → Project Settings → Plugins**, or restart
+   the editor.
 
-1. In the Godot editor, open **Editor → Editor Settings**.
-2. Search for `godot_ai/http_port` and set it to the free HTTP port from step 1
-   (e.g. `8001`).
-3. Search for `godot_ai/ws_port` and set it to the free WS port from step 1
-   (e.g. `9501`).
-4. Reload the plugin (toggle it off/on in **Project → Project Settings →
-   Plugins**, or restart the editor).
+These are Editor Settings, not Project Settings. They apply to every project
+opened by that Godot editor installation.
 
-> **Note:** both are **Editor Settings**, not project settings — they are
-> stored per editor install, so the change applies to *every* project you open
-> with this editor. If you only hit the conflict on one machine, remember to
-> revert them later if the foreign process goes away.
+## 3. Reconfigure every MCP client
 
-## 3. Reconfigure your MCP clients
+V4 clients do not persist a backend URL or bearer token. Every supported
+client launches the `godot-ai attach` stdio bridge, which obtains and rotates
+private local capabilities at runtime. The generated command still includes
+both port numbers, so a port change requires regeneration.
 
-Editor Settings only moves the *server*. URL-mode clients still point at the
-old URL (`http://127.0.0.1:8000/mcp`), while attach-mode Claude Desktop and
-Codex entries still carry the old HTTP and WebSocket ports in their `args`.
-Both need reconfiguration.
+In the dock, click **Configure** for each client (or **Configure all**). This
+rewrites the existing entry with the current exact package version, HTTP and
+WebSocket ports, excluded domains, and telemetry preference.
 
-The fastest way is the dock itself: each client row's **Configure** button
-rewrites that client's config with the current server URL, so once the server
-is on the new port, click **Configure** (or **Configure all**) again to rewrite
-every already-configured client.
+If you maintain an attach entry by hand, change the values after `--port` and
+`--ws-port`. Its relevant argv should look like:
 
-If you configured a client by hand, update its URL to use the new port. For
-example, for Claude Code:
-
-```bash
-claude mcp remove godot-ai
-claude mcp add --scope user --transport http godot-ai http://127.0.0.1:8001/mcp
+```text
+godot-ai attach --port 8001 --ws-port 9501
 ```
 
-For attach-mode Claude Desktop and Codex, re-running **Configure** is preferred
-because it updates both `--port` and `--ws-port` and re-verifies the package pin
-and excluded tool domains. If editing by hand, change the values following
-those two flags in the `args` array; there is no `url` field in an attach entry.
-
-For URL-mode config-file clients (Grok Build, Antigravity, Cursor, …), edit the
-`url` / `serverUrl` field to match the new HTTP port. See the **Manual Client
-Configuration** section in the [README](../README.md) for each client's file
-and format. Grok Build uses `~/.grok/config.toml`
-(`[mcp_servers.godot-ai]`).
+Do not replace it with `http://127.0.0.1:8001/mcp`. A persistent bare URL
+cannot carry the rotating private capability and is rejected by v4.
 
 ## Reverting
 
-If the foreign process is gone and you want the defaults back, set
-`godot_ai/http_port` back to `8000` and `godot_ai/ws_port` back to `9500` (or
-clear the overrides) in Editor Settings, reload the plugin, and re-run
-**Configure all** to point your clients back.
+After the foreign process is gone, set `godot_ai/http_port` back to `8000` and
+`godot_ai/ws_port` back to `9500` (or clear the overrides), reload the plugin,
+and run **Configure all** again.

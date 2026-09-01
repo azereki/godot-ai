@@ -110,7 +110,7 @@ def register_editor_tools(mcp: FastMCP, *, include_non_core: bool = True) -> Non
         Sources:
         - "plugin" (default): MCP plugin recv/send/event traffic. Buffer 500.
         - "game": stdout/stderr/push_error/push_warning from playing game
-          via ``_mcp_game_helper`` autoload (Godot 4.5+). Buffer 2000, with
+          via ``_mcp_game_helper`` autoload. Buffer 2000, with
           lines retained across runs and tagged by run_id. Default reads return
           current-run lines only; pass ``since_run_id`` from an earlier response
           to read that prior run. Entries: {source, level, text, run_id};
@@ -127,8 +127,8 @@ def register_editor_tools(mcp: FastMCP, *, include_non_core: bool = True) -> Non
         - "editor": editor-process script errors and the Debugger dock's
           visible Errors-tab rows — parse errors, GDScript reload warnings,
           @tool/EditorPlugin runtime errors, push_error/push_warning.
-          Logger-backed entries require Godot 4.5+; Errors-tab rows are read
-          from the editor UI when available. Use when the editor Output or
+          Logger-backed entries and Errors-tab rows are read from the editor
+          UI when available. Use when the editor Output or
           Debugger Errors panel shows red/yellow rows but other sources turned
           up nothing. Buffer 500 for logger-backed entries; Debugger rows are
           live UI state. Entries: {source, level, text, path, line, function}.

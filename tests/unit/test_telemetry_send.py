@@ -56,6 +56,20 @@ def _record(milestone: tel.MilestoneType | None = None) -> tel.TelemetryRecord:
 class TestSendOverHttpx:
     """Drive the real ``_send`` path with a mocked ``httpx.Client``."""
 
+    def test_later_env_opt_out_drops_an_already_queued_record(
+        self, monkeypatch, clean_env, isolated_data_dir
+    ) -> None:
+        """PR #931's dequeue guard closes the enqueue-to-send privacy race."""
+        monkeypatch.setenv("GODOT_AI_TELEMETRY_ENDPOINT", "https://example.com/x")
+        collector = tel.TelemetryCollector()
+        monkeypatch.setenv("GODOT_AI_DISABLE_TELEMETRY", "true")
+
+        with patch("godot_ai.telemetry.httpx.Client") as client_cls:
+            collector._send(_record())
+
+        client_cls.assert_not_called()
+        collector.shutdown()
+
     def test_empty_endpoint_short_circuits(self, clean_env, isolated_data_dir) -> None:
         ## With no endpoint set, _send must not even open an httpx.Client.
         ## Telemetry is on-by-default with a baked-in endpoint, so we

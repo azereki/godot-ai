@@ -20,7 +20,17 @@ from godot_ai.attach.lease import (
     LeaseRegistry,
 )
 from godot_ai.protocol.attach import SERVER_INSTANCE_ID, tool_catalog_hash
-from godot_ai.server import create_server
+from tests.conftest import (
+    TEST_HTTP_AUTH_HEADERS,
+    TEST_HTTP_CAPABILITY,
+)
+from tests.conftest import (
+    create_test_server as create_server,
+)
+
+
+def http_capability() -> str:
+    return TEST_HTTP_CAPABILITY
 
 
 class FakeClock:
@@ -290,6 +300,7 @@ def test_lease_routes_are_instance_bound() -> None:
     client = TestClient(
         server.http_app(transport="streamable-http"),
         base_url="http://127.0.0.1",
+        headers=TEST_HTTP_AUTH_HEADERS,
     )
 
     wrong = client.post(
@@ -332,7 +343,11 @@ def test_lease_register_route_refuses_past_the_cap() -> None:
     """The HTTP surface must surface the ceiling, not grow without bound."""
     server = create_server(ws_port=9562)
     app = server.http_app(transport="streamable-http")
-    client = TestClient(app, base_url="http://127.0.0.1")
+    client = TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        headers=TEST_HTTP_AUTH_HEADERS,
+    )
 
     ## The instance_id an attacker needs is handed out unauthenticated.
     status = client.get("/godot-ai/status").json()
@@ -370,6 +385,7 @@ def test_lease_routes_validate_bodies_and_release_errors() -> None:
     client = TestClient(
         server.http_app(transport="streamable-http"),
         base_url="http://127.0.0.1",
+        headers=TEST_HTTP_AUTH_HEADERS,
     )
 
     invalid_json = client.post(
@@ -479,6 +495,7 @@ async def test_lease_client_reregisters_after_backend_instance_change() -> None:
     lease = LeaseClient(
         "http://127.0.0.1:8000",
         ensure_backend,
+        http_capability,
         transport=httpx.MockTransport(handler),
     )
     await lease.start(SimpleNamespace(instance_id="instance-a"))
@@ -489,6 +506,42 @@ async def test_lease_client_reregisters_after_backend_instance_change() -> None:
         assert registrations == ["instance-a", "instance-b"]
     finally:
         await lease.close()
+
+
+async def test_lease_client_reads_rotated_capability_for_each_request() -> None:
+    current = [TEST_HTTP_CAPABILITY]
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["authorization"])
+        return httpx.Response(
+            200,
+            json={
+                "instance_id": "instance-a",
+                "lease_id": "lease-a",
+                "lease_ttl_seconds": 30,
+                "heartbeat_after_seconds": 10,
+                "released": request.url.path.endswith("/release"),
+            },
+        )
+
+    async def ensure_backend() -> SimpleNamespace:
+        return SimpleNamespace(instance_id="instance-a")
+
+    lease = LeaseClient(
+        "http://127.0.0.1:8000",
+        ensure_backend,
+        lambda: current[0],
+        transport=httpx.MockTransport(handler),
+    )
+    await lease._register("instance-a")
+    current[0] = "r" * 32
+    await lease._heartbeat_once()
+
+    assert seen == [
+        f"Bearer {TEST_HTTP_CAPABILITY}",
+        f"Bearer {'r' * 32}",
+    ]
 
 
 async def test_lease_start_recovers_registration_race_and_sync_is_idempotent() -> None:
@@ -517,6 +570,7 @@ async def test_lease_start_recovers_registration_race_and_sync_is_idempotent() -
     lease = LeaseClient(
         "http://127.0.0.1:8000",
         ensure_backend,
+        http_capability,
         transport=httpx.MockTransport(handler),
     )
     await lease.start(SimpleNamespace(instance_id="instance-a"))
@@ -532,7 +586,7 @@ async def test_lease_close_handles_empty_state_and_release_transport_failure() -
     async def ensure_backend() -> SimpleNamespace:
         return SimpleNamespace(instance_id="instance-a")
 
-    empty = LeaseClient("http://127.0.0.1:8000", ensure_backend)
+    empty = LeaseClient("http://127.0.0.1:8000", ensure_backend, http_capability)
     await empty.close()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -551,6 +605,7 @@ async def test_lease_close_handles_empty_state_and_release_transport_failure() -
     lease = LeaseClient(
         "http://127.0.0.1:8000",
         ensure_backend,
+        http_capability,
         transport=httpx.MockTransport(handler),
     )
     await lease.start(SimpleNamespace(instance_id="instance-a"))
@@ -591,6 +646,7 @@ async def test_lease_client_rejects_mismatched_registration_and_heartbeat() -> N
     lease = LeaseClient(
         "http://127.0.0.1:8000",
         ensure_backend,
+        http_capability,
         transport=httpx.MockTransport(handler),
     )
     with pytest.raises(ValueError, match="different backend instance"):
@@ -610,7 +666,7 @@ async def test_heartbeat_requires_a_registered_lease() -> None:
     async def ensure_backend() -> SimpleNamespace:
         return SimpleNamespace(instance_id="instance-a")
 
-    lease = LeaseClient("http://127.0.0.1:8000", ensure_backend)
+    lease = LeaseClient("http://127.0.0.1:8000", ensure_backend, http_capability)
     with pytest.raises(LeaseNotFound, match="no registered lease"):
         await lease._heartbeat_once()
 
@@ -625,7 +681,7 @@ async def test_heartbeat_loop_survives_failed_recovery(monkeypatch: pytest.Monke
         request = httpx.Request("POST", "http://127.0.0.1/heartbeat")
         raise httpx.ConnectError("heartbeat refused", request=request)
 
-    lease = LeaseClient("http://127.0.0.1:8000", ensure_backend)
+    lease = LeaseClient("http://127.0.0.1:8000", ensure_backend, http_capability)
     lease._heartbeat_after = 0.001
     monkeypatch.setattr(lease, "_heartbeat_once", fail_heartbeat)
     monkeypatch.setattr(

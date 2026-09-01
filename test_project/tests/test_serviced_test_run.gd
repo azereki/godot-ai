@@ -265,7 +265,11 @@ func test_handler_discovery_checkpoint_outcomes() -> void:
 func test_connection_classify_message() -> void:
 	var conn := McpConnection.new()
 	track(conn)
-	var ack: Dictionary = conn._classify_message('{"type":"handshake_ack","server_version":"9.9.9"}')
+	var challenge: Dictionary = conn._classify_message('{"type":"auth_challenge"}')
+	assert_eq(challenge["kind"], "challenge", "challenge classified")
+	var ack: Dictionary = conn._classify_message(
+		'{"type":"handshake_ack","protocol_version":2,"server_version":"9.9.9"}'
+	)
 	assert_eq(ack["kind"], "ack", "ack classified")
 	var cmd: Dictionary = conn._classify_message(
 		'{"request_id":"r1","command":"node_create","params":{}}'
@@ -278,11 +282,15 @@ func test_connection_classify_message() -> void:
 	assert_eq(conn._classify_message('{"type":"other"}')["kind"], "ignore", "unknown dict ignored")
 
 
-func test_connection_ack_handling_shared_by_service_path() -> void:
+func test_connection_service_path_rejects_late_handshake_frames() -> void:
 	var conn := McpConnection.new()
 	track(conn)
-	conn._service_handle_message('{"type":"handshake_ack","server_version":"7.7.7"}', 1)
-	assert_eq(conn.server_version, "7.7.7", "ack processed during exclusive servicing")
+	conn._handshake_complete = true
+	conn.server_version = "authenticated"
+	conn._service_handle_message(
+		'{"type":"handshake_ack","protocol_version":2,"server_version":"7.7.7"}', 1
+	)
+	assert_eq(conn.server_version, "authenticated", "late ACK cannot rewrite authenticated state")
 
 
 func test_connection_service_reject_shape() -> void:

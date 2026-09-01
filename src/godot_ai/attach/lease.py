@@ -12,16 +12,16 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from godot_ai.transport.capability import validate_capability
+
 DEFAULT_LEASE_TTL_SECONDS = 30.0
 DEFAULT_HEARTBEAT_AFTER_SECONDS = 10.0
 
 ## Ceiling on simultaneously-registered leases. One attach bridge holds
 ## exactly one lease, so this is far above any legitimate multi-client
-## setup; it exists because the lease routes are reachable by any local
-## process (they are loopback-guarded, not authenticated, and the
-## ``instance_id`` they require is published by the unauthenticated
-## ``/godot-ai/status`` probe). Without a ceiling, a local peer could grow
-## the registry without bound — and, because a live lease defers both the
+## setup. Authentication makes the routes private to this launch, while the
+## ceiling keeps a buggy or compromised capability holder from growing the
+## registry without bound — and, because a live lease defers both the
 ## owner-PID watchdog and the idle backstop (see ``orphan_reaper``), pin a
 ## plugin-spawned backend alive indefinitely rather than for one lease TTL.
 DEFAULT_MAX_ACTIVE_LEASES = 64
@@ -159,8 +159,8 @@ class LeaseRegistry:
         ## Capping ``_expiries`` alone does NOT bound the heap. Every heartbeat
         ## and every register pushes an entry dated one TTL in the future, and
         ## ``prune`` can only pop entries that have already expired — so an
-        ## unauthenticated loopback caller heartbeating one valid lease (or
-        ## churning register/release) in a tight loop grows the heap without
+        ## caller heartbeating one valid lease (or churning register/release)
+        ## in a tight loop grows the heap without
         ## limit inside a single TTL. Measured at 50k stale entries for ONE
         ## live lease before this compaction existed.
         ##
@@ -185,6 +185,7 @@ class LeaseRegistry:
 
 
 EnsureBackend = Callable[[], Awaitable[Any]]
+CapabilityProvider = Callable[[], str]
 HttpTransport = httpx.AsyncBaseTransport | httpx.AsyncHTTPTransport | None
 
 
@@ -195,12 +196,14 @@ class LeaseClient:
         self,
         base_url: str,
         ensure_backend: EnsureBackend,
+        capability_provider: CapabilityProvider,
         *,
         request_timeout: float = 5.0,
         transport: HttpTransport = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._ensure_backend = ensure_backend
+        self._capability_provider = capability_provider
         self._request_timeout = request_timeout
         self._transport = transport
         self._instance_id: str | None = None
@@ -310,6 +313,9 @@ class LeaseClient:
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
+            headers={
+                "Authorization": f"Bearer {validate_capability(self._capability_provider())}"
+            },
             timeout=self._request_timeout,
             transport=self._transport,
             trust_env=False,

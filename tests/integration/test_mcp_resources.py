@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+from tests.conftest import allocate_free_ports, create_test_server
+
 
 def _parse_resource(result) -> dict:
     """Extract JSON dict from a ReadResourceResult."""
@@ -12,12 +14,16 @@ def _parse_resource(result) -> dict:
 
 
 class TestNoActiveSessionResource:
-    async def test_project_info_resource_explains_missing_editor_session(self):
+    async def test_project_info_resource_explains_missing_editor_session(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
         from fastmcp import Client
 
-        from godot_ai.server import create_server
-
-        mcp = create_server(ws_port=19603)
+        http_port, ws_port = allocate_free_ports(2)
+        monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path))
+        mcp = create_test_server(ws_port=ws_port, http_port=http_port)
         async with Client(mcp) as client:
             result = await client.read_resource("godot://project/info")
 
@@ -43,7 +49,7 @@ class TestSessionsResource:
 
         assert data["count"] == 1
         assert data["sessions"][0]["session_id"] == "mcp-test"
-        assert data["sessions"][0]["godot_version"] == "4.4.1"
+        assert data["sessions"][0]["godot_version"] == "4.7.0"
         assert data["sessions"][0]["is_active"] is True
 
 
@@ -112,9 +118,7 @@ class TestSceneHierarchyResource:
 
     async def test_large_tree_is_capped_and_hinted(self, mcp_stack):
         client, plugin = mcp_stack
-        nodes = [
-            {"name": f"N{i}", "type": "Node", "path": f"/Main/N{i}"} for i in range(100)
-        ]
+        nodes = [{"name": f"N{i}", "type": "Node", "path": f"/Main/N{i}"} for i in range(100)]
 
         async def respond():
             cmd = await plugin.recv_command()
@@ -140,34 +144,6 @@ class TestSceneHierarchyResource:
         assert data["has_more"] is True
         assert data["resource_truncated"] is True
         assert "250" in data["hint"]
-        assert "scene_get_hierarchy" in data["hint"]
-
-    async def test_old_plugin_fallback_also_caps_and_hints(self, mcp_stack):
-        ## Old/skewed plugins ignore offset/limit and return the whole node list
-        ## with no `has_more`. scene_get_hierarchy's fallback then slices to the
-        ## cap and stamps `has_more`, so the resource must still truncate + hint
-        ## on that path too (Copilot).
-        client, plugin = mcp_stack
-        nodes = [
-            {"name": f"N{i}", "type": "Node", "path": f"/Main/N{i}"} for i in range(150)
-        ]
-
-        async def respond():
-            cmd = await plugin.recv_command()
-            assert cmd["command"] == "get_scene_tree"
-            ## No has_more / offset / limit in the response — the old-plugin shape.
-            await plugin.send_response(cmd["request_id"], {"nodes": nodes})
-
-        task = asyncio.create_task(respond())
-        result = await client.read_resource("godot://scene/hierarchy")
-        await task
-
-        data = _parse_resource(result)
-        assert len(data["nodes"]) == 100, "fallback must slice to the cap"
-        assert data["total_count"] == 150
-        assert data["has_more"] is True
-        assert data["resource_truncated"] is True
-        assert "150" in data["hint"]
         assert "scene_get_hierarchy" in data["hint"]
 
 
@@ -209,7 +185,7 @@ class TestProjectInfoResource:
         data = _parse_resource(result)
 
         assert data["session_id"] == "mcp-test"
-        assert data["godot_version"] == "4.4.1"
+        assert data["godot_version"] == "4.7.0"
         assert data["project_path"] == "/tmp/test_project"
         assert "connected_at" not in data
 
@@ -254,7 +230,10 @@ class TestLogsRecentResource:
             cmd = await plugin.recv_command()
             assert cmd["command"] == "get_logs"
             assert cmd["params"]["count"] == 100
-            await plugin.send_response(cmd["request_id"], {"lines": lines})
+            await plugin.send_response(
+                cmd["request_id"],
+                {"lines": [{"source": "plugin", "level": "info", "text": line} for line in lines]},
+            )
 
         task = asyncio.create_task(respond())
         result = await client.read_resource("godot://logs/recent")

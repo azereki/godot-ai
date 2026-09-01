@@ -11,6 +11,7 @@ import pytest
 import godot_ai
 from godot_ai.attach import main as attach_main_module
 from godot_ai.attach.ensure import AttachStartupError
+from tests.conftest import TEST_HTTP_CAPABILITY
 
 
 def test_root_main_dispatches_attach_before_legacy_parser(monkeypatch) -> None:
@@ -72,10 +73,15 @@ async def test_run_attach_wires_ensure_observer_proxy_and_lease(monkeypatch) -> 
             events.append("ensure")
             return backend_status
 
+        def http_capability(self) -> str:
+            events.append("capability")
+            return TEST_HTTP_CAPABILITY
+
     class FakeLease:
-        def __init__(self, base_url: str, ensure_backend) -> None:
+        def __init__(self, base_url: str, ensure_backend, capability_provider) -> None:
             events.append(("lease", base_url))
             self.ensure_backend = ensure_backend
+            assert capability_provider() == TEST_HTTP_CAPABILITY
 
         async def start(self, status) -> None:
             events.append(("start", status.instance_id))
@@ -96,9 +102,10 @@ async def test_run_attach_wires_ensure_observer_proxy_and_lease(monkeypatch) -> 
         events.append(("observe", port, timeout))
         return backend_status
 
-    def fake_create_proxy(mcp_url: str, ensure_ready, observe_backend):
+    def fake_create_proxy(mcp_url: str, ensure_ready, observe_backend, capability_provider):
         nonlocal ready, observe
         events.append(("proxy", mcp_url))
+        assert capability_provider() == TEST_HTTP_CAPABILITY
         ready = ensure_ready
         observe = observe_backend
         return FakeProxy()

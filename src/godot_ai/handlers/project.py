@@ -63,33 +63,8 @@ async def project_run(
 
 
 async def project_stop(runtime: DirectRuntime) -> dict:
-    """Stop the running game and reflect authoritative readiness in the session.
-
-    New plugins (issue #29) defer the stop response until after
-    `EditorInterface.stop_playing_scene()` has ticked two frames, then return
-    `readiness_after` in the payload — a ground-truth snapshot of
-    `McpConnection.get_readiness()` after the stop settled. We copy that straight
-    onto `session.readiness` so the next write tool can't race the
-    `readiness_changed` event.
-
-    Older plugins (pre-#29) omit `readiness_after` and the server still needs
-    to wait for the `readiness_changed` event. We fall back to polling
-    `session.readiness` bounded by a 1s timeout — a hung play process leaves
-    readiness at "playing" and the next write tool correctly blocks with
-    EDITOR_NOT_READY.
-    """
     result = await runtime.send_command("stop_project")
-    if sync_readiness_from_snapshot(runtime, result.get("readiness_after")):
-        return result
-
-    session = runtime.get_active_session()
-    if session is None:
-        return result
-
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + 1.0
-    while session.readiness == "playing" and loop.time() < deadline:
-        await asyncio.sleep(0.02)
+    sync_readiness_from_snapshot(runtime, result.get("readiness_after"))
     return result
 
 

@@ -11,9 +11,9 @@ from godot_ai.handlers import editor as editor_handlers
 from godot_ai.handlers._readiness import (
     _IMPORTING_HOLD_CAP_SECONDS,
     _IMPORTING_HOLD_PROBE_INTERVAL_SECONDS,
-    KNOWN_READINESS,
     require_writable_async,
 )
+from godot_ai.protocol.envelope import KNOWN_READINESS
 from godot_ai.protocol.errors import ErrorCode
 from godot_ai.runtime.direct import DirectRuntime
 from godot_ai.sessions.registry import Session, SessionRegistry
@@ -114,7 +114,7 @@ async def test_editor_state_overwrites_stale_playing_cache():
     result = await editor_handlers.editor_state(runtime)
 
     assert result["readiness"] == "ready"
-    assert session.readiness == "ready"
+    assert runtime.get_session(session.session_id).readiness == "ready"
     # Followup require_writable_async now sees the refreshed cache and lets
     # the caller through. This is the critical end-to-end invariant —
     # without it, editor_state -> scene_save still fails with the stale
@@ -129,7 +129,7 @@ async def test_editor_state_syncs_playing_when_truly_playing():
 
     await editor_handlers.editor_state(runtime)
 
-    assert session.readiness == "playing"
+    assert runtime.get_session(session.session_id).readiness == "playing"
     with pytest.raises(GodotCommandError):
         await require_writable_async(runtime)
 
@@ -140,7 +140,7 @@ async def test_editor_state_ignores_missing_readiness_field():
 
     await editor_handlers.editor_state(runtime)
 
-    assert session.readiness == "ready"
+    assert runtime.get_session(session.session_id).readiness == "ready"
 
 
 async def test_editor_state_ignores_unknown_readiness_field():
@@ -151,7 +151,7 @@ async def test_editor_state_ignores_unknown_readiness_field():
 
     await editor_handlers.editor_state(runtime)
 
-    assert session.readiness == "ready"
+    assert runtime.get_session(session.session_id).readiness == "ready"
 
 
 async def test_editor_state_no_session_is_no_op():
@@ -202,7 +202,9 @@ async def test_require_writable_async_probe_heals_stale_playing_cache():
     runtime, session, client = _runtime_with_stub(cached="playing", plugin_reports="ready")
     await require_writable_async(runtime)
     assert client.probe_calls == 1
-    assert session.readiness == "ready", "probe must heal the cache before letting the call through"
+    assert runtime.get_session(session.session_id).readiness == "ready", (
+        "probe must heal the cache before letting the call through"
+    )
 
 
 # --- #651 stage 2: bounded hold on live-confirmed importing.
@@ -286,7 +288,7 @@ async def test_require_writable_async_importing_hold_clears_early():
 
     # Initial confirm + two hold re-probes; the second re-probe saw "ready".
     assert client.probe_calls == 3
-    assert session.readiness == "ready"
+    assert runtime.get_session(session.session_id).readiness == "ready"
     assert fake.sleeps == [_IMPORTING_HOLD_PROBE_INTERVAL_SECONDS] * 2
     assert fake.now < _IMPORTING_HOLD_CAP_SECONDS, "must exit as soon as importing clears"
 
@@ -420,7 +422,7 @@ async def test_require_writable_async_probe_failure_falls_back_to_cached_value()
 
 async def test_require_writable_async_probe_handles_unknown_state_gracefully():
     """Forward-compat: if the probe returns a state the server doesn't
-    know yet, sync_readiness_for_session is a no-op and we enforce
+    know yet, the table transition is a no-op and we enforce
     against the prior cached value. A future plugin's new state name
     can't accidentally let a write slip through or get blocked."""
     runtime, session, client = _runtime_with_stub(
@@ -429,7 +431,7 @@ async def test_require_writable_async_probe_handles_unknown_state_gracefully():
     with pytest.raises(GodotCommandError):
         await require_writable_async(runtime)
     assert client.probe_calls == 1
-    assert session.readiness == "playing"
+    assert runtime.get_session(session.session_id).readiness == "playing"
 
 
 def test_known_readiness_matches_plugin_get_readiness_source():
@@ -507,4 +509,4 @@ async def test_require_writable_async_pins_session_across_slow_path():
     assert client.calls == ["sess-a"]
     assert runtime.active_session_id == "sess-a"
     assert registry.active_session_id == "sess-b"
-    assert session_a.readiness == "ready"
+    assert registry.get("sess-a").readiness == "ready"

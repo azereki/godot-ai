@@ -102,7 +102,8 @@ binary_format/embed_pck=false
 EOF
 
 echo "==> Importing fixture project"
-"$GODOT_BIN" --headless --path "$FIXTURE" --import > "$WORK/import.log" 2>&1 || true
+"$GODOT_BIN" --headless --path "$FIXTURE" --import \
+  --log-file "$WORK/import-godot.log" > "$WORK/import.log" 2>&1 || true
 if [ ! -d "$FIXTURE/.godot" ]; then
   echo "FAIL: --import produced no .godot directory"
   tail -50 "$WORK/import.log"
@@ -126,7 +127,8 @@ run_one() {
   local run_log="$WORK/$preset-run.log"
 
   echo "==> Exporting preset '$preset'"
-  "$GODOT_BIN" --headless --path "$FIXTURE" --export-pack "$preset" "$pck" > "$export_log" 2>&1 \
+  "$GODOT_BIN" --headless --path "$FIXTURE" --export-pack "$preset" "$pck" \
+    --log-file "${export_log}.godot" > "$export_log" 2>&1 \
     || fail "--export-pack '$preset' exited nonzero" "$export_log"
   [ -f "$pck" ] || fail "no pack produced for '$preset'" "$export_log"
 
@@ -139,7 +141,8 @@ run_one() {
   echo "==> Booting exported pack '$preset'"
   # --quit-after is a frame-count backstop in case the probe never runs;
   # the probe itself quits in _ready.
-  (cd "$WORK" && "$GODOT_BIN" --headless --main-pack "$pck" --quit-after 300 > "$run_log" 2>&1) || true
+  (cd "$WORK" && "$GODOT_BIN" --headless --main-pack "$pck" --quit-after 300 \
+    --log-file "${run_log}.godot" > "$run_log" 2>&1) || true
 
   grep -q "PROBE autoload_setting=<absent>" "$run_log" \
     || fail "exported pack '$preset' still carries the autoload setting (or probe never ran)" "$run_log"

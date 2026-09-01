@@ -14,13 +14,23 @@ source "$(dirname "$0")/_ci_env.sh"
 PYTHON_CMD="${1:-python}"
 PORT=8000
 SERVER_URL="http://127.0.0.1:$PORT/mcp"
+STATUS_URL="http://127.0.0.1:$PORT/godot-ai/status"
+
+if [ -z "${GODOT_AI_HTTP_CAPABILITY:-}" ] && [ -z "${GODOT_AI_WS_TOKEN:-}" ]; then
+  IFS=$'\t' read -r GODOT_AI_HTTP_CAPABILITY GODOT_AI_WS_TOKEN < <(
+    "$PYTHON_CMD" -c 'from godot_ai.transport.capability import generate_capabilities; c = generate_capabilities(); print(c.http, c.websocket, sep="\t")'
+  )
+elif [ -z "${GODOT_AI_HTTP_CAPABILITY:-}" ] || [ -z "${GODOT_AI_WS_TOKEN:-}" ]; then
+  echo "ERROR: HTTP and WebSocket capabilities must be supplied together" >&2
+  exit 1
+fi
+export GODOT_AI_HTTP_CAPABILITY GODOT_AI_WS_TOKEN
 
 $PYTHON_CMD -m godot_ai --transport streamable-http --port $PORT &
 
 for i in $(seq 1 30); do
-  if curl -s -o /dev/null "$SERVER_URL" -X POST \
-    -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}'; then
+  if curl --fail --silent --output /dev/null --max-filesize 65536 \
+    -H "Authorization: Bearer $GODOT_AI_HTTP_CAPABILITY" "$STATUS_URL"; then
     echo "Server ready on port $PORT"
     exit 0
   fi

@@ -4,23 +4,27 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import hmac
 import json
 import logging
 import re
-from typing import Any
+import secrets
+from functools import partial
+from typing import Any, TypeVar
 
 import websockets
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from websockets.asyncio.server import ServerConnection
 
 from godot_ai import __version__ as _SERVER_VERSION
-from godot_ai.handlers._readiness import sync_readiness_for_session
 from godot_ai.protocol.envelope import (
+    WS_PROTOCOL_VERSION,
+    AuthenticatedHandshake,
+    AuthenticationHello,
     CommandRequest,
     CommandResponse,
     CustomToolsChangedEvent,
-    HandshakeMessage,
     PlayStateChangedEvent,
     PluginTelemetryEvent,
     ReadinessChangedEvent,
@@ -34,15 +38,225 @@ from godot_ai.transport.origin_guard import make_websocket_request_guard
 logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 9500
+DEFAULT_MAX_OPEN_CONNECTIONS = 32
+DEFAULT_OPEN_TIMEOUT_SECONDS = 5.0
+DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 5.0
+DEFAULT_MAX_HANDSHAKE_FRAME_BYTES = 8 * 1024
+DEFAULT_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_DECODED_MESSAGES = 4
 
 ## RFC 6455 reserves 4000-4999 for application-defined close codes; we use
 ## 4001 to flag a handshake rejected for duplicate session_id so a debugging
 ## peer can distinguish it from a normal close.
 _CLOSE_CODE_DUPLICATE_SESSION = 4001
-## Handshake carried an auth token that doesn't match this server launch's
-## token (#690). Only ever sent when the server was launched with
-## GODOT_AI_WS_TOKEN; tokenless handshakes are accepted for compat.
-_CLOSE_CODE_AUTH_TOKEN_MISMATCH = 4003
+## Mixed pre-v4/v4 peers fail explicitly instead of entering a legacy parser.
+_CLOSE_CODE_PROTOCOL_MISMATCH = 4002
+## Missing, stale, or wrong editor capability. No weaker retry exists.
+_CLOSE_CODE_AUTH_FAILED = 4003
+
+_CAPABILITY_RE = re.compile(r"^[0-9a-f]{64}$")
+_SERVER_PROOF_DOMAIN = "godot-ai-ws-v2/server-proof"
+_CLIENT_PROOF_DOMAIN = "godot-ai-ws-v2/client-proof"
+_MIN_GODOT_VERSION = (4, 7)
+
+
+def _proof_message(domain: str, values: tuple[str | int, ...]) -> bytes:
+    """Encode an unambiguous, domain-separated handshake transcript."""
+
+    message = bytearray(domain.encode("ascii"))
+    for value in values:
+        encoded = str(value).encode("utf-8")
+        message.extend(b"\n")
+        message.extend(str(len(encoded)).encode("ascii"))
+        message.extend(b":")
+        message.extend(encoded)
+    return bytes(message)
+
+
+def _supports_v4_editor(godot_version: str) -> bool:
+    # Engine.get_version_info().string uses a hyphen before status in Godot
+    # 4.7 (for example ``4.7-stable (official)``); older patch-bearing forms
+    # use a dot. Require either real delimiter after the complete minor number,
+    # while accepting both official display formats.
+    match = re.match(r"^(\d+)\.(\d+)(?:[.-]|$)", godot_version)
+    if match is None:
+        return False
+    major, minor = map(int, match.groups())
+    return major == _MIN_GODOT_VERSION[0] and minor >= _MIN_GODOT_VERSION[1]
+
+
+def _hmac_proof(capability: str, domain: str, values: tuple[str | int, ...]) -> str:
+    if not _CAPABILITY_RE.fullmatch(capability):
+        raise ValueError("editor WebSocket capability must be 32 lowercase-hex bytes")
+    return hmac.new(
+        capability.encode("ascii"),
+        _proof_message(domain, values),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def websocket_server_proof(
+    capability: str,
+    *,
+    client_nonce: str,
+    server_nonce: str,
+    server_version: str = _SERVER_VERSION,
+) -> str:
+    """Prove server capability possession without receiving editor metadata."""
+
+    return _hmac_proof(
+        capability,
+        _SERVER_PROOF_DOMAIN,
+        (WS_PROTOCOL_VERSION, client_nonce, server_nonce, server_version),
+    )
+
+
+def websocket_client_proof(
+    capability: str,
+    *,
+    client_nonce: str,
+    server_nonce: str,
+    session_id: str,
+    godot_version: str,
+    project_path: str,
+    plugin_version: str,
+    readiness: str,
+    editor_pid: int,
+    server_launch_mode: str,
+    server_version: str = _SERVER_VERSION,
+) -> str:
+    """Bind editor authentication to the verified challenge and all metadata."""
+
+    return _hmac_proof(
+        capability,
+        _CLIENT_PROOF_DOMAIN,
+        (
+            WS_PROTOCOL_VERSION,
+            client_nonce,
+            server_nonce,
+            server_version,
+            session_id,
+            godot_version,
+            project_path,
+            plugin_version,
+            readiness,
+            editor_pid,
+            server_launch_mode,
+        ),
+    )
+
+
+class _BoundedOpeningServerConnection(ServerConnection):
+    """Abort raw sockets beyond the server's pre-auth connection budget."""
+
+    def __init__(self, *args: Any, opening_limit: int, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._opening_limit = opening_limit
+        self._rejected_at_open = False
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        super().connection_made(transport)
+        ## websockets registers this connection's handler synchronously in
+        ## ``handler_tasks`` above. Counting that set bounds HTTP upgrades,
+        ## half-open handshakes, pending reservations, and active peers with
+        ## one cheap admission check before attacker bytes are processed.
+        handlers = getattr(self.server, "handler_tasks", None)
+        if handlers is None or len(handlers) > self._opening_limit:
+            self._rejected_at_open = True
+            transport.abort()
+
+    def data_received(self, data: bytes) -> None:
+        if not self._rejected_at_open:
+            super().data_received(data)
+
+
+class _HandshakeFailure(Exception):
+    def __init__(self, code: int, reason: str) -> None:
+        self.code = code
+        self.reason = reason
+        super().__init__(reason)
+
+
+_HandshakeModel = TypeVar("_HandshakeModel", bound=BaseModel)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _strict_json_loads(raw: str | bytes) -> Any:
+    return json.loads(
+        raw,
+        object_pairs_hook=_unique_json_object,
+        parse_constant=_reject_json_constant,
+    )
+
+
+def _remaining_handshake_time(deadline: float) -> float:
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise _HandshakeFailure(1008, "v4 editor handshake timed out")
+    return remaining
+
+
+async def _receive_handshake_frame(
+    ws: ServerConnection,
+    deadline: float,
+    model: type[_HandshakeModel],
+) -> _HandshakeModel:
+    try:
+        raw = await asyncio.wait_for(ws.recv(), _remaining_handshake_time(deadline))
+    except asyncio.TimeoutError as exc:
+        raise _HandshakeFailure(1008, "v4 editor handshake timed out") from exc
+    if not isinstance(raw, str):
+        raise _HandshakeFailure(1008, "v4 editor handshake requires text JSON")
+    if len(raw.encode("utf-8")) > DEFAULT_MAX_HANDSHAKE_FRAME_BYTES:
+        raise _HandshakeFailure(1009, "v4 editor handshake frame too large")
+    try:
+        data = _strict_json_loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise _HandshakeFailure(1008, "invalid v4 editor handshake JSON") from exc
+    if not isinstance(data, dict):
+        raise _HandshakeFailure(1008, "invalid v4 editor handshake object")
+    if data.get("protocol_version") != WS_PROTOCOL_VERSION:
+        raise _HandshakeFailure(
+            _CLOSE_CODE_PROTOCOL_MISMATCH,
+            f"Godot AI v4 WebSocket protocol {WS_PROTOCOL_VERSION} required",
+        )
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:
+        expected_type = "auth_hello" if model is AuthenticationHello else "auth_response"
+        if data.get("type") != expected_type:
+            raise _HandshakeFailure(
+                _CLOSE_CODE_PROTOCOL_MISMATCH,
+                f"Godot AI v4 expected {expected_type}",
+            ) from exc
+        raise _HandshakeFailure(1008, f"invalid v4 {expected_type}") from exc
+
+
+async def _send_handshake_frame(
+    ws: ServerConnection,
+    deadline: float,
+    payload: dict[str, Any],
+) -> None:
+    try:
+        await asyncio.wait_for(
+            ws.send(json.dumps(payload, separators=(",", ":"))),
+            _remaining_handshake_time(deadline),
+        )
+    except asyncio.TimeoutError as exc:
+        raise _HandshakeFailure(1008, "v4 editor handshake timed out") from exc
+
 
 ## Allowlist of plugin-emitted telemetry event names. Drop everything else
 ## silently; the plugin and server lists must stay in sync. Plugin-side
@@ -114,18 +328,23 @@ class GodotWebSocketServer:
         registry: SessionRegistry,
         port: int = DEFAULT_PORT,
         auth_token: str | None = None,
+        *,
+        max_open_connections: int = DEFAULT_MAX_OPEN_CONNECTIONS,
     ):
         self.registry = registry
         self.port = port
-        ## Per-launch handshake auth token (#690). The spawning plugin
-        ## generates it and hands it to us via the GODOT_AI_WS_TOKEN spawn
-        ## env; a handshake carrying a DIFFERENT token is rejected. A
-        ## handshake carrying no token is still accepted — older plugins
-        ## and editors adopting a server they didn't spawn have no token,
-        ## and the field is attacker-omittable anyway, so this is defense
-        ## in depth on top of loopback-only binding (see AGENTS.md's WS
-        ## trust-boundary note), not an authentication boundary.
-        self._auth_token = auth_token or None
+        if auth_token is not None and not _CAPABILITY_RE.fullmatch(auth_token):
+            raise ValueError("editor WebSocket capability must be 32 lowercase-hex bytes")
+        if max_open_connections <= 0:
+            raise ValueError("max_open_connections must be positive")
+        ## None is a deliberately locked editor bridge, not a tokenless mode:
+        ## HTTP/status may still start so lifecycle diagnostics remain
+        ## available, but every editor connection fails closed until the
+        ## capability bootstrap supplies a fresh 32-byte value.
+        self._auth_token = auth_token
+        self._max_open_connections = int(max_open_connections)
+        self._ready_event = asyncio.Event()
+        self._startup_error: BaseException | None = None
         ## Coalesced tools/list_changed broadcast. Broadcasts run OFF the
         ## per-editor receive loop (a stalled MCP transport must not delay
         ## queued command responses behind its notify_timeout_s cap), and at
@@ -134,15 +353,6 @@ class GodotWebSocketServer:
         ## trailing re-notification, not N queued tasks.
         self._broadcast_task: asyncio.Task | None = None
         self._broadcast_rerun: bool = False
-        ## request_id -> (owner session_id, future). The session id is part
-        ## of the entry (#690) so (a) a disconnect can immediately fail that
-        ## session's in-flight futures instead of leaving callers to wait
-        ## out their full per-command timeout, and (b) a response is only
-        ## ever resolved by the connection the command was sent to — a
-        ## hostile local session can't forge a reply to another session's
-        ## request_id (defense in depth on top of the uuid4 request ids).
-        self._pending: dict[str, tuple[str, asyncio.Future[CommandResponse]]] = {}
-        self._connections: dict[str, ServerConnection] = {}
         self._custom_tool_service: CustomToolService = CustomToolService.get_instance()
 
     async def start(self):
@@ -153,75 +363,108 @@ class GodotWebSocketServer:
                 # Always loopback. The WS channel is the *local* Python-server↔
                 # Godot-editor bridge; the editor connects via ws://127.0.0.1
                 # (plugin connection.gd). Remote agents reach us over HTTP only,
-                # so --allow-host (#421) must NOT widen this port — that would
-                # expose the unauthenticated plugin WS to the LAN, and binding
-                # "::" (IPv6-only by default on Windows) would break the editor's
-                # IPv4 loopback connection.
+                # so --allow-host (#421) must NOT widen this port — authentication
+                # is defense in depth, not permission to expose the editor bridge
+                # to the LAN. Binding "::" (IPv6-only by default on Windows)
+                # would also break the editor's IPv4 loopback connection.
                 "127.0.0.1",
                 self.port,
-                max_size=4 * 1024 * 1024,  # 4 MB for screenshot base64
+                ## Start under the tiny pre-auth ceiling. Once both proofs
+                ## validate, the handler raises this peer's parser limit to the
+                ## normal 4 MiB screenshot/command envelope budget.
+                max_size=DEFAULT_MAX_HANDSHAKE_FRAME_BYTES,
+                max_queue=DEFAULT_MAX_DECODED_MESSAGES,
+                open_timeout=DEFAULT_OPEN_TIMEOUT_SECONDS,
+                close_timeout=1.0,
+                compression=None,
+                create_connection=partial(
+                    _BoundedOpeningServerConnection,
+                    opening_limit=self._max_open_connections,
+                ),
                 # Reject DNS-rebinding attempts before the upgrade — see
                 # godot_ai.transport.origin_guard. Native plugin clients
                 # carry a loopback Host and no Origin, so they pass through.
                 process_request=make_websocket_request_guard(),
             ):
+                self._ready_event.set()
                 await asyncio.Future()  # run forever
-        except OSError as e:
-            if e.errno == errno.EADDRINUSE:
+        except BaseException as exc:
+            self._startup_error = exc
+            self._ready_event.set()
+            if isinstance(exc, OSError) and exc.errno == errno.EADDRINUSE:
                 logger.warning(
-                    "WebSocket port %d already in use — another server instance may be running. "
-                    "MCP tools will work but the Godot plugin won't connect to this instance.",
+                    "WebSocket port %d already in use; refusing a half-ready HTTP server.",
                     self.port,
                 )
-            else:
-                raise
+            raise
+
+    async def wait_until_ready(self) -> None:
+        """Return only after the WebSocket listener binds, or propagate startup failure."""
+
+        await self._ready_event.wait()
+        if self._startup_error is not None:
+            raise RuntimeError("WebSocket listener failed to start") from self._startup_error
 
     async def _handle_connection(self, ws: ServerConnection):
         session_id: str | None = None
         close_code: int | None = None
         try:
-            # First message must be a handshake
-            raw = await asyncio.wait_for(ws.recv(), timeout=10.0)
-            data = json.loads(raw)
-            handshake = HandshakeMessage.model_validate(data)
-
-            ## #690: when this launch has a token, a handshake carrying a
-            ## DIFFERENT one is a peer reading someone else's (or a stale)
-            ## secret — reject before registering. Absent tokens pass: see
-            ## __init__'s note on why this is compat-gated defense in depth.
-            ## Truthiness, not `is not None`: an empty-string auth_token
-            ## means "no token" exactly like an omitted field (the plugin
-            ## omits when empty, but a client that serializes "" instead
-            ## must not be 4003'd — rejecting "" buys nothing when omitting
-            ## the field is always accepted).
-            if self._auth_token is not None and handshake.auth_token:
-                if not hmac.compare_digest(handshake.auth_token, self._auth_token):
-                    logger.warning(
-                        "Rejecting handshake for session %s: auth token mismatch",
-                        handshake.session_id,
-                    )
-                    await ws.close(
-                        code=_CLOSE_CODE_AUTH_TOKEN_MISMATCH,
-                        reason="auth token mismatch",
-                    )
-                    return
-
-            ## Reject duplicate session_id while the first peer is live —
-            ## otherwise the second handshake silently overwrites the
-            ## routing map (duplicate-ID hijack).
-            existing = self.registry.get(handshake.session_id)
-            if existing is not None:
-                logger.warning(
-                    "Rejecting duplicate handshake for session %s (existing pid=%s, project=%s)",
-                    handshake.session_id,
-                    existing.editor_pid,
-                    existing.project_path,
+            if self._auth_token is None:
+                raise _HandshakeFailure(
+                    _CLOSE_CODE_AUTH_FAILED,
+                    "server has no v4 editor capability; restart it from Godot",
                 )
-                await ws.close(
-                    code=_CLOSE_CODE_DUPLICATE_SESSION,
-                    reason="session id already registered",
+
+            deadline = asyncio.get_running_loop().time() + DEFAULT_HANDSHAKE_TIMEOUT_SECONDS
+            hello = await _receive_handshake_frame(ws, deadline, AuthenticationHello)
+            server_nonce = secrets.token_hex(32)
+            await _send_handshake_frame(
+                ws,
+                deadline,
+                {
+                    "type": "auth_challenge",
+                    "protocol_version": WS_PROTOCOL_VERSION,
+                    "client_nonce": hello.client_nonce,
+                    "server_nonce": server_nonce,
+                    "server_version": _SERVER_VERSION,
+                    "server_proof": websocket_server_proof(
+                        self._auth_token,
+                        client_nonce=hello.client_nonce,
+                        server_nonce=server_nonce,
+                    ),
+                },
+            )
+            handshake = await _receive_handshake_frame(ws, deadline, AuthenticatedHandshake)
+            if (
+                handshake.client_nonce != hello.client_nonce
+                or handshake.server_nonce != server_nonce
+            ):
+                raise _HandshakeFailure(_CLOSE_CODE_AUTH_FAILED, "v4 handshake nonce mismatch")
+            expected_client_proof = websocket_client_proof(
+                self._auth_token,
+                client_nonce=hello.client_nonce,
+                server_nonce=server_nonce,
+                session_id=handshake.session_id,
+                godot_version=handshake.godot_version,
+                project_path=handshake.project_path,
+                plugin_version=handshake.plugin_version,
+                readiness=handshake.readiness,
+                editor_pid=handshake.editor_pid,
+                server_launch_mode=handshake.server_launch_mode,
+            )
+            if not hmac.compare_digest(handshake.client_proof, expected_client_proof):
+                raise _HandshakeFailure(_CLOSE_CODE_AUTH_FAILED, "v4 editor proof failed")
+            if not _supports_v4_editor(handshake.godot_version):
+                raise _HandshakeFailure(
+                    _CLOSE_CODE_PROTOCOL_MISMATCH,
+                    "Godot 4.7 or newer within the 4.x line is required by the v4 editor protocol",
                 )
-                return
+
+            ## Proof verification is the only transition that raises this
+            ## peer's inbound parser from the handshake ceiling to the normal
+            ## payload ceiling. A peer cannot allocate a 4 MiB decoded frame
+            ## before authenticating.
+            ws.protocol.max_message_size = DEFAULT_MAX_MESSAGE_BYTES
 
             session_id = handshake.session_id
             session = Session(
@@ -233,12 +476,44 @@ class GodotWebSocketServer:
                 readiness=handshake.readiness,
                 editor_pid=handshake.editor_pid,
                 server_launch_mode=handshake.server_launch_mode,
-                ## Mismatches were rejected above, so a present token here is
-                ## the matching one.
-                token_authenticated=bool(self._auth_token is not None and handshake.auth_token),
             )
-            self.registry.register(session)
-            self._connections[session_id] = ws
+            ## Reserve before ACK so a simultaneous duplicate cannot claim the
+            ## same ID, but do not expose a routable session until the ACK send
+            ## succeeds. A failed send falls through ``finally`` and removes
+            ## this pending entry atomically.
+            if not self.registry.reserve_connection(session, ws):
+                existing = self.registry.get(session_id)
+                detail = (
+                    f"existing pid={existing.editor_pid}, project={existing.project_path}"
+                    if existing is not None
+                    else "another handshake is pending"
+                )
+                logger.warning(
+                    "Rejecting duplicate handshake for session %s (%s)",
+                    session_id,
+                    detail,
+                )
+                await ws.close(
+                    code=_CLOSE_CODE_DUPLICATE_SESSION,
+                    reason="session id already registered",
+                )
+                return
+
+            ## Tell the plugin which server version it's talking to so the dock
+            ## can surface a banner when plugin_version != server_version (e.g.
+            ## after self-update when the plugin was adopting a foreign-port
+            ## server owned by another session and `_stop_server` couldn't kill
+            ## it because _server_pid was never set). See #174 follow-up.
+            await _send_handshake_frame(
+                ws,
+                deadline,
+                {
+                    "type": "handshake_ack",
+                    "protocol_version": WS_PROTOCOL_VERSION,
+                    "server_version": _SERVER_VERSION,
+                },
+            )
+            self.registry.publish_connection(session_id, ws)
             logger.info(
                 "Session connected: %s (pid=%s, Godot %s, %s)",
                 session_id,
@@ -247,27 +522,11 @@ class GodotWebSocketServer:
                 handshake.project_path,
             )
 
-            ## Tell the plugin which server version it's talking to so the dock
-            ## can surface a banner when plugin_version != server_version (e.g.
-            ## after self-update when the plugin was adopting a foreign-port
-            ## server owned by another session and `_stop_server` couldn't kill
-            ## it because _server_pid was never set). See #174 follow-up.
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "handshake_ack",
-                        "server_version": _SERVER_VERSION,
-                    }
-                )
-            )
-
             # Listen for responses and events
             async for raw_msg in ws:
                 ## Any message counts as a heartbeat — last_seen lets callers
                 ## distinguish live editors from stale registry entries.
-                live = self.registry.get(session_id)
-                if live is not None:
-                    live.touch()
+                self.registry.note_peer_activity(session_id)
 
                 ## Parse/validation failures of a single frame must not tear
                 ## down the whole editor session (#526): before this guard,
@@ -278,8 +537,8 @@ class GodotWebSocketServer:
                 ## ValidationError handling. Only parse/validation errors are
                 ## swallowed — everything else still propagates.
                 try:
-                    data = json.loads(raw_msg)
-                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    data = _strict_json_loads(raw_msg)
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
                     ## UnicodeDecodeError covers a bytes frame with invalid
                     ## UTF-8 — same malformed-frame class as bad JSON (#526).
                     logger.warning(
@@ -317,51 +576,53 @@ class GodotWebSocketServer:
                     ## timeout (#526).
                     request_id = data.get("request_id") if isinstance(data, dict) else None
                     if isinstance(request_id, str):
-                        entry = self._pending.get(request_id)
-                        ## Session-scoped (#690): only the connection the
-                        ## command was sent to may fail its future.
-                        if entry is not None and entry[0] == session_id:
-                            self._pending.pop(request_id, None)
-                            pending = entry[1]
-                            if not pending.done():
-                                pending.set_exception(
-                                    ConnectionError(
-                                        f"Malformed response from session {session_id} "
-                                        f"for request {request_id}"
-                                    )
+                        malformed = self.registry.claim_pending_response(
+                            session_id,
+                            request_id,
+                            peer=ws,
+                        )
+                        if malformed is not None:
+                            malformed.set_exception(
+                                ConnectionError(
+                                    f"Malformed response from session {session_id} "
+                                    f"for request {request_id}"
                                 )
+                            )
                     continue
-                ## Heal `Session.readiness` from every response envelope.
+                ## Claim before applying envelope side effects: unsolicited or
+                ## late responses do not own a pending request and therefore
+                ## have no authority to mutate the editor snapshot.
+                future = self.registry.claim_pending_response(
+                    session_id,
+                    response.request_id,
+                    peer=ws,
+                )
+                if future is None:
+                    logger.warning(
+                        "Dropping response for unowned request %s from session %s",
+                        response.request_id[:8],
+                        session_id[:8],
+                    )
+                    continue
+
+                ## Heal `Session.readiness` from every owned response envelope.
                 ## The plugin stamps live readiness onto its dispatcher
                 ## output, so the cache stays in lockstep with editor
                 ## state — no `editor_state` ceremony required after a
-                ## game stop / autosave / import. Old plugins omit the
-                ## field; the helper treats `None` as a no-op so the
-                ## existing event-driven path still applies.
-                if response.readiness is not None and live is not None:
-                    sync_readiness_for_session(live, response.readiness)
-                if response.error_watermark is not None and live is not None:
-                    _sync_error_watermark_for_session(live, response.error_watermark)
-                entry = self._pending.get(response.request_id)
-                if entry is not None:
-                    if entry[0] != session_id:
-                        ## Cross-session response injection (#690): the reply
-                        ## came from a different connection than the command
-                        ## was sent to. Leave the real session's future
-                        ## pending and drop the forged frame.
-                        logger.warning(
-                            "Dropping response for request %s from session %s — "
-                            "command was sent to session %s",
-                            response.request_id[:8],
-                            session_id[:8],
-                            entry[0][:8],
-                        )
-                    else:
-                        self._pending.pop(response.request_id, None)
-                        future = entry[1]
-                        if not future.done():
-                            future.set_result(response)
+                ## game stop / autosave / import.
+                self.registry.record_readiness(session_id, response.readiness)
+                if response.error_watermark is not None:
+                    self.registry.record_error_watermark(session_id, response.error_watermark)
+                if not future.done():
+                    future.set_result(response)
 
+        except _HandshakeFailure as exc:
+            close_code = exc.code
+            logger.warning("Rejecting editor WebSocket handshake: %s", exc.reason)
+            try:
+                await ws.close(code=exc.code, reason=exc.reason)
+            except websockets.ConnectionClosed:
+                pass
         except websockets.ConnectionClosed as exc:
             ## Normalize the close frame: prefer the one the peer sent
             ## (rcvd); the keepalive watchdog's own 1011 lives on ``sent``.
@@ -383,30 +644,17 @@ class GodotWebSocketServer:
             logger.exception("Error in WebSocket handler for session %s", session_id)
         finally:
             if session_id:
-                self.registry.unregister(session_id, close_code=close_code)
-                self._connections.pop(session_id, None)
+                removed = self.registry.remove_connection(
+                    session_id,
+                    peer=ws,
+                    close_code=close_code,
+                )
                 ## Drop this editor's custom tools from the catalog and tell
                 ## MCP clients — a closed editor's tools must not linger as
-                ## invokable entries. Only broadcast if it actually had any.
-                if self._custom_tool_service.remove_session(session_id):
+                ## invokable entries. A rejected duplicate does not own the
+                ## table entry, so it must not erase the live peer's catalog.
+                if removed and self._custom_tool_service.remove_session(session_id):
                     self._schedule_tools_broadcast()
-                ## Fail this session's in-flight futures NOW (#690): a close
-                ## settles nothing by itself, so every in-flight command used
-                ## to wait out its full per-command timeout (120s for
-                ## test_run) after an editor crash / plugin reload — and the
-                ## circuit breaker recorded TimeoutError instead of a
-                ## disconnect, degrading death-spiral diagnostics.
-                for request_id, entry in list(self._pending.items()):
-                    if entry[0] != session_id:
-                        continue
-                    self._pending.pop(request_id, None)
-                    future = entry[1]
-                    if not future.done():
-                        future.set_exception(
-                            ConnectionError(
-                                f"Session {session_id} disconnected while the command was in flight"
-                            )
-                        )
 
     def _schedule_tools_broadcast(self) -> None:
         """Fire a coalesced tools/list_changed broadcast, non-blocking.
@@ -441,8 +689,7 @@ class GodotWebSocketServer:
     async def _handle_event(self, session_id: str, data: dict) -> None:
         event = data.get("event", "")
         event_data = data.get("data", {})
-        session = self.registry.get(session_id)
-        if session is None:
+        if self.registry.get(session_id) is None:
             return
 
         ## Validate the payload before assigning to typed Session fields —
@@ -453,29 +700,15 @@ class GodotWebSocketServer:
         try:
             if event == "scene_changed":
                 payload = SceneChangedEvent.model_validate(event_data)
-                session.current_scene = payload.current_scene
+                self.registry.record_scene_changed(session_id, payload.current_scene)
                 logger.info(
-                    "Session %s: scene changed to %s", session_id[:8], session.current_scene
+                    "Session %s: scene changed to %s", session_id[:8], payload.current_scene
                 )
             elif event == "play_state_changed":
                 payload = PlayStateChangedEvent.model_validate(event_data)
-                session.play_state = payload.play_state
-                logger.info("Session %s: play state -> %s", session_id[:8], session.play_state)
+                self.registry.record_play_state_changed(session_id, payload.play_state)
+                logger.info("Session %s: play state -> %s", session_id[:8], payload.play_state)
             elif event == "custom_tools_changed":
-                ## Catalog text (names/descriptions) is served into the AI
-                ## agent's context, so on a token-configured launch (#690)
-                ## only a session that proved the token may mutate it — an
-                ## unauthenticated local peer must not be able to plant
-                ## agent-visible instructions. Tokenless launches keep the
-                ## compat identity model (any local session accepted); the
-                ## budget caps on CustomToolsChangedEvent/CustomToolDefinition
-                ## bound what such a peer can park either way.
-                if self._auth_token is not None and not session.token_authenticated:
-                    logger.warning(
-                        "Dropping custom_tools_changed from unauthenticated session %s",
-                        session_id[:8],
-                    )
-                    return
                 ## Plugin payload shape: {"tools": [ {...}, ... ]} — see
                 ## plugin.gd::_on_custom_tools_changed. Iterating event_data
                 ## itself would walk dict KEYS, not tool dicts.
@@ -494,8 +727,8 @@ class GodotWebSocketServer:
                     logger.error("Invalid custom tool definition: %s", e)
             elif event == "readiness_changed":
                 payload = ReadinessChangedEvent.model_validate(event_data)
-                session.readiness = payload.readiness
-                logger.info("Session %s: readiness -> %s", session_id[:8], session.readiness)
+                self.registry.record_readiness(session_id, payload.readiness)
+                logger.info("Session %s: readiness -> %s", session_id[:8], payload.readiness)
             elif event == "plugin_event":
                 ## Plugin-side events (self-update outcome, dock startup,
                 ## reload). The plugin owns the allowlist on the emit side,
@@ -504,11 +737,14 @@ class GodotWebSocketServer:
                 ## fields before forwarding.
                 payload = PluginTelemetryEvent.model_validate(event_data)
                 if payload.name in _PLUGIN_EVENT_NAMES:
-                    record_telemetry(
-                        RecordType.PLUGIN_EVENT,
-                        _sanitized_plugin_event_data(payload.name, payload.data),
-                        session_id=session_id,
-                    )
+                    try:
+                        record_telemetry(
+                            RecordType.PLUGIN_EVENT,
+                            _sanitized_plugin_event_data(payload.name, payload.data),
+                            session_id=session_id,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.debug("plugin event telemetry failed", exc_info=True)
                 else:
                     logger.debug(
                         "Dropping plugin_event with unknown name %r from %s",
@@ -530,18 +766,13 @@ class GodotWebSocketServer:
         params: dict[str, Any] | None = None,
         timeout: float = 5.0,
     ) -> CommandResponse:
-        ws = self._connections.get(session_id)
-        if ws is None:
-            raise ConnectionError(f"No connection for session {session_id}")
-
         request = CommandRequest(command=command, params=params or {})
-        future: asyncio.Future[CommandResponse] = asyncio.get_running_loop().create_future()
-        self._pending[request.request_id] = (session_id, future)
+        ws, future = self.registry.open_request(session_id, request.request_id)
 
         ## Always pop on exit — the response receiver in _handle_connection
         ## pops on the happy path, so this is a no-op there; on `ws.send`
         ## raise / TimeoutError / cancellation it prevents Futures leaking
-        ## into _pending forever.
+        ## in the peer's pending set forever.
         ## The deadline covers the SEND as well as the response wait. When the
         ## transport is write-paused by TCP backpressure — an editor that has
         ## stopped reading its socket — `ws.send` blocks for the whole stall, and
@@ -577,108 +808,4 @@ class GodotWebSocketServer:
                 f"Command {command} timed out after {timeout}s on session {session_id}"
             )
         finally:
-            self._pending.pop(request.request_id, None)
-
-
-## Watermark components whose baseline resets each game run. The server may
-## never observe their zero between stop/start, so on an advanced run_seq the
-## current value is counted in full rather than diffed against a stale baseline.
-## `game_error_warn` is historically misnamed — it carries game-process ERROR
-## counts (see McpGameLogBuffer.error_total); `game_warn` is its warn-level
-## sibling.
-_PER_RUN_WATERMARK_KEYS = frozenset({"game_error_warn", "game_warn"})
-
-## Warn-level watermark components. Split out from error components so a
-## warning-only run surfaces as `new_warnings_since_last_call` instead of
-## reading as clean. Editor and game warn streams are independent processes
-## with no overlap, so their deltas sum (unlike the error path, where the game
-## buffer and Debugger Errors tab are two views of one stream).
-_WARN_WATERMARK_KEYS = frozenset({"editor_ring_warn", "game_warn"})
-
-
-def _sync_error_watermark_for_session(session: Session, value: dict[str, int]) -> None:
-    """Fold a plugin-stamped watermark into the session's counters.
-
-    Side effects only: updates ``session.error_watermark`` to the incoming
-    component values, adds the newly observed error count to
-    ``session.pending_new_errors``, and accumulates newly observed warnings
-    onto ``session.pending_new_warnings`` as a parallel,
-    independently-consumed channel.
-
-    Watermark components reset independently. When run_seq advances, per-run
-    game components are counted in full because the server may never observe
-    their zero between stop/start. Editor and debugger components remain
-    session-scoped monotonic deltas; a decrease is treated as a reset and the
-    current component value is counted when above zero. The debugger and game
-    error components overlap (both observe the running game's script errors),
-    so their deltas are combined with max(), not summed.
-
-    **Adding a component is a cross-version contract change.** An unrecognized
-    key is not rejected. Its first stamp only establishes a baseline (recorded
-    in ``updates``, no delta), but every later increase becomes a delta, and any
-    delta not popped below falls through ``sum(deltas.values())`` into the
-    *error* total — on a server that has never heard of the key. Only
-    ``run_seq`` (skipped outright), the two warn components, and the
-    overlapping debugger/game error pair are routed elsewhere; nothing gates
-    the rest. So a plugin that stamps a new counter against an older server
-    silently inflates its "N new errors" doorbell from the second stamp onward.
-
-    Carry genuinely new signal (paths, classifications — anything that is not a
-    count of new errors) in a separate optional envelope field instead, which a
-    server that does not know it simply ignores. Note how narrow the skip is:
-    ``_normalized_watermark_int`` drops only what ``int()`` refuses, so a list
-    or dict falls out, while ``"5"``, ``1.5`` and ``True`` all coerce and count.
-    See #782 for the case that established this.
-    """
-
-    updates: dict[str, int] = {}
-    deltas: dict[str, int] = {}
-    incoming_run_seq = _normalized_watermark_int(value.get("run_seq"))
-    previous_run_seq = max(0, int(session.error_watermark.get("run_seq", 0)))
-    run_advanced = (
-        incoming_run_seq is not None
-        and previous_run_seq > 0
-        and incoming_run_seq > previous_run_seq
-    )
-    for key, raw_current in value.items():
-        current = _normalized_watermark_int(raw_current)
-        if current is None:
-            continue
-        updates[key] = current
-        if key == "run_seq":
-            continue
-
-        previous = session.error_watermark.get(key)
-        if previous is not None:
-            previous_int = max(0, int(previous))
-            if run_advanced and key in _PER_RUN_WATERMARK_KEYS:
-                deltas[key] = current
-            elif current >= previous_int:
-                deltas[key] = current - previous_int
-            else:
-                deltas[key] = current
-        elif run_advanced and key in _PER_RUN_WATERMARK_KEYS:
-            deltas[key] = current
-
-    ## Warnings first — pull them out before the error math so they can't be
-    ## conflated with the error total. Independent process streams, so sum.
-    new_warnings = sum(deltas.pop(key, 0) for key in _WARN_WATERMARK_KEYS)
-
-    ## A running game's script errors surface twice: in the game log buffer
-    ## (game_error_warn) and as Debugger Errors-tab rows (debugger_promoted).
-    ## Those are alternate views of the same error stream — summing them
-    ## reports 2 for every push_error once the #641 deferred scans promote
-    ## rows reliably. Take the larger of the two overlapping views; only
-    ## editor-process components accumulate independently.
-    overlap = max(deltas.pop("debugger_promoted", 0), deltas.pop("game_error_warn", 0))
-    new_total = overlap + sum(deltas.values())
-    session.error_watermark.update(updates)
-    session.pending_new_errors += new_total
-    session.pending_new_warnings += new_warnings
-
-
-def _normalized_watermark_int(value: object) -> int | None:
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError):
-        return None
+            self.registry.cancel_request(session_id, request.request_id, peer=ws)

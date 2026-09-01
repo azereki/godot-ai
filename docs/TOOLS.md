@@ -1,6 +1,6 @@
 # Available Tools
 
-Godot AI exposes ~43 MCP tools — 19 high-traffic verbs as named tools, plus
+Godot AI exposes 46 MCP tools — 19 high-traffic verbs as named tools, plus
 one rolled-up `<domain>_manage` per domain that takes `op="..."` + a `params`
 dict. The rollup pattern keeps the tool count well below the 100-tool caps
 some clients enforce while still exposing every action.

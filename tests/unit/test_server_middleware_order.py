@@ -31,7 +31,7 @@ from godot_ai.middleware import (
     StripClientWrapperKwargs,
     TrackMcpSessions,
 )
-from godot_ai.server import create_server
+from tests.conftest import create_test_server as create_server
 
 EXPECTED_ORDER: tuple[type, ...] = (
     PreserveGodotCommandErrorData,
@@ -52,7 +52,7 @@ EXPECTED_ORDER: tuple[type, ...] = (
 def test_godot_ai_middleware_registered_in_documented_order() -> None:
     """First-added is outermost; reorder fails with the actual list named.
 
-    Filters ``mcp.middleware`` to entries whose class is one of the five
+    Filters ``mcp.middleware`` to entries whose class is one of the six
     godot_ai middleware classes. FastMCP itself adds internal middleware
     (e.g. ``DereferenceRefsMiddleware`` — see ``fastmcp/server/server.py``
     around the ``DereferenceRefsMiddleware`` append in ``__init__``); the
@@ -77,7 +77,7 @@ def test_every_godot_ai_middleware_is_covered_by_the_order_lock() -> None:
     """A new godot_ai middleware must be added to EXPECTED_ORDER.
 
     The order test above filters ``mcp.middleware`` down to the classes in
-    ``EXPECTED_ORDER``, so a *fifth* godot_ai middleware registered at any
+    ``EXPECTED_ORDER``, so a new godot_ai middleware registered at any
     position would be invisible to it — the order lock would keep passing
     while an undocumented middleware sits in the (load-bearing) chain.
     This test closes that hole: anything registered from the godot_ai

@@ -59,10 +59,15 @@ async def run_attach(port: int, ws_port: int, exclude_domains: tuple[str, ...]) 
 
     # Lease recovery calls the raw ensure operation. Passing ensure_ready here
     # would recurse back into lease.sync() while the lease lock is held.
-    lease = LeaseClient(ensurer.base_url, ensurer.ensure)
+    lease = LeaseClient(ensurer.base_url, ensurer.ensure, ensurer.http_capability)
     initial_status = await ensurer.ensure()
     await lease.start(initial_status)
-    proxy = create_attach_proxy(ensurer.mcp_url, ensure_ready, observe_backend)
+    proxy = create_attach_proxy(
+        ensurer.mcp_url,
+        ensure_ready,
+        observe_backend,
+        ensurer.http_capability,
+    )
     try:
         await proxy.run_async(transport="stdio", show_banner=False)
     finally:

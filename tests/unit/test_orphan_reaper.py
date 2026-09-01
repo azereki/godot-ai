@@ -240,12 +240,6 @@ def test_attach_idle_exit_honors_opt_out_and_reload(_clean_idle_env):
     assert should_arm_attach_idle_exit() is False
 
 
-def test_idle_exit_armed_by_owner_pid(_clean_idle_env):
-    ## Older plugin builds that predate the marker still plumb an owner pid;
-    ## that is proof enough of a plugin spawn.
-    assert should_arm_idle_exit(4242) is True
-
-
 def test_idle_exit_armed_on_windows(_clean_idle_env):
     ## Unlike should_arm_reaper there is NO platform gate — this is the #497
     ## Windows orphan coverage.

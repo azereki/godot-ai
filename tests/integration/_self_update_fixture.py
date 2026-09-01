@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import subprocess
-import zipfile
+import time
 from importlib.machinery import SourceFileLoader
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from types import ModuleType
+from typing import Callable
 
 import pytest
 
@@ -14,21 +17,20 @@ ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_ROOT = ROOT / "plugin" / "addons" / "godot_ai"
 SCRIPT = ROOT / "script" / "local-self-update-smoke"
 
-TEST_ZIP_DIR = "_test_update_zip"
-TEST_ZIP_NAME = "godot-ai-plugin.zip"
-TEST_ZIP_RES_PATH = f"res://{TEST_ZIP_DIR}/{TEST_ZIP_NAME}"
-TEST_TEMP_DIR = "user://godot_ai_self_update_upgrade_test/"
-TEST_HTTP_PORT = 18100
-TEST_WS_PORT = 19600
 LIVE_HTTP_PORT = 18210
 LIVE_WS_PORT = 19710
 POST_UPDATE_STATUS_FILE = "_test_post_update_status.json"
+POST_UPDATE_TOOL_PROBE_FILE = "_test_post_update_tool_probe.done"
+CLEAN_MAJOR_STATUS_FILE = "_test_clean_major_status.json"
+CLEAN_MAJOR_TOOL_PROBE_FILE = "_test_clean_major_tool_probe.done"
+CLEAN_MAJOR_MARKER_RELATIVE = Path(".godot/godot-ai-v4-migration.json")
 
 PARSE_ERROR_PATTERNS = (
     "SCRIPT ERROR: Parse Error",
     "ERROR: Failed to load script",
     "Could not resolve script",
 )
+COORDINATOR_DISABLE_MARKER = "MCP | update coordinator disabling old plugin"
 
 
 def load_smoke_script() -> ModuleType:
@@ -137,12 +139,290 @@ def read_plugin_version(plugin_cfg: Path) -> str:
     return smoke.read_plugin_version(plugin_cfg)
 
 
-def prepare_project_shell(project_dir: Path) -> None:
+def prepare_signed_update_project(
+    project_dir: Path,
+    *,
+    base_version: str,
+    next_version: str,
+    base_server_version: str,
+    next_server_version: str,
+    http_port: int,
+    ws_port: int,
+) -> None:
+    """Build the same signed A -> B fixture as the interactive harness.
+
+    The helper deliberately delegates release construction, frozen server
+    commands, and the old-tree transaction actor to ``local-self-update-smoke``.
+    Integration tests then add only an autoload that presses the production
+    plugin handoff automatically; they do not carry a second updater model.
+    """
+
     smoke = load_smoke_script()
-    project_dir.mkdir(parents=True)
+    smoke.prepare_project(
+        project_dir=project_dir,
+        base_version=base_version,
+        next_version=next_version,
+        server_version=base_server_version,
+        next_server_version=next_server_version,
+        http_port=http_port,
+        ws_port=ws_port,
+        force=False,
+        isolate_client_migration=True,
+    )
+    append_driver_autoload(project_dir / "project.godot")
+
+
+def prepare_clean_major_migration_project(
+    project_dir: Path,
+    *,
+    recovery_root: Path,
+    codex_home: Path,
+    from_version: str,
+    target_version: str,
+    http_port: int,
+    ws_port: int,
+) -> tuple[list[str], Path]:
+    """Prepare a synthetic pre-v4 project and locally signed clean v4 release."""
+    smoke = load_smoke_script()
+    project_dir.mkdir()
     smoke.write_project_files(project_dir)
     append_driver_autoload(project_dir / "project.godot")
-    (project_dir / TEST_ZIP_DIR).mkdir()
+
+    work = project_dir / ".clean-major-smoke"
+    work.mkdir()
+    fake_uvx = _write_fake_uvx_shim(work, smoke.smoke_python())
+    server_command, runtime_source = smoke.prepare_local_server_runtime(
+        work, "server-v4", target_version
+    )
+    actor_command, private_key, public_key = smoke.prepare_smoke_actor(work, runtime_source)
+    release_tree = work / "release-tree"
+    shutil.copytree(PLUGIN_ROOT, release_tree, ignore=smoke.copy_ignore)
+    smoke.patch_fixture_plugin(
+        release_tree,
+        version=target_version,
+        server_version=target_version,
+        http_port=http_port,
+        ws_port=ws_port,
+        force_local_update=False,
+        next_version=target_version,
+        server_command=server_command,
+        actor_command=actor_command,
+        isolate_client_migration=True,
+        skip_client_prewarm=False,
+    )
+    configurator = release_tree / "client_configurator.gd"
+    configurator_text = smoke.replace_function(
+        configurator.read_text(encoding="utf-8"),
+        "static func find_uvx() -> String:",
+        f"static func find_uvx() -> String:\n\treturn {json.dumps(str(fake_uvx))}",
+    )
+    configurator_text = smoke.subn_once(
+        configurator,
+        configurator_text,
+        r"const PREWARM_TIMEOUT_MS := \d+",
+        "const PREWARM_TIMEOUT_MS := 1000",
+        "clean-major prewarm timeout",
+    )
+    configurator.write_text(configurator_text, encoding="utf-8")
+    bundle = work / "release"
+    bundle.mkdir()
+    smoke.create_signed_v4_bundle(release_tree, bundle, target_version, private_key, public_key)
+    private_key.unlink()
+
+    verifier_root = work / "verifier"
+    _write_fixture_verifier(verifier_root, public_key)
+    old_addon = project_dir / "addons" / "godot_ai"
+    (old_addon / "legacy").mkdir(parents=True)
+    (old_addon / "plugin.cfg").write_text(f'[plugin]\nversion="{from_version}"\n', encoding="utf-8")
+    (old_addon / "old_only.gd").write_text("extends RefCounted\n", encoding="utf-8")
+    (old_addon / "legacy" / "state.txt").write_text("retained pre-v4 state\n", encoding="utf-8")
+    write_owned_codex_pin(
+        codex_home,
+        command=fake_uvx,
+        version=from_version,
+        http_port=http_port,
+        ws_port=ws_port,
+    )
+    argv = clean_major_install_argv(
+        smoke.smoke_python(),
+        bundle=bundle,
+        project_root=project_dir,
+        recovery_root=recovery_root,
+        target_version=target_version,
+        source_commit=smoke.SMOKE_SOURCE,
+    )
+    return argv, verifier_root
+
+
+def clean_major_install_argv(
+    python: Path,
+    *,
+    bundle: Path,
+    project_root: Path,
+    recovery_root: Path,
+    target_version: str,
+    source_commit: str,
+) -> list[str]:
+    """Return the documentation's install argv, including both closure assertions."""
+    return [
+        str(python),
+        "script/v4-release",
+        "install",
+        "--archive",
+        str(bundle / "godot-ai-v4-plugin.zip"),
+        "--manifest",
+        str(bundle / "godot-ai-v4-plugin.manifest.json"),
+        "--signature",
+        str(bundle / "godot-ai-v4-plugin.manifest.sig"),
+        "--expected-channel",
+        "stable",
+        "--expected-repository",
+        "hi-godot/godot-ai",
+        "--expected-tag",
+        f"v{target_version}",
+        "--expected-version",
+        target_version,
+        "--expected-source",
+        source_commit,
+        "--project-root",
+        str(project_root),
+        "--recovery-root",
+        str(recovery_root),
+        "--editors-closed",
+        "--clients-and-backend-stopped",
+    ]
+
+
+def _write_fixture_verifier(verifier_root: Path, public_key: str) -> None:
+    """Copy the standalone verifier and substitute only the synthetic test key."""
+    script_dir = verifier_root / "script"
+    source_dir = verifier_root / "src" / "godot_ai"
+    script_dir.mkdir(parents=True)
+    source_dir.mkdir(parents=True)
+    shutil.copy2(ROOT / "script" / "v4-release", script_dir / "v4-release")
+    source = (ROOT / "src" / "godot_ai" / "release_verify.py").read_text(encoding="utf-8")
+    pem_start = source.index('PUBLIC_KEY_PEM = """')
+    pem_end = source.index('"""\nPUBLIC_KEY_SPKI_SHA256', pem_start) + 3
+    normalized_key = public_key.rstrip("\n") + "\n"
+    source = source[:pem_start] + f'PUBLIC_KEY_PEM = """{normalized_key}"""' + source[pem_end:]
+    der = subprocess.run(
+        ["openssl", "pkey", "-pubin", "-outform", "DER"],
+        input=normalized_key.encode("ascii"),
+        check=True,
+        capture_output=True,
+    ).stdout
+    fingerprint_start = source.index('PUBLIC_KEY_SPKI_SHA256 = "')
+    fingerprint_end = source.index("\n", fingerprint_start)
+    source = (
+        source[:fingerprint_start]
+        + f'PUBLIC_KEY_SPKI_SHA256 = "{hashlib.sha256(der).hexdigest()}"'
+        + source[fingerprint_end:]
+    )
+    (source_dir / "release_verify.py").write_text(source, encoding="utf-8")
+
+
+def write_owned_codex_pin(
+    codex_home: Path,
+    *,
+    command: Path,
+    version: str,
+    http_port: int,
+    ws_port: int,
+) -> None:
+    codex_home.mkdir(parents=True, exist_ok=True)
+    args = [
+        "--link-mode",
+        "copy",
+        "--from",
+        f"godot-ai=={version}",
+        "godot-ai",
+        "attach",
+        "--port",
+        str(http_port),
+        "--ws-port",
+        str(ws_port),
+    ]
+    encoded_args = ", ".join(json.dumps(value) for value in args)
+    (codex_home / "config.toml").write_text(
+        (
+            '[mcp_servers."godot-ai"]\n'
+            f"command = {json.dumps(str(command))}\n"
+            f"args = [{encoded_args}]\n"
+            "enabled = true\n"
+            "startup_timeout_sec = 60\n"
+            "tool_timeout_sec = 360\n"
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_fake_uvx_shim(work: Path, python: Path) -> Path:
+    """Provide a private exact-identity actor without network or shared caches."""
+    fake_bin = work / "fake-bin"
+    fake_bin.mkdir()
+    implementation = fake_bin / "fake_uvx.py"
+    implementation.write_text(
+        """import json
+import os
+import sys
+import time
+
+args = sys.argv[1:]
+try:
+    from_index = args.index("--from")
+except ValueError:
+    raise SystemExit("unexpected fake uvx argv")
+version = args[from_index + 1].partition("==")[2] if len(args) > from_index + 1 else ""
+target = args[from_index + 2:]
+if not version:
+    raise SystemExit("unexpected fake uvx version")
+if target == ["godot-ai-update-transaction", "identity"]:
+    record = {
+        "argv": args,
+        "install_claim_present": os.path.lexists(os.environ["CLEAN_MAJOR_INSTALL_CLAIM"]),
+        "kind": "install_identity",
+        "old_tree_present": os.path.isfile(os.environ["CLEAN_MAJOR_OLD_SENTINEL"]),
+        "uv_no_progress": os.environ.get("UV_NO_PROGRESS", ""),
+    }
+    with open(os.environ["CLEAN_MAJOR_PREWARM_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\\n")
+    print(json.dumps({
+        "package_version": version,
+        "protocol_version": 1,
+        "status": "identity",
+    }, separators=(",", ":")))
+elif target == ["godot-ai", "--version"]:
+    mode = os.environ.get("CLEAN_MAJOR_FAKE_UVX_MODE", "cold")
+    record = {"argv": args, "kind": "startup_prewarm", "mode": mode}
+    with open(os.environ["CLEAN_MAJOR_PREWARM_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\\n")
+    if mode == "offline":
+        print("offline fixture", file=sys.stderr)
+        raise SystemExit(2)
+    if mode == "wedged":
+        with open(os.environ["CLEAN_MAJOR_WEDGE_STARTED"], "w", encoding="utf-8") as handle:
+            handle.write("wedged prewarm started\\n")
+        time.sleep(30)
+    print(f"godot-ai {version}")
+else:
+    raise SystemExit("unexpected fake uvx target")
+""",
+        encoding="utf-8",
+    )
+    if _is_windows():
+        wrapper = fake_bin / "uvx.cmd"
+        wrapper.write_text(
+            f'@echo off\r\n"{python}" "{implementation}" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        wrapper = fake_bin / "uvx"
+        wrapper.write_text(
+            f"#!{python}\n" + implementation.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o700)
+    return wrapper.absolute()
 
 
 def append_driver_autoload(project_file: Path) -> None:
@@ -151,106 +431,97 @@ def append_driver_autoload(project_file: Path) -> None:
     project_file.write_text(text, encoding="utf-8")
 
 
-def copy_addon_tree(source: Path, target: Path) -> None:
-    smoke = load_smoke_script()
-    shutil.copytree(source, target, ignore=smoke.copy_ignore)
+def write_configure_client_driver(project_dir: Path, *, http_port: int, version: str) -> None:
+    """Configure Codex in a disposable editor process before the update run."""
+    project_file = project_dir / "project.godot"
+    project_file.write_text(
+        project_file.read_text(encoding="utf-8")
+        + '_SelfUpdateClientPrep="*res://_test_configure_client.gd"\n',
+        encoding="utf-8",
+    )
+    (project_dir / "_test_configure_client.gd").write_text(
+        f"""@tool
+extends Node
+
+const VERSION := "{version}"
+const HTTP_PORT := {http_port}
+const ClientConfigurator := preload("res://addons/godot_ai/client_configurator.gd")
+
+var _frames := 0
 
 
-def patch_fixture_addon(
-    addon_dir: Path,
-    *,
-    version: str,
-    server_version: str,
-    next_version: str,
-    skip_server_start: bool,
-    http_port: int = TEST_HTTP_PORT,
-    ws_port: int = TEST_WS_PORT,
+func _ready() -> void:
+\tif not Engine.is_editor_hint() or OS.get_environment("_SELF_UPDATE_CONFIGURE_CLIENT") != "1":
+\t\tqueue_free()
+\t\treturn
+\tset_process(true)
+
+
+func _process(_delta: float) -> void:
+\t_frames += 1
+\tif _frames < 45:
+\t\treturn
+\tset_process(false)
+\tvar context := ClientConfigurator.capture_launch_context()
+\tvar result := ClientConfigurator.configure(
+\t\t"codex",
+\t\t"http://127.0.0.1:%d/mcp" % HTTP_PORT,
+\t\tcontext,
+\t)
+\tif str(result.get("status", "error")) != "ok" or not _has_pin():
+\t\tpush_error("SELF_UPDATE_TEST | production Codex A configuration failed: %s" % result)
+\t\tget_tree().quit(31)
+\t\treturn
+\tprint("SELF_UPDATE_TEST | production-configured Codex command pin=%s" % VERSION)
+\tget_tree().quit(0)
+
+
+func _has_pin() -> bool:
+\tvar home := OS.get_environment("CODEX_HOME")
+\tvar path := home.path_join("config.toml")
+\treturn not home.is_empty() and FileAccess.file_exists(path) and FileAccess.get_file_as_string(
+\t\tpath
+\t).contains("godot-ai==%s" % VERSION)
+""",
+        encoding="utf-8",
+    )
+
+
+def remove_configure_client_driver(project_dir: Path) -> None:
+    """Remove the prep-only autoload so it cannot pin A during the update run."""
+    project_file = project_dir / "project.godot"
+    autoload = '_SelfUpdateClientPrep="*res://_test_configure_client.gd"\n'
+    text = project_file.read_text(encoding="utf-8")
+    if text.count(autoload) != 1:
+        raise AssertionError("expected exactly one self-update client prep autoload")
+    project_file.write_text(text.replace(autoload, ""), encoding="utf-8")
+    (project_dir / "_test_configure_client.gd").unlink()
+
+
+def write_install_update_driver(
+    project_dir: Path, *, http_port: int, base_version: str, next_version: str
 ) -> None:
-    smoke = load_smoke_script()
-    smoke.patch_fixture_plugin(
-        addon_dir,
-        version=version,
-        server_version=server_version,
-        http_port=http_port,
-        ws_port=ws_port,
-        force_local_update=False,
-        next_version=next_version,
-    )
-    if skip_server_start:
-        patch_server_start_noop(addon_dir / "plugin.gd")
-
-
-def patch_server_start_noop(plugin_gd: Path) -> None:
-    smoke = load_smoke_script()
-    text = plugin_gd.read_text(encoding="utf-8")
-    text = smoke.replace_function(
-        text,
-        "func _start_server() -> void:",
-        """func _start_server() -> void:
-\tprint("MCP | self-update upgrade test: server start skipped")""",
-    )
-    plugin_gd.write_text(text, encoding="utf-8")
-
-
-def create_plugin_zip(addon_dir: Path, zip_path: Path) -> None:
-    smoke = load_smoke_script()
-    smoke.create_plugin_zip(addon_dir, zip_path)
-
-
-def link_dev_checkout_anchor(anchor: Path, repo_root: Path) -> None:
-    """Junction/symlink repo ``.venv`` + ``src`` so a tmp project can spawn locally.
-
-    ``ClientConfigurator._find_venv_python_in`` only treats a ``.venv`` as a
-    godot-ai checkout when a sibling ``src/godot_ai`` exists. A bare tmp
-    project would fall through to uvx and flake without network.
-    """
-    venv = repo_root / ".venv"
-    src = repo_root / "src"
-    python_name = "python.exe" if os.name == "nt" else "python"
-    python = venv / ("Scripts" if os.name == "nt" else "bin") / python_name
-    if not python.is_file() or not (src / "godot_ai").is_dir():
-        pytest.skip("repo .venv + src/godot_ai required to spawn a live server")
-    anchor.mkdir(parents=True, exist_ok=True)
-    _dir_link(anchor / ".venv", venv)
-    _dir_link(anchor / "src", src)
-
-
-def _dir_link(link: Path, target: Path) -> None:
-    if link.exists():
-        return
-    resolved = target.resolve()
-    if os.name == "nt":
-        completed = subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(link), str(resolved)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"mklink /J failed for {link} -> {resolved}: {completed.stderr}"
-            )
-        return
-    link.symlink_to(resolved, target_is_directory=True)
-
-
-def write_install_update_driver(project_dir: Path, *, http_port: int) -> None:
-    """Drive ``install_downloaded_update()`` and snapshot ``/godot-ai/status``."""
+    """Submit a signed package to the production handoff and verify B live."""
+    write_driver_support(project_dir)
     (project_dir / "_test_runner_driver.gd").write_text(
         f"""@tool
 extends Node
 
-const ZIP_PATH := "{TEST_ZIP_RES_PATH}"
-const TEMP_DIR := "{TEST_TEMP_DIR}"
+const BASE_VERSION := "{base_version}"
+const NEXT_VERSION := "{next_version}"
 const HTTP_PORT := {http_port}
 const STATUS_PATH := "res://{POST_UPDATE_STATUS_FILE}"
+const TOOL_PROBE_DONE_PATH := "res://{POST_UPDATE_TOOL_PROBE_FILE}"
+const DriverSupport := preload("res://_test_self_update_driver_support.gd")
 const START_AFTER_FRAMES := 45
 const MAX_FRAMES := 1800
-const STATUS_WAIT_MS := 45000
+const STATUS_WAIT_MS := 120000
 
 var _frames := 0
 var _started := false
 var _validated := false
+var _repin_observed := false
+var _tool_probe_ready := false
 var _finished := false
 var _status_wait_started_ms := 0
 var _pre_instance_id := ""
@@ -278,17 +549,25 @@ func _process(_delta: float) -> void:
 \t\t\t_finished = true
 \t\t\tget_tree().quit(12)
 \t\t\treturn
-\t\tvar pre := _fetch_status(HTTP_PORT)
+\t\tvar pre := DriverSupport.fetch_status(HTTP_PORT)
 \t\tvar pre_id := str(pre.get("instance_id", ""))
 \t\tif pre_id.is_empty():
 \t\t\treturn
 \t\t_pre_instance_id = pre_id
+\t\tif not _update_candidate_ready():
+\t\t\treturn
 \t\tprint("SELF_UPDATE_TEST | pre-update instance_id=%s" % _pre_instance_id)
+\t\tif not DriverSupport.client_config_has_pin(BASE_VERSION):
+\t\t\tpush_error("SELF_UPDATE_TEST | Codex config does not contain the A pin")
+\t\t\t_finished = true
+\t\t\tget_tree().quit(14)
+\t\t\treturn
+\t\tprint("SELF_UPDATE_TEST | configured Codex command pin=%s" % BASE_VERSION)
 \t\t_call_install()
 \t\treturn
 \tif _started and not _validated:
 \t\tif _frames > MAX_FRAMES:
-\t\t\tpush_error("SELF_UPDATE_TEST | install_downloaded_update timed out")
+\t\t\tpush_error("SELF_UPDATE_TEST | signed install timed out")
 \t\t\t_finished = true
 \t\t\tget_tree().quit(10)
 \t\t\treturn
@@ -297,7 +576,14 @@ func _process(_delta: float) -> void:
 \t\t\t_status_wait_started_ms = Time.get_ticks_msec()
 \t\treturn
 \tif _validated:
-\t\tif _try_write_status():
+\t\tif not _repin_observed:
+\t\t\t_observe_automatic_repin()
+\t\t\treturn
+\t\tif not _tool_probe_ready and _try_write_status():
+\t\t\t_tool_probe_ready = true
+\t\t\treturn
+\t\tif _tool_probe_ready and FileAccess.file_exists(TOOL_PROBE_DONE_PATH):
+\t\t\tprint("SELF_UPDATE_TEST | authenticated read/write tool probe completed")
 \t\t\t_finished = true
 \t\t\tget_tree().quit(0)
 \t\t\treturn
@@ -309,33 +595,56 @@ func _process(_delta: float) -> void:
 
 func _call_install() -> void:
 \t_started = true
-\tvar plugin := _find_godot_ai_plugin()
+\tvar plugin := DriverSupport.find_godot_ai_plugin()
 \tif plugin == null:
 \t\tpush_error("SELF_UPDATE_TEST | failed to find Godot AI plugin")
 \t\t_finished = true
 \t\tget_tree().quit(11)
 \t\treturn
-\tprint("SELF_UPDATE_TEST | calling install_downloaded_update")
-\tplugin.install_downloaded_update(ZIP_PATH, TEMP_DIR, null)
+\tprint("SELF_UPDATE_TEST | requesting canonical signed install")
+\tplugin.call("_on_dock_update_requested")
+
+
+func _update_candidate_ready() -> bool:
+\tvar plugin := DriverSupport.find_godot_ai_plugin()
+\tif plugin == null:
+\t\treturn false
+\tvar manager: Variant = plugin.get("_update_manager")
+\treturn manager != null and bool(manager.call("has_install_candidate"))
+
+
+func _observe_automatic_repin() -> void:
+\tif not DriverSupport.client_config_has_pin(NEXT_VERSION):
+\t\treturn
+\tprint("SELF_UPDATE_TEST | repinned Codex command pin=%s" % NEXT_VERSION)
+\t_repin_observed = true
 
 
 func _try_validate_install() -> bool:
-\tvar Handler := load(
-\t\t"res://addons/godot_ai/handlers/self_update_synthetic_next.gd"
-\t)
-\tif Handler == null:
+\tvar child_path := "res://addons/godot_ai/utils/self_update_smoke_child.gd"
+\tvar base_path := "res://addons/godot_ai/utils/self_update_smoke_base.gd"
+\tif not FileAccess.file_exists(child_path) or not FileAccess.file_exists(base_path):
 \t\treturn false
-\tvar marker: String = Handler.marker()
-\tprint("SELF_UPDATE_TEST | synthetic handler marker %s" % marker)
+\tvar cfg := ConfigFile.new()
+\tif cfg.load("res://addons/godot_ai/plugin.cfg") != OK:
+\t\treturn false
+\tif str(cfg.get_value("plugin", "version", "")) != NEXT_VERSION:
+\t\treturn false
+\tvar child_source := FileAccess.get_file_as_string(child_path)
+\tvar base_source := FileAccess.get_file_as_string(base_path)
+\tif not child_source.contains("extends McpSelfUpdateSmokeBase"):
+\t\treturn false
+\tif not base_source.contains("class_name McpSelfUpdateSmokeBase"):
+\t\treturn false
 \treturn true
 
 
 func _try_write_status() -> bool:
-\tvar payload := _fetch_status(HTTP_PORT)
+\tvar payload := DriverSupport.fetch_status(HTTP_PORT)
 \tif payload.get("name") != "godot-ai":
 \t\treturn false
 \tvar version := str(payload.get("server_version", ""))
-\tif version.is_empty():
+\tif version != NEXT_VERSION:
 \t\treturn false
 \tvar post_id := str(payload.get("instance_id", ""))
 \tif post_id.is_empty() or post_id == _pre_instance_id:
@@ -346,18 +655,34 @@ func _try_write_status() -> bool:
 \t\treturn false
 \tf.store_string(JSON.stringify(payload))
 \tf.close()
+\tprint("SELF_UPDATE_TEST | signed topology files installed")
 \tprint("SELF_UPDATE_TEST | status name=%s server_version=%s instance_id=%s" % [
 \t\tpayload.get("name"),
 \t\tversion,
 \t\tpost_id,
 \t])
 \treturn true
+""",
+        encoding="utf-8",
+    )
 
 
-func _fetch_status(port: int) -> Dictionary:
+def write_driver_support(project_dir: Path) -> None:
+    """Write shared authenticated status and plugin-discovery primitives."""
+    (project_dir / "_test_self_update_driver_support.gd").write_text(
+        """@tool
+extends RefCounted
+
+const MAX_STATUS_BYTES := 64 * 1024
+
+
+static func fetch_status(port: int) -> Dictionary:
+\tvar record := _read_capability(port)
+\tif record.is_empty():
+\t\treturn {}
 \tvar http := HTTPClient.new()
 \tif http.connect_to_host("127.0.0.1", port) != OK:
-\t\treturn {{}}
+\t\treturn {}
 \tvar deadline := Time.get_ticks_msec() + 2000
 \twhile (
 \t\thttp.get_status() == HTTPClient.STATUS_CONNECTING
@@ -365,39 +690,85 @@ func _fetch_status(port: int) -> Dictionary:
 \t):
 \t\thttp.poll()
 \t\tif Time.get_ticks_msec() > deadline:
-\t\t\treturn {{}}
+\t\t\treturn {}
 \t\tOS.delay_msec(10)
 \tif http.get_status() != HTTPClient.STATUS_CONNECTED:
-\t\treturn {{}}
-\tif http.request(HTTPClient.METHOD_GET, "/godot-ai/status", PackedStringArray()) != OK:
-\t\treturn {{}}
+\t\treturn {}
+\tvar headers := PackedStringArray([
+\t\t"Authorization: Bearer %s" % record["http"],
+\t\t"Accept-Encoding: identity",
+\t])
+\tif http.request(HTTPClient.METHOD_GET, "/godot-ai/status", headers) != OK:
+\t\treturn {}
 \tdeadline = Time.get_ticks_msec() + 2000
 \twhile http.get_status() == HTTPClient.STATUS_REQUESTING:
 \t\thttp.poll()
 \t\tif Time.get_ticks_msec() > deadline:
-\t\t\treturn {{}}
+\t\t\treturn {}
 \t\tOS.delay_msec(10)
-\tif not http.has_response():
-\t\treturn {{}}
+\tif not http.has_response() or http.get_response_code() != 200:
+\t\treturn {}
 \tvar body := PackedByteArray()
 \tdeadline = Time.get_ticks_msec() + 2000
 \twhile http.get_status() == HTTPClient.STATUS_BODY:
 \t\thttp.poll()
 \t\tvar chunk := http.read_response_body_chunk()
 \t\tif chunk.size() > 0:
+\t\t\tif body.size() + chunk.size() > MAX_STATUS_BYTES:
+\t\t\t\treturn {}
 \t\t\tbody.append_array(chunk)
 \t\telse:
 \t\t\tOS.delay_msec(5)
 \t\tif Time.get_ticks_msec() > deadline:
-\t\t\treturn {{}}
+\t\t\treturn {}
 \tvar parsed: Variant = JSON.parse_string(body.get_string_from_utf8())
 \tif typeof(parsed) != TYPE_DICTIONARY:
-\t\treturn {{}}
+\t\treturn {}
+\tif parsed.get("instance_id") != record["instance_nonce"]:
+\t\treturn {}
 \treturn parsed
 
 
-func _find_godot_ai_plugin() -> EditorPlugin:
-\tvar tree := get_tree()
+static func _read_capability(port: int) -> Dictionary:
+\tvar directory := OS.get_environment("GODOT_AI_CAPABILITY_DIR").strip_edges()
+\tif OS.get_name() == "Windows":
+\t\tdirectory = OS.get_environment("LOCALAPPDATA").path_join("godot-ai/capabilities")
+\telif directory.is_empty() and OS.get_name() == "macOS":
+\t\tdirectory = OS.get_environment("HOME").path_join(
+\t\t\t"Library/Application Support/godot-ai/capabilities"
+\t\t)
+\telif directory.is_empty():
+\t\tdirectory = OS.get_environment("XDG_CONFIG_HOME").strip_edges()
+\t\tif directory.is_empty():
+\t\t\tdirectory = OS.get_environment("HOME").path_join(".config")
+\t\tdirectory = directory.path_join("godot-ai/capabilities")
+\tvar path := directory.path_join("http-%d.json" % port)
+\tif not path.is_absolute_path() or not FileAccess.file_exists(path):
+\t\treturn {}
+\tvar file := FileAccess.open(path, FileAccess.READ)
+\tif file == null or file.get_length() < 1 or file.get_length() > 1025:
+\t\treturn {}
+\tvar parsed: Variant = JSON.parse_string(file.get_as_text())
+\tif not parsed is Dictionary:
+\t\treturn {}
+\tfor key in ["http", "instance_nonce"]:
+\t\tif not parsed.get(key) is String or str(parsed.get(key)).is_empty():
+\t\t\treturn {}
+\treturn parsed
+
+
+static func client_config_has_pin(version: String) -> bool:
+\tvar home := OS.get_environment("CODEX_HOME")
+\tif home.is_empty():
+\t\treturn false
+\tvar path := home.path_join("config.toml")
+\treturn FileAccess.file_exists(path) and FileAccess.get_file_as_string(path).contains(
+\t\t"godot-ai==%s" % version
+\t)
+
+
+static func find_godot_ai_plugin() -> EditorPlugin:
+\tvar tree := Engine.get_main_loop() as SceneTree
 \tif tree == null:
 \t\treturn null
 \tvar found := _walk_plugin(tree.root)
@@ -409,7 +780,7 @@ func _find_godot_ai_plugin() -> EditorPlugin:
 \treturn _walk_plugin(base.get_parent())
 
 
-func _walk_plugin(node: Node) -> EditorPlugin:
+static func _walk_plugin(node: Node) -> EditorPlugin:
 \tif node is EditorPlugin and node.has_method("install_downloaded_update"):
 \t\treturn node
 \tfor child in node.get_children():
@@ -422,31 +793,36 @@ func _walk_plugin(node: Node) -> EditorPlugin:
     )
 
 
-def write_forward_driver(project_dir: Path) -> None:
+def write_clean_major_driver(
+    project_dir: Path, *, http_port: int, from_version: str, target_version: str
+) -> None:
+    """Confirm the marker barrier, then prove the first v4 server and tools."""
+    write_driver_support(project_dir)
     (project_dir / "_test_runner_driver.gd").write_text(
         f"""@tool
 extends Node
 
-const ZIP_PATH := "{TEST_ZIP_RES_PATH}"
-const TEMP_DIR := "{TEST_TEMP_DIR}"
+const FROM_VERSION := "{from_version}"
+const TARGET_VERSION := "{target_version}"
+const HTTP_PORT := {http_port}
+const MARKER_PATH := "res://{CLEAN_MAJOR_MARKER_RELATIVE.as_posix()}"
+const STATUS_PATH := "res://{CLEAN_MAJOR_STATUS_FILE}"
+const TOOL_PROBE_DONE_PATH := "res://{CLEAN_MAJOR_TOOL_PROBE_FILE}"
+const DriverSupport := preload("res://_test_self_update_driver_support.gd")
 const START_AFTER_FRAMES := 15
-const MAX_FRAMES := 900
+const MAX_FRAMES := 2400
+const STATUS_WAIT_MS := 120000
 
 var _frames := 0
-var _started := false
+var _migration_observed := false
+var _tool_probe_ready := false
 var _finished := false
-var _runner = null
+var _status_wait_started_ms := 0
+var _wedged_responsiveness_proved := false
 
 
 func _ready() -> void:
 \tif not Engine.is_editor_hint():
-\t\tqueue_free()
-\t\treturn
-\t# `prime_class_cache()` sets this env var so its `--headless --import` /
-\t# `--headless --editor` pass populates `.godot/global_script_class_cache.cfg`
-\t# without triggering the runner. The actual editor pass that DOES want to
-\t# drive the runner runs without this env var, even when also headless.
-\tif OS.get_environment("_SELF_UPDATE_DRIVER_SKIP") == "1":
 \t\tqueue_free()
 \t\treturn
 \tset_process(true)
@@ -456,74 +832,102 @@ func _process(_delta: float) -> void:
 \tif _finished:
 \t\treturn
 \t_frames += 1
-\tif not _started and _frames >= START_AFTER_FRAMES:
-\t\t_start_runner()
+\tif _frames < START_AFTER_FRAMES:
 \t\treturn
-\tif _started:
-\t\tif not is_instance_valid(_runner):
-\t\t\t_validate_install()
-\t\t\treturn
-\t\tif _frames > MAX_FRAMES:
-\t\t\tpush_error("SELF_UPDATE_TEST | runner timed out")
-\t\t\t_finished = true
-\t\t\tget_tree().quit(10)
-
-
-func _start_runner() -> void:
-\t_started = true
-\tprint("SELF_UPDATE_TEST | starting runner")
-\tvar Runner := load("res://addons/godot_ai/update_reload_runner.gd")
-\tif Runner == null:
-\t\tpush_error("SELF_UPDATE_TEST | failed to load runner")
+\tif _frames > MAX_FRAMES:
+\t\t_fail(21, "clean-major first-start barrier timed out")
+\t\treturn
+\t_record_wedged_responsiveness()
+\tvar plugin := DriverSupport.find_godot_ai_plugin()
+\tif plugin == null:
+\t\treturn
+\tif not _migration_observed:
+\t\t_observe_automatic_migration(plugin)
+\t\treturn
+\tif not _tool_probe_ready and _try_write_status():
+\t\t_tool_probe_ready = true
+\t\treturn
+\tif _tool_probe_ready and FileAccess.file_exists(TOOL_PROBE_DONE_PATH):
+\t\tprint("CLEAN_MAJOR_TEST | authenticated read/write tool probe completed")
 \t\t_finished = true
-\t\tget_tree().quit(11)
+\t\tget_tree().quit(0)
 \t\treturn
-\t_runner = Runner.new()
-\tget_tree().root.add_child(_runner)
-\t_runner.start(ZIP_PATH, TEMP_DIR, null)
+\tif Time.get_ticks_msec() - _status_wait_started_ms > STATUS_WAIT_MS:
+\t\t_fail(22, "post-migration authenticated server timed out")
 
 
-func _validate_install() -> void:
-\t_finished = true
-\tvar Handler := load(
-\t\t"res://addons/godot_ai/handlers/self_update_synthetic_next.gd"
+func _record_wedged_responsiveness() -> void:
+\tif _wedged_responsiveness_proved or OS.get_environment(
+\t\t"CLEAN_MAJOR_FAKE_UVX_MODE"
+\t) != "wedged":
+\t\treturn
+\tvar started := OS.get_environment("CLEAN_MAJOR_WEDGE_STARTED")
+\tif not started.is_empty() and FileAccess.file_exists(started):
+\t\t_wedged_responsiveness_proved = true
+\t\tprint("CLEAN_MAJOR_TEST | editor remained responsive during wedged prewarm")
+
+
+func _observe_automatic_migration(plugin: EditorPlugin) -> void:
+\tvar action := str(plugin.get("_post_update_action"))
+\tif action == "retry":
+\t\t_fail(23, "client migration requested retry")
+\t\treturn
+\tif FileAccess.file_exists(MARKER_PATH):
+\t\treturn
+\tif not _installed_tree_is_target():
+\t\t_fail(26, "installed add-on is not the clean v4 target")
+\t\treturn
+\tif (
+\t\tnot DriverSupport.client_config_has_pin(TARGET_VERSION)
+\t\tor DriverSupport.client_config_has_pin(FROM_VERSION)
+\t):
+\t\t_fail(27, "owned Codex entry was not repinned from pre-v4 to v4")
+\t\treturn
+\tprint("CLEAN_MAJOR_TEST | migration marker removed automatically")
+\tprint("CLEAN_MAJOR_TEST | repinned owned Codex command pin=%s" % TARGET_VERSION)
+\t_migration_observed = true
+\t_status_wait_started_ms = Time.get_ticks_msec()
+
+
+func _installed_tree_is_target() -> bool:
+\tif FileAccess.file_exists("res://addons/godot_ai/old_only.gd"):
+\t\treturn false
+\tvar cfg := ConfigFile.new()
+\treturn (
+\t\tcfg.load("res://addons/godot_ai/plugin.cfg") == OK
+\t\tand str(cfg.get_value("plugin", "version", "")) == TARGET_VERSION
 \t)
-\tif Handler == null:
-\t\tpush_error("SELF_UPDATE_TEST | synthetic handler failed to load")
-\t\tget_tree().quit(12)
-\t\treturn
-\tvar marker: String = Handler.marker()
-\tprint("SELF_UPDATE_TEST | synthetic handler marker %s" % marker)
-\tget_tree().quit(0)
+
+
+func _try_write_status() -> bool:
+\tvar payload := DriverSupport.fetch_status(HTTP_PORT)
+\tif (
+\t\tpayload.get("name") != "godot-ai"
+\t\tor str(payload.get("server_version", "")) != TARGET_VERSION
+\t\tor str(payload.get("instance_id", "")).is_empty()
+\t):
+\t\treturn false
+\tvar file := FileAccess.open(STATUS_PATH, FileAccess.WRITE)
+\tif file == null:
+\t\t_fail(29, "failed to write clean-major status snapshot")
+\t\treturn false
+\tfile.store_string(JSON.stringify(payload))
+\tfile.close()
+\tprint("CLEAN_MAJOR_TEST | status name=godot-ai server_version=%s" % TARGET_VERSION)
+\treturn true
+
+
+func _fail(code: int, message: String) -> void:
+\tpush_error("CLEAN_MAJOR_TEST | %s" % message)
+\t_finished = true
+\tget_tree().quit(code)
 """,
         encoding="utf-8",
     )
 
 
-def prime_class_cache(project_dir: Path, godot_bin: str, timeout: int = 60) -> None:
-    """Headless `--import` pass to populate `.godot/global_script_class_cache.cfg`.
-
-    Without this, the editor pass starts with an empty class registry, the
-    editor's first scan happens concurrently with the autoload kicking off
-    the runner, and the registry-skew window the historical-constraint test
-    relies on never opens.
-
-    Sets `_SELF_UPDATE_DRIVER_SKIP=1` so the autoload skips its runner work
-    during this warmup pass. The real editor pass that follows leaves the
-    env var unset, so the autoload runs normally there.
-    """
-    env = os.environ.copy()
-    env["_SELF_UPDATE_DRIVER_SKIP"] = "1"
-    proc = subprocess.run(
-        [godot_bin, "--headless", "--import", "--path", str(project_dir)],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-    )
-    assert proc.returncode == 0, proc.stdout
+def _godot_log_path(project_dir: Path, phase: str) -> Path:
+    return project_dir.parent / f".{project_dir.name}-{phase}.log"
 
 
 def run_godot_editor(
@@ -533,21 +937,37 @@ def run_godot_editor(
     allow_headless: bool,
     headless: bool = True,
     timeout: int = 90,
+    environment: dict[str, str] | None = None,
+    live_probe: Callable[[], None] | None = None,
+    probe_ready_file: str = POST_UPDATE_STATUS_FILE,
+    probe_done_file: str = POST_UPDATE_TOOL_PROBE_FILE,
+    phase: str = "editor",
+    expected_exit_code: int = 0,
 ) -> str:
     env = os.environ.copy()
     if allow_headless:
         env["GODOT_AI_ALLOW_HEADLESS"] = "1"
     else:
         env.pop("GODOT_AI_ALLOW_HEADLESS", None)
+    if environment is not None:
+        env.update(environment)
     command = [godot_bin]
     if headless:
         command.append("--headless")
-    command.extend(["--path", str(project_dir), "--editor"])
+    command.extend(
+        [
+            "--path",
+            str(project_dir),
+            "--editor",
+            "--log-file",
+            str(_godot_log_path(project_dir, phase)),
+        ]
+    )
     # MERGE stderr into stdout at the kernel level so the captured `output`
     # is a single chronologically-ordered stream. `capture_output=True` would
     # produce SEPARATE stdout/stderr buffers; concatenating them yields an
     # "all-stdout-then-all-stderr" string with no time-ordering. The window
-    # markers below (`MCP | update runner disabling old plugin`,
+    # markers below (`MCP | update coordinator disabling old plugin`,
     # `MCP | plugin loaded`) are stdout-only, so a marker-bracketed window
     # against an unmerged buffer can never see stderr-routed parse errors
     # like `SCRIPT ERROR: Parse Error` (emitted via `OS::print_error`). The
@@ -555,22 +975,65 @@ def run_godot_editor(
     # then silently pass while a reverted-to-two-phase runner shipped parse
     # errors. Same reason existing CI scripts (.github/workflows/ci.yml)
     # use `> log 2>&1`. Do not change without also fixing those scans.
-    proc = subprocess.run(
-        command,
-        cwd=ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
+    capture_path = project_dir.parent / f".{project_dir.name}-{phase}-combined.log"
+    deadline = time.monotonic() + timeout
+    probe_ran = False
+    crash_reports = load_smoke_script().diagnostic_reports_snapshot
+    crash_baseline = crash_reports()
+    failure: BaseException | None = None
+    with capture_path.open("w+", encoding="utf-8") as capture:
+        proc = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=capture,
+            stderr=subprocess.STDOUT,
+        )
+        _godot_log_path(project_dir, f"{phase}-pid").write_text(f"{proc.pid}\n", encoding="utf-8")
+        try:
+            while proc.poll() is None:
+                if (
+                    live_probe is not None
+                    and not probe_ran
+                    and (project_dir / probe_ready_file).is_file()
+                ):
+                    live_probe()
+                    (project_dir / probe_done_file).write_text(
+                        "authenticated read/write probe passed\n", encoding="utf-8"
+                    )
+                    probe_ran = True
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                time.sleep(0.05)
+            capture.flush()
+            capture.seek(0)
+            output = capture.read()
+        except BaseException as exc:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            capture.flush()
+            capture.seek(0)
+            output = capture.read()
+            failure = exc
+    new_crashes = crash_reports() - crash_baseline
+    assert not new_crashes, "Godot crash report(s) appeared during the isolated lane: " + ", ".join(
+        map(str, sorted(new_crashes))
     )
-    output = proc.stdout
-    assert proc.returncode == 0, output
+    if failure is not None:
+        raise failure
+    if live_probe is not None:
+        assert probe_ran, output
+    assert proc.returncode == expected_exit_code, output
     return output
 
 
 def assert_no_update_parse_errors(log: str) -> None:
-    start = log.find("MCP | update runner disabling old plugin")
+    start = log.find(COORDINATOR_DISABLE_MARKER)
     assert start >= 0, log
     end = log.find("MCP | plugin loaded", start)
     assert end >= 0, log
@@ -579,49 +1042,3 @@ def assert_no_update_parse_errors(log: str) -> None:
     assert not offenders, (
         f"Unexpected parse/load errors during self-update window {offenders}:\n{window}"
     )
-
-
-def extract_addon_from_zip(zip_path: Path, target_addon: Path) -> None:
-    target_addon.mkdir(parents=True)
-    target_resolved = target_addon.resolve()
-    with zipfile.ZipFile(zip_path) as zf:
-        for info in zf.infolist():
-            if not info.filename.startswith("addons/godot_ai/") or info.is_dir():
-                continue
-            raw_filename = getattr(info, "orig_filename", info.filename)
-            # ZIP spec uses POSIX-style forward-slash separators; parsing the
-            # member name as PurePosixPath stops a Windows host from
-            # reinterpreting an entry like "addons/godot_ai/C:evil.txt" as a
-            # drive component (which would make `target_addon / rel` discard
-            # the prefix and write outside the fixture).
-            if "\\" in raw_filename or "\\" in info.filename:
-                raise ValueError(f"Refusing unsafe zip entry {raw_filename!r}: contains backslash")
-            rel = PurePosixPath(info.filename).relative_to("addons/godot_ai")
-            if rel.is_absolute() or any(part in ("", ".", "..") for part in rel.parts):
-                raise ValueError(
-                    f"Refusing unsafe zip entry {info.filename!r}: relative path "
-                    f"{rel!s} contains absolute or traversal segments"
-                )
-            out = target_addon.joinpath(*rel.parts)
-            # Belt-and-suspenders containment: if the resolved output path
-            # would escape target_addon (e.g. an OS-specific path-parsing
-            # quirk we didn't anticipate), refuse the entry.
-            candidate = out if out.exists() else target_resolved / Path(*rel.parts)
-            resolved = candidate.resolve()
-            if not resolved.is_relative_to(target_resolved):
-                raise ValueError(
-                    f"Refusing unsafe zip entry {info.filename!r}: resolved "
-                    f"output {resolved!s} escapes target {target_resolved!s}"
-                )
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_bytes(zf.read(info.filename))
-
-
-def release_zip_from_cache(cache_dir: Path, tag: str) -> Path | None:
-    candidates = [
-        cache_dir / tag / TEST_ZIP_NAME,
-        cache_dir / f"{tag}.zip",
-        cache_dir / f"godot-ai-plugin-{tag}.zip",
-        cache_dir / f"{tag}-godot-ai-plugin.zip",
-    ]
-    return next((path for path in candidates if path.is_file()), None)

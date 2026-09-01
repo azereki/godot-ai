@@ -64,9 +64,6 @@ class StubClient:
         ## the cached value (otherwise the probe heals the cache and the
         ## write incorrectly slips through).
         self.live_readiness: str = "ready"
-        ## Plugins before get_run_page ignore since_run_id and serve the
-        ## current run; tests flip this to exercise that fallback.
-        self.game_supports_since_run_id: bool = True
 
     async def send(
         self,
@@ -103,8 +100,6 @@ class StubClient:
                     "rprev": ["prev 0", "prev 1"],
                 }
                 since_run_id = str(params_dict.get("since_run_id") or "")
-                if not self.game_supports_since_run_id:
-                    since_run_id = ""
                 target_run_id = since_run_id or current_run_id
                 all_entries = [
                     {"source": "game", "level": "info", "text": text}
@@ -134,10 +129,6 @@ class StubClient:
                     "dropped_count": 0,
                     "stale_run_id": bool(since_run_id) and since_run_id != current_run_id,
                 }
-                if not self.game_supports_since_run_id:
-                    ## Old plugins predate these keys entirely.
-                    del response["current_run_id"]
-                    del response["stale_run_id"]
                 return response
             if source == "editor":
                 req_offset = int(params_dict.get("offset", 0))
@@ -229,7 +220,11 @@ class StubClient:
                     "is_running": True,
                     "dropped_count": 0,
                 }
-            return {"lines": [f"line {i}" for i in range(6)]}
+            return {
+                "lines": [
+                    {"source": "plugin", "level": "info", "text": f"line {i}"} for i in range(6)
+                ]
+            }
         if command == "game_command":
             return {
                 "source": "game",
@@ -267,9 +262,16 @@ class StubClient:
         if command == "get_selection":
             return {"selected": ["/Main/Camera3D"]}
         if command == "get_scene_tree":
+            all_nodes = [{"name": f"Node{i}", "type": "Node3D"} for i in range(3)]
+            offset = max(0, int((params or {}).get("offset", 0)))
+            limit = int((params or {}).get("limit", 100))
+            nodes = all_nodes[offset:] if limit <= 0 else all_nodes[offset : offset + limit]
             return {
-                "root": "Main",
-                "nodes": [{"name": f"Node{i}", "type": "Node3D"} for i in range(3)],
+                "nodes": nodes,
+                "total_count": len(all_nodes),
+                "offset": offset,
+                "limit": limit,
+                "has_more": limit > 0 and offset + limit < len(all_nodes),
             }
         if command == "get_open_scenes":
             return {"scenes": ["res://main.tscn"], "current": "res://main.tscn"}
@@ -1517,44 +1519,6 @@ async def test_logs_read_handler_since_run_id_unknown_run_returns_empty_stale():
     assert result["current_run_id"] == "rstub"
 
 
-async def test_logs_read_handler_since_run_id_old_plugin_falls_back_to_stale_shape():
-    ## Plugins that predate get_run_page ignore since_run_id and serve the
-    ## current run under the current run_id. The handler must not mislabel
-    ## those lines as the requested run.
-    client = StubClient()
-    client.game_supports_since_run_id = False
-    runtime = DirectRuntime(registry=SessionRegistry(), client=client)
-
-    result = await editor_handlers.logs_read(runtime, source="game", since_run_id="r-old")
-
-    assert result["stale_run_id"] is True
-    assert result["lines"] == []
-    assert result["run_id"] == "rstub"
-    assert "current_run_id" not in result
-
-
-async def test_logs_read_handler_stale_fallback_preserves_current_run_id():
-    ## If a plugin ever reports current_run_id while still mismatching the
-    ## requested run, the stale shape must carry it so callers can resync.
-    class MismatchingClient(StubClient):
-        async def send(self, command, params=None, **kwargs):
-            result = await super().send(command, params, **kwargs)
-            if command == "get_logs" and (params or {}).get("source") == "game":
-                result = dict(result)
-                result["run_id"] = "rNEW"
-                result["current_run_id"] = "rNEW"
-            return result
-
-    runtime = DirectRuntime(registry=SessionRegistry(), client=MismatchingClient())
-
-    result = await editor_handlers.logs_read(runtime, source="game", since_run_id="r-old")
-
-    assert result["stale_run_id"] is True
-    assert result["lines"] == []
-    assert result["run_id"] == "rNEW"
-    assert result["current_run_id"] == "rNEW"
-
-
 class StampingClient(StubClient):
     """Simulates GodotClient.send merging the consumed error-watermark
     stamp into the raw command result (client.py does this exactly once
@@ -2102,7 +2066,7 @@ async def test_reload_plugin_returns_preflight_ack_when_plugin_managed(
     ## the task during the post-ack delay and silently skip the reload.
     assert len(editor_handlers._pending_reload_tasks) == 1
     ## Drain so the task doesn't leak into the next test.
-    await asyncio.gather(*editor_handlers._pending_reload_tasks)
+    await asyncio.gather(*editor_handlers._pending_reload_tasks.values())
 
 
 async def test_reload_plugin_dispatches_reload_async_when_plugin_managed(
@@ -2122,10 +2086,10 @@ async def test_reload_plugin_dispatches_reload_async_when_plugin_managed(
     ## Await the task by reference rather than `sleep(N)` — synchronizes
     ## on actual completion, not a timing budget that could miss on a
     ## loaded CI runner.
-    await asyncio.gather(*editor_handlers._pending_reload_tasks)
+    await asyncio.gather(*editor_handlers._pending_reload_tasks.values())
     ## And the done-callback must have removed it from the retention set
     ## so successive reloads don't pile up.
-    assert editor_handlers._pending_reload_tasks == set()
+    assert editor_handlers._pending_reload_tasks == {}
 
     reload_calls = [c for c in stub.calls if c["command"] == "reload_plugin"]
     assert len(reload_calls) == 1
@@ -2155,7 +2119,23 @@ async def test_reload_plugin_async_dispatch_swallows_disconnect_errors(
     ## Drain the background task by reference; if it raised an unhandled
     ## exception (TimeoutError counted as expected) `gather` would surface
     ## it here.
-    await asyncio.gather(*editor_handlers._pending_reload_tasks)
+    await asyncio.gather(*editor_handlers._pending_reload_tasks.values())
+
+
+async def test_plugin_managed_reload_is_single_flight_per_session(plugin_managed_mode):
+    registry = SessionRegistry()
+    registry.register(_make_session("old-session"))
+    stub = ReloadStubClient(registry=registry, new_session_id="new-session")
+    runtime = DirectRuntime(registry=registry, client=stub)
+
+    for _ in range(100):
+        result = await editor_handlers.editor_reload_plugin(runtime)
+        assert result["status"] == "reload_initiated"
+
+    assert list(editor_handlers._pending_reload_tasks) == ["old-session"]
+    await asyncio.gather(*editor_handlers._pending_reload_tasks.values())
+    assert editor_handlers._pending_reload_tasks == {}
+    assert len([call for call in stub.calls if call["command"] == "reload_plugin"]) == 1
 
 
 async def test_dispatch_reload_async_swallows_unexpected_errors(plugin_managed_mode):
@@ -2336,17 +2316,12 @@ async def test_logs_resource_data_handler():
 
 
 async def test_scene_get_hierarchy_handler():
-    ## StubClient returns the OLD plugin shape (full node list, no `has_more`),
-    ## so the handler falls back to slicing server-side — the mixed
-    ## new-server/old-plugin path.
     client = StubClient()
     runtime = DirectRuntime(registry=SessionRegistry(), client=client)
     result = await scene_handlers.scene_get_hierarchy(runtime, depth=5, offset=0, limit=2)
     assert len(result["nodes"]) == 2
     assert result["total_count"] == 3
     assert result["has_more"] is True
-    ## offset/limit are forwarded to the plugin even though this old stub
-    ## ignores them.
     assert client.calls[-1]["params"] == {"depth": 5, "offset": 0, "limit": 2}
 
 
@@ -2384,25 +2359,6 @@ async def test_scene_get_hierarchy_passthrough_when_plugin_paginates():
     assert "root" not in result
 
 
-async def test_scene_get_hierarchy_fallback_limit_zero_returns_all():
-    ## Old-plugin fallback must honor the plugin's `limit <= 0 = no limit`
-    ## contract, not paginate()'s empty-slice-on-zero-limit behavior.
-    runtime = DirectRuntime(registry=SessionRegistry(), client=StubClient())
-    result = await scene_handlers.scene_get_hierarchy(runtime, depth=5, offset=0, limit=0)
-    assert len(result["nodes"]) == 3  # StubClient returns 3 nodes
-    assert result["total_count"] == 3
-    assert result["has_more"] is False
-
-
-async def test_scene_get_hierarchy_fallback_clamps_negative_offset():
-    ## A negative offset must clamp to 0 (matches the plugin's maxi(0, offset)),
-    ## not slice from the end the way Python's paginate would.
-    runtime = DirectRuntime(registry=SessionRegistry(), client=StubClient())
-    result = await scene_handlers.scene_get_hierarchy(runtime, depth=5, offset=-5, limit=2)
-    assert result["offset"] == 0
-    assert [n["name"] for n in result["nodes"]] == ["Node0", "Node1"]
-
-
 async def test_scene_get_roots_handler():
     client = StubClient()
     runtime = DirectRuntime(registry=SessionRegistry(), client=client)
@@ -2419,9 +2375,6 @@ async def test_current_scene_resource_data_handler():
 
 
 async def test_scene_hierarchy_resource_data_handler():
-    ## StubClient returns the old plugin shape (no pagination metadata); routing
-    ## the resource through scene_get_hierarchy normalizes it, so the resource
-    ## exposes the same shape regardless of plugin version.
     runtime = DirectRuntime(registry=SessionRegistry(), client=StubClient())
     result = await scene_handlers.scene_hierarchy_resource_data(runtime)
     assert "nodes" in result
@@ -2802,7 +2755,10 @@ async def test_client_configure_handler():
     runtime = DirectRuntime(registry=SessionRegistry(), client=client)
     result = await client_handlers.client_configure(runtime, client="codex")
     assert result["client"] == "codex"
+    assert client.calls[-1]["command"] == "configure_client"
     assert client.calls[-1]["params"] == {"client": "codex"}
+    assert client_handlers.CLIENT_CONFIGURE_TIMEOUT_SECONDS == 85.0
+    assert client.calls[-1]["timeout"] == 85.0
 
 
 async def test_client_remove_handler():
@@ -2812,6 +2768,8 @@ async def test_client_remove_handler():
     assert result["client"] == "cursor"
     assert client.calls[-1]["command"] == "remove_client"
     assert client.calls[-1]["params"] == {"client": "cursor"}
+    assert client_handlers.CLIENT_REMOVE_TIMEOUT_SECONDS == 85.0
+    assert client.calls[-1]["timeout"] == 85.0
 
 
 async def test_client_status_handler():
@@ -4081,9 +4039,7 @@ async def test_editor_screenshot_handler_forwards_user_prompt():
     the vision model can describe what the agent is looking for."""
     client = StubClient()
     runtime = DirectRuntime(registry=SessionRegistry(), client=client)
-    await editor_handlers.editor_screenshot(
-        runtime, user_prompt="Why is the spider red?"
-    )
+    await editor_handlers.editor_screenshot(runtime, user_prompt="Why is the spider red?")
     assert client.calls[-1]["params"]["user_prompt"] == "Why is the spider red?"
 
 
@@ -4092,7 +4048,6 @@ async def test_editor_screenshot_handler_omits_empty_user_prompt():
     runtime = DirectRuntime(registry=SessionRegistry(), client=client)
     await editor_handlers.editor_screenshot(runtime, user_prompt="")
     assert "user_prompt" not in client.calls[-1]["params"]
-
 
 
 async def test_editor_screenshot_routed_metadata_forwarded_without_image():
@@ -4142,6 +4097,7 @@ async def test_editor_screenshot_routed_drops_image_block():
     assert '"routed_via": "groq:qwen/qwen3.6-27b"' in result[0].text
     assert "vision_description" in result[0].text
     assert "spider" in result[0].text
+
 
 async def test_editor_screenshot_handler_coverage_passes_param():
     client = StubClient()
@@ -5088,67 +5044,6 @@ async def test_project_stop_handler_returns_fast_when_no_session():
     assert client.calls[-1]["command"] == "stop_project"
 
 
-async def test_project_stop_handler_waits_for_readiness_change():
-    """When session.readiness is 'playing', handler polls until it changes or timeout."""
-    import asyncio
-    import time
-
-    from godot_ai.sessions.registry import Session
-
-    client = StubClient()
-    registry = SessionRegistry()
-    session = Session(
-        session_id="t@0001",
-        godot_version="4.6",
-        project_path="/tmp/test",
-        plugin_version="0.1.0",
-    )
-    session.readiness = "playing"
-    registry.register(session)
-    registry.set_active(session.session_id)
-    runtime = DirectRuntime(registry=registry, client=client)
-
-    # Simulate the plugin's `readiness_changed` event arriving after ~50ms.
-    async def flip_readiness():
-        await asyncio.sleep(0.05)
-        session.readiness = "ready"
-
-    asyncio.create_task(flip_readiness())
-
-    t0 = time.monotonic()
-    await project_handlers.project_stop(runtime)
-    elapsed = time.monotonic() - t0
-    # Should complete when readiness flips, not wait the full 1s timeout.
-    assert elapsed < 0.5, f"Expected fast completion on readiness change, got {elapsed:.3f}s"
-    assert session.readiness == "ready"
-
-
-async def test_project_stop_handler_times_out_if_readiness_stuck():
-    """If readiness stays 'playing' (e.g. hung play process), handler returns after ~1s."""
-    import time
-
-    from godot_ai.sessions.registry import Session
-
-    client = StubClient()
-    registry = SessionRegistry()
-    session = Session(
-        session_id="t@0002",
-        godot_version="4.6",
-        project_path="/tmp/test",
-        plugin_version="0.1.0",
-    )
-    session.readiness = "playing"
-    registry.register(session)
-    registry.set_active(session.session_id)
-    runtime = DirectRuntime(registry=registry, client=client)
-
-    t0 = time.monotonic()
-    await project_handlers.project_stop(runtime)
-    elapsed = time.monotonic() - t0
-    # Timeout should fire ~1s and let the handler return.
-    assert 0.9 <= elapsed < 1.5, f"Expected ~1s timeout, got {elapsed:.3f}s"
-
-
 def _make_stop_project_runtime(
     readiness_after: str, session_id: str
 ) -> tuple[DirectRuntime, "Session"]:
@@ -5165,8 +5060,8 @@ def _make_stop_project_runtime(
         godot_version="4.6",
         project_path="/tmp/test",
         plugin_version="0.2.0",
+        readiness="playing",
     )
-    session.readiness = "playing"
     registry.register(session)
     registry.set_active(session.session_id)
     return DirectRuntime(registry=registry, client=ReadinessAfterStub()), session
@@ -5184,23 +5079,14 @@ async def test_project_stop_handler_consumes_readiness_after():
     elapsed = time.monotonic() - t0
     # No polling: plugin already waited, handler should return ~instantly.
     assert elapsed < 0.1, f"Expected near-zero elapsed, got {elapsed:.3f}s"
-    assert session.readiness == "no_scene"
+    assert runtime.get_session(session.session_id).readiness == "no_scene"
     assert result["readiness_after"] == "no_scene"
 
 
 async def test_project_stop_handler_rejects_unknown_readiness_after():
-    """A buggy plugin returning a junk `readiness_after` must not corrupt
-    session state — we fall through to the polling fallback instead."""
-    import time
-
     runtime, session = _make_stop_project_runtime("bogus_state", "t@0004")
-
-    t0 = time.monotonic()
     await project_handlers.project_stop(runtime)
-    elapsed = time.monotonic() - t0
-    # Rejected → falls back to 1s polling loop (readiness stuck at "playing").
-    assert session.readiness == "playing"
-    assert 0.9 <= elapsed < 1.5, f"Expected polling fallback, got {elapsed:.3f}s"
+    assert runtime.get_session(session.session_id).readiness == "playing"
 
 
 # ---------------------------------------------------------------------------

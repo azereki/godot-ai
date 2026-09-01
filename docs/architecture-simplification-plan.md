@@ -1,8 +1,11 @@
 # Architecture Simplification Plan — Draft 3
 
 - Date: 2026-08-30
-- Status: approved implementation baseline; Phases 0-7 authorized on
-  2026-08-31; publication is not authorized by this document
+- Status: approved implementation baseline; the ownership simplification and
+  core Phase-6 transaction/recovery reducer are present, but the complete
+  section-8.1 external failpoint surface, Phase 1 numeric storm ceilings, the
+  Phase-6 real process matrix, and Phase-7 exact-candidate qualification remain
+  open; publication is not authorized by this document
 - Target: Godot AI v4.0
 - Frozen maximal oracle: `957add991347e94443014cf97079d72713fb05c2`
 - Frozen draft-2 commit: `ba31206`
@@ -12,8 +15,16 @@
   [review 3](architecture-simplification-plan-review-3.md)
 - Executable release proof:
   [verification plan](architecture-simplification-verification-plan.md)
-- Draft-3 reconciliation validation: architecture **PASS**, security **PASS**,
-  execution/release **PASS**; no remaining P0/P1 contradiction reported
+- Latest local implementation evidence:
+  [2026-08-31 checkpoint](v4-local-implementation-checkpoint.md)
+- Draft-3 plan reconciliation at approval: architecture **PASS**, security
+  **PASS**, execution/release **PASS**; this records plan consistency, not final
+  candidate qualification
+
+Implementation checkpoint, 2026-08-31: the current working tree passes every
+mechanical structural gate in section 7. This is source-level evidence, not a
+candidate qualification result. No final A/B bundle, approval, or public-byte
+attestation is recorded by this plan.
 
 ## 1. Objective
 
@@ -67,7 +78,7 @@ nearby aggregate, 44.8% of active installs had emitted a self-update outcome.
 That supports one clean manual major migration while preserving excellent
 one-click updates after v4.
 
-### 2.2 v4 requires Godot 4.7+
+### 2.2 v4 requires Godot 4.7+ within the 4.x line
 
 Recent aggregate engine-version telemetry found:
 
@@ -146,12 +157,18 @@ POSIX other-user claims apply only where owner, mode, and link checks succeed.
 - accidental same-user stale processes, duplicate sessions, and concurrent
   editors;
 - other local users on POSIX when verified private-path checks pass;
-- editor/updater process crashes at named durable boundaries.
+- editor/updater process crashes at named durable boundaries;
+- ambient project/user uv configuration selecting an alternate Python package
+  index or already-installed tool environment for a production launch.
 
 ### 3.2 v4 does not protect against
 
 - compromise of the release-signing key, protected signing workflow, trusted
   repository source, or required approver;
+- compromise of PyPI's index/artifact service or TLS delivery, the selected
+  `uv` executable/cache, or the exact `godot-ai` wheel served under an approved
+  version; plugin signing does not independently bind later-resolved wheel
+  bytes;
 - administrator/kernel compromise;
 - malicious code already running as the same OS account;
 - an attacker who can arbitrarily rewrite the user's project/plugin source;
@@ -159,7 +176,11 @@ POSIX other-user claims apply only where owner, mode, and link checks succeed.
 - sudden power or storage-controller loss without an independently proven
   durability primitive.
 
-Release assets and release notes are inputs, never trust roots.
+Release assets and release notes are inputs, never trust roots. The signing key
+authenticates the plugin tree. Official PyPI/TLS plus uv and same-user local
+machine integrity are separate global trust roots for the Python server and
+transaction actor. Their package/protocol identity response proves
+compatibility only, not provenance.
 
 ## 4. Security and correctness invariants
 
@@ -189,8 +210,11 @@ Every tranche names the invariants it changes and links to executable proof.
 - **M4:** the backup is canonicalized outside the entire project root and stays
   recoverable.
 - **M5:** the new live tree exactly matches the signed v4 manifest.
-- **M6:** clients are repinned/restarted before matching-version server health
-  and representative tools are declared successful.
+- **M6:** owned client configuration is repinned and the exact actor records
+  durable migration completion before matching-version server health and
+  representative tools are declared successful. Clients reconnect to the
+  stable endpoint; restart is remediation for a client that does not reconnect,
+  not an unverifiable global confirmation gate.
 
 ### 4.3 v4 self-update
 
@@ -199,12 +223,16 @@ Every tranche names the invariants it changes and links to executable proof.
 - **U2:** staging completes and validates before quiescence or disablement.
 - **U3:** one canonical install-root lock excludes another activation/editor
   before any live-tree mutation.
-- **U4:** intent, readiness, result, and claim bind the project/install root,
-  transaction, initiating editor process instance, and runner nonce.
+- **U4:** prepared state binds the signed new tree, prepare-time old tree,
+  canonical roots, and initiating editor. Intent/journal, readiness,
+  result/claim, and migration-completion records then strictly bind the
+  identities appropriate to their phase, including the transaction, actor,
+  live tree, claim, and editor lease.
 - **U5:** the initiating reload lineage remains behind a startup barrier until
-  it atomically claims the matching terminal result. Observer editors remain
-  barred until they validate that claim and the activation lock is released;
-  they do not consume or fan the outcome.
+  it atomically claims the matching terminal result. Any non-initiating editor
+  that encounters the active lock fails closed before normal composition and
+  must be re-enabled or restarted after the transaction; it cannot continue
+  stale compiled code as an observer.
 - **U6:** the old runner is the only normal result writer; a dead runner is
   recovered only by an explicit user-invoked repair takeover.
 - **U7:** one external backup is retained after success; rollback/quarantine
@@ -236,6 +264,14 @@ Every tranche names the invariants it changes and links to executable proof.
   surrenders process ownership.
 - **A5:** an update may stop an ordinarily owned server. An unowned stale server
   requires a separate post-update **Replace stale server** action.
+- **A6:** every production server, attach, prewarm, and transaction-actor uvx
+  command uses the one isolated/no-config/no-build resolver policy with
+  official PyPI explicit; Godot-owned spawns also clear inherited uv resolver
+  controls under the process-spawn mutex.
+- **A7:** only an explicit process-local qualification switch plus private uv
+  index authorizes non-PyPI resolution. It and its credentials never persist
+  into client configuration, project files, transaction records, logs, or
+  telemetry.
 
 ### 4.6 Persistence honesty
 
@@ -282,14 +318,16 @@ plugin.gd
   -> constructs owners without starting effects
   -> routes Dock intents to owners
   -> fans immutable snapshots/outcomes to consumers
+  -> invokes the exact actor for authenticated preparation
+  -> quiesces the client owner and constructs a detached coordinator after preparation
 
 McpDock
   -> emits intents
   <- receives snapshots
 
 McpUpdateManager
-  -> client-job quiesce port
-  -> detached-runner factory
+  -> signed release discovery and bounded private-root download
+  -> emits the downloaded candidate's bounded asset/identity values
   <- candidate/progress/outcome values
 
 McpServerLifecycleManager
@@ -322,7 +360,7 @@ Forbidden:
 | Dock attachment | Dock controls and view-local values only |
 | Editor peer | one entry in the editor connection table |
 | Command | one future inside that peer, charged to the global budget |
-| Activation transaction | lock, intent/readiness/result/claim records, staged tree, runner, and backup creation |
+| Activation transaction | prepared state, activation lock/editor leases, intent/journal/readiness/result/claim records, durable migration-completion acknowledgement, staged tree, actors, and backup creation |
 | Install-root recovery artifact | retained successful backup plus its immutable path/hash reference until explicit editor-closed archive or removal |
 
 Construction has no side effects. Normal startup begins only after the
@@ -414,10 +452,22 @@ state out of Dock. Reuse `McpClientConfigurator` for client policy/mutation;
 add at most one private preload-only job owner if instance lifetime cannot live
 there cleanly.
 
-The update manager receives only a `quiesce(deadline) -> result` callable. It
-does not own client jobs or repin. After the update result is claimed, the root
-fans the value to the client owner and requests repin; neither owner retains the
-other.
+The update manager receives no client-owner callable and does not own client
+jobs or repin. The root quiesces the client owner after preparation and
+constructs the value-only coordinator. After the update result is claimed, the
+root fans the value to the client owner and requests repin; neither owner
+retains the other.
+The successful claim itself is the durable pending-migration fact, so a second
+mutable state machine is unnecessary. Only the exact transaction actor may
+publish the immutable completion acknowledgement that releases normal startup.
+
+Every automatic Configure/Remove mutation, including an M6 repin, acquires one
+account-wide durable mutation directory and holds it through post-write status
+verification. Status probes remain lock-free. Consequently an M6 batch is not
+an atomic compare-and-mutate transaction: its initial probe/drift decision can
+become stale before the individual write acquires the lock, and another project
+can complete a serialized write between those points. V4 accepts this as a P2
+last-writer seam; it does not claim whole-batch client atomicity.
 
 Do not create general `TargetResolver` or `EntryPolicy` services in v4. A small
 pure helper is accepted only when it deletes duplicated policy.
@@ -430,10 +480,14 @@ their actual Update path opens the canonical release page instead of applying a
 payload.
 
 The v4 release uses one provisionally named `godot-ai-v4-plugin.zip` with an
-old-key-signed canonical manifest. A small verifier is stored at a full
-immutable pre-v4 source commit and the signing-key fingerprint is published
-independently of release assets. It verifies repository, source, channel,
-tag/version, asset name/size/digest, inventory, and path rules before extraction.
+existing-key-signed canonical manifest. The small verifier comes from the exact
+immutable v4 release source commit. A separately administered attestation binds
+that commit, both verifier-file digests, every plugin and Python-package asset
+identity, each qualification row's complete resolved distribution artifact
+inventory, and the signing-key fingerprint independently of GitHub release
+assets. The verifier checks repository, source, channel, tag/version, asset
+name/size/digest, inventory, and path rules before extraction; Python startup
+separately enforces the exact behavior-defining dependency versions.
 
 Migration order:
 
@@ -441,12 +495,13 @@ Migration order:
 2. run the exact standalone verification command;
 3. close every Godot editor using the project and stop old clients/backend;
 4. canonicalize a safe recovery root outside the entire project;
-5. rename the old add-on tree there on the same filesystem, or for an explicit
-   cross-filesystem manual destination copy it, compare the full tree/hash, and
-   only then remove the live source;
+5. require the recovery root to share the project's filesystem, then rename
+   the complete old add-on tree there; a cross-filesystem destination is
+   refused rather than introducing a second copy/delete migration protocol;
 6. extract one exact v4 tree;
-7. open Godot, enable v4, repin/restart clients;
-8. start the matching server and run representative tools;
+7. open Godot, enable v4, and repin owned client configuration;
+8. durably complete migration, start the matching server, and run
+   representative tools;
 9. retain the backup until the user explicitly cleans it while editors close.
 
 The preferred same-filesystem recovery root is a canonical project-parent
@@ -465,42 +520,73 @@ update fails and the manual instructions choose an explicit safe destination.
 Preparation occurs while the old plugin remains enabled:
 
 ```text
-discover -> authenticate -> download -> extract -> exact-tree validate
-         -> acquire install-root activation lock
-         -> refuse if another live editor owns the root
-         -> quiesce client work
-         -> write intent/journal
-         -> disable and hand off
+discover -> authenticate -> exclusive preflight/editor lease
+         -> allocate private download root -> bounded download
+         -> verify -> extract -> exact-tree validate -> publish prepared.json
+         -> root quiesces client/server work -> disable and hand off
 ```
 
-Activation uses three records plus one exclusive transaction directory:
+Activation reduces one exclusive transaction directory through these strict
+records and authorities:
 
-1. **intent/journal** — schema, canonical roots, transaction, versions,
+1. **prepared** — immutable signed-manifest-derived new-tree identity,
+   prepare-time old-tree identity, canonical roots, versions, initiating editor,
+   and stage location;
+2. **intent/journal** — reconstructed prepared identity, transaction, versions,
    manifest/tree hashes, initiating editor process fingerprint/nonce, runner
    nonce, phase, and recovery action;
-2. **readiness** — matching new code's self-observed version/tree and main-
-   thread minimal-root readiness;
-3. **result** — activation success or rollback/quarantine result written by the
-   old runner.
+3. **readiness** — the initiating new root invokes the frozen old-package
+   startup actor, which verifies the matching live version/tree and publishes
+   readiness;
+4. **result -> claim** — the long-running activation actor writes the bounded
+   result; the frozen startup actor validates and atomically renames that exact
+   record to claim it; and
+5. **migration-complete** — that same frozen actor acknowledges the completed
+   M6 client barrier, bound to the claim, live tree, and editor lease.
+
+The activation lock and editor leases are separate durable authorities, not
+fields that a record can mint.
 
 Normal event order:
 
 ```text
-old code writes intent
--> runner replaces live tree and enables new code
--> new root enters STARTUP_BARRIER and writes readiness
--> runner validates readiness and writes result
--> initiating new root atomically renames result to claim
+old actor publishes prepared.json while old code is live
+-> activation actor reconstructs intent and publishes intent/journal
+-> activation actor replaces live tree and publishes stage_live
+-> coordinator scans and enables new code
+-> new root enters STARTUP_BARRIER and invokes the frozen startup actor
+-> startup actor writes readiness
+-> activation actor validates readiness and writes result
+-> startup actor validates and atomically renames result to claim
+-> root repins owned client configuration
+-> actor publishes migration-complete acknowledgement
 -> root fans one immutable PostUpdateOutcome
 -> root releases normal lifecycle/client/telemetry/update startup
 ```
 
-Other editor processes are observers. They cannot write readiness or claim.
-After the initiating root claims the result and releases the activation lock,
-an observer validates the matching terminal claim and may then enter normal
-startup without consuming or fanning `PostUpdateOutcome`. A missing,
-malformed, mismatched, timed-out, or still-locked outcome leaves the observer
-barred and points to the existing-runtime repair procedure.
+If the editor exits after claim but before acknowledgement, ordinary startup
+rediscovers the one uncompleted successful claim, verifies that it names the
+current exact live tree, reacquires an editor lease, and repeats the client
+migration barrier. Completion requires that exact lease and is an immutable,
+strict record bound to the claim and intent. A completed historical claim is
+semantically complete, but it is not ignored: startup and update preflight
+strictly validate retained history before deciding that no obligation remains.
+This reuses transaction history as authority instead of adding a parallel
+root-level pending pointer or reducer.
+
+V4 transaction records use schema 1. Transaction directories are retained and
+there is no compaction pass, so future schema evolution must first define a
+bounded migration or compaction policy for historical records. A malformed,
+foreign-bound, or unsupported retained record deliberately fails closed; users
+must not hand-edit transaction JSON to bypass that refusal.
+
+Other editor processes are not transaction observers. An editor already live
+holds a lease and blocks preflight. An editor opened after lock acquisition is
+refused before normal composition and disables the plugin; it must load the
+post-transaction tree in a later re-enable or process restart. This deliberately
+avoids letting an old in-memory GDScript instance continue against a newly
+renamed tree. Only the initiating lineage may write readiness, claim, or fan
+`PostUpdateOutcome`.
 
 The old runner holds the only normal writer lock. If it dies, no actor steals
 automatically. Startup remains behind the barrier and requests the existing
@@ -523,10 +609,11 @@ architecture-analysis product.
 
 | Gate | Target |
 |---|---:|
-| lifecycle generic `_host.*` dependencies | 42 -> 0 |
+| lifecycle generic `_host.*` dependencies | 40 -> 0 |
 | UpdateManager retained plugin/Dock references | 0 |
 | detached runner retained owner/Node references | 0 |
 | Dock-owned client worker/static stores | 0 |
+| non-client-owner client `Thread.new()` spawns | 0 |
 | Python session/peer membership maps | 2 -> 1 |
 | external mutable Session field assignments | 0 |
 | owner dependency cycles in changed graph | 0 |
@@ -543,22 +630,29 @@ and wire compatibility. Draft 3 does not authorize deleting those declarations;
 any future removal requires an explicit API decision plus clean-install and
 class-cache evidence rather than being hidden inside a refactor.
 
-The checkpoint baseline is 63,605 physical `.py`/`.gd` lines under `src/` and
-`plugin/`. There is no total net-reduction promise.
+The draft estimated 63,605 physical `.py`/`.gd` lines under `src/` and
+`plugin/`. The pinned `a468a7e` gate supersedes that estimate with the measured
+baseline of 59,859. At the final 2026-08-31 local implementation checkpoint the
+working tree contains 64,084 production physical lines, a net increase of
+4,225, while all eleven structural targets above pass. The result is a
+reduction in owners, branches, legal state combinations, and duplicated
+authority—not a LOC reduction. Recompute both values from the frozen candidate
+before approval.
 
 ## 8. Outstanding PR dispositions
 
-Live status was refreshed on 2026-08-30. Revalidate before pinning the base.
+Live status was revalidated on 2026-08-31 after the rebuild base was pinned.
+Six PRs remain open; #940 merged independently in the pinned base.
 
-| PR | Head | State | Draft-3 disposition |
-|---|---|---|---|
-| #936 | `537a490c865837bedb96042d10ee0fc74673cd99` | UNSTABLE | port early correctness; checkpoint patch-ID equivalent exists |
-| #927 | `1a95bcca51d81d29de925c2f636814eaa037c1c2` | UNSTABLE | port early correctness with its tests |
-| #931 | `418fb5e2eec516f2b34251f0034dc37fe26e680c` | UNSTABLE | port privacy fix before transport rewrite |
-| #930 | `ea79e5a3735198d3be9d562871fddcb0a699bf0a` | UNSTABLE | do not port 308 production lines of general JSONC mutation; supersede with safe Zed manual-config UX |
-| #934 | `5880005515e5fc234ed75f36c1b1cdd3f4595d0d` | UNSTABLE | defer feature/P6 until after v4 architecture |
-| #892 | `d16770c017f106d7035d9a1d59479bb0e3693668` | CLEAN | defer optional physics feature until after v4 |
-| #940 | `d4f16f538710674e01136b1e0ba88bf458c120f4` | CLEAN | review/merge independently before base pin, or explicitly defer; never port inside an architecture tranche |
+| PR | Head at review | V4 outcome |
+|---|---|---|
+| #936 | `537a490c865837bedb96042d10ee0fc74673cd99` | superseded with provenance: root nulls the lifecycle on every exit path, and the manager no longer retains a cyclic version-check object |
+| #927 | `1a95bcca51d81d29de925c2f636814eaa037c1c2` | ported with stronger owned/unowned descendant undo/redo coverage |
+| #931 | `418fb5e2eec516f2b34251f0034dc37fe26e680c` | ported before the transport rewrite; live opt-out is re-read on record/send/status paths |
+| #930 | `ea79e5a3735198d3be9d562871fddcb0a699bf0a` | intentionally superseded: Zed is read-only/manual-config rather than adding a general JSONC mutation subsystem |
+| #934 | `5880005515e5fc234ed75f36c1b1cdd3f4595d0d` | explicitly deferred until after v4; resource persistence is unrelated feature expansion |
+| #892 | `d16770c017f106d7035d9a1d59479bb0e3693668` | explicitly deferred until after v4; bulk physics generation is unrelated feature expansion |
+| #940 | `d4f16f538710674e01136b1e0ba88bf458c120f4` | merged independently as `a468a7e`'s immediate history before the rebuild base was pinned |
 
 For #930, v4 does not attempt to preserve arbitrary JSONC through a custom
 parser. If Zed's supported configuration surface remains comment-bearing, the
@@ -579,7 +673,7 @@ At implementation start, pin:
 - landing-base SHA;
 - oracle SHA/tag;
 - accepted PR heads/patch IDs;
-- historical tag/assets and SHA-256 values;
+- the retained one-time historical evidence digest and boundary decision;
 - exact test-profile manifest;
 - expected-red/current-green/intentional-v4-difference ledger.
 
@@ -597,28 +691,42 @@ pinned main -> tranche T1 -> green tag T1
             -> ... -> final source A
                          |-> exact v4.0.0 bundle A
                          `-> minimal qualification child source B
-                              -> exact v4.1.0rc1 qualification bundle B
+                              -> exact v4.0.1 qualification-only bundle B
 
-bundle A + bundle B -> pre-publication qualification evidence
+bundle A + bundle B + per-row dependency artifacts
+                    -> pre-publication qualification evidence
                     -> publication approval bound to digests
                     -> publish bundle A byte-for-byte
                     -> public redownload/hash attestation
                     -> release-completion record
 ```
 
-The RC successor has a unique signed qualification identity and is never
-relabeled as stable v4.1. Before an eventual v4.1 release, published v4.0 must
-qualify the exact private stable-v4.1 candidate that will be published.
+The successor has a unique signed, stable-shaped qualification identity. Version
+`4.0.1` is permanently burned for this proof: it is never published, relabeled,
+or reused, so the next publishable stable version is at least `4.0.2`. Before an
+eventual v4.1 release, published v4.0 must qualify the exact private stable-v4.1
+candidate that will be published.
 
 Main synchronizes only between immutable green tags. Each sync is range-diffed
 and re-runs affected evidence.
 
 ## 10. Implementation phases
 
+Checkpoint status: Phase 0 decisions and inputs are pinned. Phase 1's historical
+boundary proof and architecture baseline are retained, but its numeric storm
+latency/resource ceilings remain unresolved. Phases 2-5 and the core Phase-6
+transaction/recovery reducer are present and pass the section-7 mechanical
+gates. Phase 6 is not implementation-complete: the current external failpoint
+adapter covers only a subset of activation and coordinator effects and cannot
+uniquely select repeated effect names. The complete section-8.1 surface and
+actual process matrix remain required before Phase 7. The phase bullets below
+stay as the approved execution contract rather than being rewritten as a
+release changelog.
+
 ### Phase 0 — approve and pin
 
 - review draft 3 and the verification companion;
-- affirm Godot 4.7+ and manual-only v4.0 install;
+- affirm Godot 4.7+ within the 4.x line and manual-only v4.0 install;
 - decide #940 independently;
 - fetch/pin landing main and all PR/tag inputs;
 - write the tranche/provenance manifest;
@@ -629,7 +737,8 @@ Exit: approved scope and immutable inputs.
 ### Phase 1 — characterize externally
 
 - freeze only invariant/user-visible behavior;
-- classify all historical updater implementations;
+- classify all historical updater implementations once and retain the compact
+  result, not the implementation-era classifier stack;
 - baseline the explicit simplification gates;
 - establish deterministic seeds/workloads and numeric stress ceilings;
 - mark each proof expected-red, current-green, oracle-only, or intentional v4
@@ -673,7 +782,8 @@ Exit: O5 and A1-A5 pass; hard lifecycle gates are met.
 - implement one Godot-4.7 v4 package producer and distinct asset name;
 - implement the standalone verifier using the existing signing root;
 - freeze/deprecate overlaying store surfaces;
-- prove all historical updater classes no-mutation with provisional fixtures;
+- preserve the completed one-time proof that historical updater classes do not
+  select or install the distinct v4 asset shape;
 - test the exact documented external backup and clean migration flow.
 
 Exit: M1-M6 pass against provisional release-shaped fixtures. No fixture is
@@ -681,8 +791,14 @@ called a final candidate.
 
 ### Phase 6 — transactional updater
 
+Checkpoint: the reducer, durable records, startup barrier, and production-inert
+qualification capability are present. The qualification adapter is partial;
+all section-8.1 effects still need unique external addressing and command-path
+wiring before the process matrix can run as specified.
+
 - implement external recovery root, install lock/editor leases, exact staging,
-  journal/readiness/result/claim reducer, retained backup, and startup barrier;
+  prepared/intent/journal/readiness/result/claim/migration-complete reducer,
+  retained backup, and startup barrier;
 - expose repair through the existing Python CLI/runtime, not a new service;
 - add externally controlled, production-inert failpoint barriers;
 - run two-editor, crash, rollback, quarantine, and repair proofs.
@@ -725,11 +841,13 @@ Only after v4 architecture is stable:
 - DACL-based hostile-local-user claim on Windows;
 - power-loss durability;
 - general-purpose cognitive-metrics analyzer;
+- atomic compare-and-mutate across the M6 probe-to-client-write interval;
+- historical transaction-record schema migration or compaction;
 - unrelated UI/features and opportunistic cleanup.
 
 ## 12. Approved implementation decisions
 
-1. Godot 4.7+ is the v4 floor despite the measured 12.8% 4.6-and-older
+1. Godot 4.7+ within the 4.x line is the v4 support range despite the measured 12.8% 4.6-and-older
    cohort.
 2. v4.0 uses manual GitHub-release clean migration; v3 Store/Asset Library
    listings remain frozen.

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from godot_ai.resources.project import COMMON_SETTINGS
-from godot_ai.server import create_server
+from tests.conftest import create_test_server as create_server
 
 
 @pytest.fixture

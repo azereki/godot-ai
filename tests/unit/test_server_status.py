@@ -10,19 +10,59 @@ from godot_ai import server as server_module
 from godot_ai.protocol.attach import (
     ATTACH_SPAWNED_ENV,
     PLUGIN_SPAWNED_ENV,
+    SERVER_INSTANCE_ID,
     owner_type_from_env,
 )
-from godot_ai.server import create_server
+from godot_ai.telemetry import TelemetryConfig
+from tests.conftest import (
+    TEST_HTTP_AUTH_HEADERS,
+    TEST_TRANSPORT_CAPABILITIES,
+    TEST_WS_CAPABILITY,
+)
+from tests.conftest import (
+    create_test_server as create_server,
+)
+
+
+def test_every_http_route_requires_the_distinct_http_capability() -> None:
+    server = create_server(ws_port=9554)
+    client = TestClient(
+        server.http_app(transport="streamable-http"),
+        base_url="http://127.0.0.1",
+    )
+
+    for method, path in (
+        ("GET", "/godot-ai/status"),
+        ("POST", "/godot-ai/lease/register"),
+        ("POST", "/mcp"),
+    ):
+        response = client.request(method, path)
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "TRANSPORT_AUTH_REQUIRED"
+
+        crossed = client.request(
+            method,
+            path,
+            headers={"Authorization": f"Bearer {TEST_WS_CAPABILITY}"},
+        )
+        assert crossed.status_code == 401
+
+    assert client.get("/godot-ai/status", headers=TEST_HTTP_AUTH_HEADERS).status_code == 200
 
 
 def test_status_route_reports_live_server_version():
     server = create_server(ws_port=9555, exclude_domains={"audio", "theme"})
+    assert server.version == __version__
     app = server.http_app(transport="streamable-http")
     ## ``base_url`` overrides Starlette TestClient's default ``testserver``
     ## Host header. The DNS-rebinding guard (origin_guard.py) rejects any
     ## non-loopback Host, so without this the request 403s before
     ## reaching the status route. See audit-v2 finding #1 (#345).
-    client = TestClient(app, base_url="http://127.0.0.1")
+    client = TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        headers=TEST_HTTP_AUTH_HEADERS,
+    )
 
     response = client.get("/godot-ai/status")
 
@@ -30,6 +70,7 @@ def test_status_route_reports_live_server_version():
     payload = response.json()
     instance_id = payload.pop("instance_id")
     catalog_hash = payload.pop("tool_catalog_hash")
+    telemetry_enabled = payload.pop("telemetry_enabled")
     assert payload == {
         "name": "godot-ai",
         "server_version": __version__,
@@ -41,9 +82,34 @@ def test_status_route_reports_live_server_version():
         "attach_protocol_version": 1,
         "active_lease_count": 0,
     }
+    assert telemetry_enabled is (not TelemetryConfig._is_disabled_via_env())
     assert len(instance_id) == 32
     assert len(catalog_hash) == 64
     assert set(catalog_hash) <= set("0123456789abcdef")
+
+
+def test_status_route_telemetry_enabled_rereads_env(monkeypatch) -> None:
+    ## Prove a live env re-read on an already-constructed server, not a
+    ## construction-time snapshot (upstream PR #931 / issue #913).
+    monkeypatch.delenv("GODOT_AI_DISABLE_TELEMETRY", raising=False)
+    monkeypatch.delenv("DISABLE_TELEMETRY", raising=False)
+    server = create_server(ws_port=9557)
+    app = server.http_app(transport="streamable-http")
+    client = TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        headers=TEST_HTTP_AUTH_HEADERS,
+    )
+
+    before = client.get("/godot-ai/status")
+    assert before.status_code == 200
+    assert before.json()["telemetry_enabled"] is True
+
+    monkeypatch.setenv("GODOT_AI_DISABLE_TELEMETRY", "true")
+    response = client.get("/godot-ai/status")
+
+    assert response.status_code == 200
+    assert response.json()["telemetry_enabled"] is False
 
 
 def test_status_route_package_path_points_at_loaded_package_dir():
@@ -55,7 +121,11 @@ def test_status_route_package_path_points_at_loaded_package_dir():
     ## resolved path to a real directory containing `__init__.py`.
     server = create_server(ws_port=9556)
     app = server.http_app(transport="streamable-http")
-    client = TestClient(app, base_url="http://127.0.0.1")
+    client = TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        headers=TEST_HTTP_AUTH_HEADERS,
+    )
 
     response = client.get("/godot-ai/status")
 
@@ -82,7 +152,10 @@ def test_owner_type_uses_spawn_markers_with_plugin_precedence(monkeypatch) -> No
     assert owner_type_from_env() == "plugin"
 
 
-async def test_attach_owned_lifespan_wires_lease_count_into_idle_reaper(monkeypatch) -> None:
+async def test_attach_owned_lifespan_wires_lease_count_into_idle_reaper(
+    monkeypatch,
+    tmp_path,
+) -> None:
     started = asyncio.Event()
     captured: dict[str, object] = {}
 
@@ -92,6 +165,9 @@ async def test_attach_owned_lifespan_wires_lease_count_into_idle_reaper(monkeypa
 
         async def start(self) -> None:
             await asyncio.Event().wait()
+
+        async def wait_until_ready(self) -> None:
+            return None
 
     async def fake_watch_idle(session_count, *, lease_count, **_kwargs) -> None:
         captured["sessions"] = session_count()
@@ -110,6 +186,7 @@ async def test_attach_owned_lifespan_wires_lease_count_into_idle_reaper(monkeypa
     monkeypatch.setattr(server_module, "should_arm_attach_idle_exit", lambda: True)
     monkeypatch.setattr(server_module, "watch_idle", fake_watch_idle)
     monkeypatch.setattr(server_module, "shutdown_if_initialized", lambda: None)
+    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path))
 
     server = create_server(ws_port=9561)
     async with server._lifespan(server):
@@ -117,7 +194,66 @@ async def test_attach_owned_lifespan_wires_lease_count_into_idle_reaper(monkeypa
         assert captured == {"sessions": 0, "leases": 0}
 
 
-async def test_plugin_owned_lifespan_wires_lease_count_into_both_reapers(monkeypatch) -> None:
+async def test_lifespan_publishes_after_ws_ready_and_cleans_only_its_record(
+    monkeypatch,
+) -> None:
+    order: list[object] = []
+    started = asyncio.Event()
+
+    class FakeClaim:
+        def release(self) -> None:
+            order.append("release")
+
+    class FakeWebSocketServer:
+        def __init__(self, _registry, *, port: int, auth_token: str) -> None:
+            self.port = port
+            assert auth_token == TEST_TRANSPORT_CAPABILITIES.websocket
+
+        async def start(self) -> None:
+            order.append("ws-start")
+            started.set()
+            await asyncio.Event().wait()
+
+        async def wait_until_ready(self) -> None:
+            await started.wait()
+            order.append("ws-ready")
+
+    def write(http_port, http, websocket, *, instance_nonce) -> None:
+        order.append(("publish", http_port, http, websocket, instance_nonce))
+
+    def remove(http_port, instance_nonce) -> bool:
+        order.append(("remove", http_port, instance_nonce))
+        return True
+
+    monkeypatch.setattr(server_module, "GodotWebSocketServer", FakeWebSocketServer)
+    monkeypatch.setattr(
+        server_module,
+        "GodotClient",
+        lambda *_args: SimpleNamespace(default_hint_policy="preserve"),
+    )
+    monkeypatch.setattr(server_module, "acquire_port_claim", lambda port: FakeClaim())
+    monkeypatch.setattr(server_module, "write_capabilities", write)
+    monkeypatch.setattr(server_module, "remove_capabilities", remove)
+    monkeypatch.setattr(server_module, "should_arm_reaper", lambda _owner_pid: False)
+    monkeypatch.setattr(server_module, "should_arm_idle_exit", lambda _owner_pid: False)
+    monkeypatch.setattr(server_module, "should_arm_attach_idle_exit", lambda: False)
+    monkeypatch.setattr(server_module, "shutdown_if_initialized", lambda: None)
+
+    server = create_server(ws_port=9563, http_port=8123)
+    async with server._lifespan(server):
+        publish_index = next(i for i, event in enumerate(order) if event[0] == "publish")
+        assert order.index("ws-ready") < publish_index
+
+    assert order[-2:] == [
+        ("remove", 8123, SERVER_INSTANCE_ID),
+        "release",
+    ]
+
+
+async def test_plugin_owned_lifespan_wires_lease_count_into_both_reapers(
+    monkeypatch,
+    tmp_path,
+) -> None:
     started = asyncio.Event()
     captured: dict[str, int] = {}
 
@@ -127,6 +263,9 @@ async def test_plugin_owned_lifespan_wires_lease_count_into_both_reapers(monkeyp
 
         async def start(self) -> None:
             await asyncio.Event().wait()
+
+        async def wait_until_ready(self) -> None:
+            return None
 
     async def fake_watch_owner(_owner_pid, session_count, *, lease_count, **_kwargs) -> None:
         captured["owner_sessions"] = session_count()
@@ -153,6 +292,7 @@ async def test_plugin_owned_lifespan_wires_lease_count_into_both_reapers(monkeyp
     monkeypatch.setattr(server_module, "watch_owner", fake_watch_owner)
     monkeypatch.setattr(server_module, "watch_idle", fake_watch_idle)
     monkeypatch.setattr(server_module, "shutdown_if_initialized", lambda: None)
+    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path))
 
     server = create_server(ws_port=9562, owner_pid=4242)
     async with server._lifespan(server):
@@ -169,14 +309,16 @@ def test_status_route_reports_active_attach_lease_count():
     """#824: the plugin reads this at editor exit to decide detach vs kill."""
     server = create_server(ws_port=9556)
     app = server.http_app(transport="streamable-http")
-    client = TestClient(app, base_url="http://127.0.0.1")
+    client = TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        headers=TEST_HTTP_AUTH_HEADERS,
+    )
 
     instance_id = client.get("/godot-ai/status").json()["instance_id"]
     assert client.get("/godot-ai/status").json()["active_lease_count"] == 0
 
-    registered = client.post(
-        "/godot-ai/lease/register", json={"instance_id": instance_id}
-    )
+    registered = client.post("/godot-ai/lease/register", json={"instance_id": instance_id})
     assert registered.status_code == 200
     lease_id = registered.json()["lease_id"]
 
@@ -199,19 +341,23 @@ def test_status_lease_count_tracks_multiple_bridges():
     """#824: releasing one of several bridges must not free the backend."""
     server = create_server(ws_port=9557)
     app = server.http_app(transport="streamable-http")
-    client = TestClient(app, base_url="http://127.0.0.1")
+    client = TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        headers=TEST_HTTP_AUTH_HEADERS,
+    )
 
     instance_id = client.get("/godot-ai/status").json()["instance_id"]
 
     def count() -> int:
         return client.get("/godot-ai/status").json()["active_lease_count"]
 
-    first = client.post(
-        "/godot-ai/lease/register", json={"instance_id": instance_id}
-    ).json()["lease_id"]
-    second = client.post(
-        "/godot-ai/lease/register", json={"instance_id": instance_id}
-    ).json()["lease_id"]
+    first = client.post("/godot-ai/lease/register", json={"instance_id": instance_id}).json()[
+        "lease_id"
+    ]
+    second = client.post("/godot-ai/lease/register", json={"instance_id": instance_id}).json()[
+        "lease_id"
+    ]
     assert count() == 2
 
     ## One bridge exits; the other still holds the backend, so the editor's

@@ -13,7 +13,24 @@ from godot_ai.godot_client.client import GodotClient, GodotCommandError
 from godot_ai.handlers import editor as editor_handlers
 from godot_ai.handlers import scene as scene_handlers
 from godot_ai.runtime.direct import DirectRuntime
-from tests.conftest import drain_handshake_ack
+from godot_ai.sessions.registry import SessionRegistry
+from godot_ai.transport import websocket as websocket_transport
+from godot_ai.transport.websocket import (
+    DEFAULT_MAX_HANDSHAKE_FRAME_BYTES,
+    DEFAULT_MAX_MESSAGE_BYTES,
+    GodotWebSocketServer,
+)
+from tests.conftest import (
+    TEST_TRANSPORT_CAPABILITIES,
+    TEST_WS_CAPABILITY,
+    allocate_free_port,
+    allocate_free_ports,
+    build_auth_response,
+    create_test_server,
+    perform_v4_handshake,
+    receive_auth_challenge,
+    send_auth_hello,
+)
 
 # ---------------------------------------------------------------------------
 # Handshake
@@ -30,12 +47,21 @@ class TestHandshake:
     async def test_handshake_populates_session_fields(self, harness):
         plugin = await harness.connect_plugin(
             session_id="sess-2",
-            godot_version="4.5.0",
+            godot_version="4.7.0",
             project_path="/home/user/my_game",
         )
         session = harness.registry.get("sess-2")
-        assert session.godot_version == "4.5.0"
+        assert session.godot_version == "4.7.0"
         assert session.project_path == "/home/user/my_game"
+        await plugin.close()
+
+    async def test_handshake_accepts_exact_godot_47_engine_string(self, harness):
+        version = "4.7-stable (official)"
+        plugin = await harness.connect_plugin(
+            session_id="sess-godot-47-official",
+            godot_version=version,
+        )
+        assert harness.registry.get("sess-godot-47-official").godot_version == version
         await plugin.close()
 
     async def test_handshake_sets_readiness_from_plugin(self, harness):
@@ -61,16 +87,16 @@ class TestHandshake:
         ## logs only.
         captured = {}
         unregistered = asyncio.Event()
-        real_unregister = harness.registry.unregister
+        real_remove = harness.registry.remove_connection
 
-        def spy(session_id, close_code=None):
+        def spy(session_id, *, peer=None, close_code=None):
             captured["close_code"] = close_code
             try:
-                return real_unregister(session_id, close_code=close_code)
+                return real_remove(session_id, peer=peer, close_code=close_code)
             finally:
                 unregistered.set()
 
-        monkeypatch.setattr(harness.registry, "unregister", spy)
+        monkeypatch.setattr(harness.registry, "remove_connection", spy)
         plugin = await harness.connect_plugin(session_id="sess-cc")
         await plugin.ws.close(code=1011, reason="keepalive ping timeout")
         ## Deterministic wait — a fixed sleep can race server cleanup under
@@ -85,8 +111,7 @@ class TestHandshake:
         assert session.editor_pid == 4242
         await plugin.close()
 
-    async def test_handshake_missing_editor_pid_defaults_to_zero(self, harness):
-        ## Default path — plugin omits the field (older plugin versions).
+    async def test_handshake_records_zero_editor_pid(self, harness):
         plugin = await harness.connect_plugin(session_id="sess-no-pid")
         session = harness.registry.get("sess-no-pid")
         assert session.editor_pid == 0
@@ -101,21 +126,12 @@ class TestHandshake:
         ## Bypass the `connect_plugin` helper so we can observe the ack on
         ## the wire directly — the helper drains it.
         ws = await websockets.connect(f"ws://127.0.0.1:{harness.port}")
-        handshake = {
-            "type": "handshake",
-            "session_id": "ack-probe",
-            "godot_version": "4.4.1",
-            "project_path": "/tmp",
-            "plugin_version": "9.9.9",
-            "protocol_version": 1,
-            "readiness": "ready",
-            "editor_pid": 0,
-        }
-        await ws.send(json.dumps(handshake))
-
-        ack_raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
-        ack = json.loads(ack_raw)
-        assert ack["type"] == "handshake_ack"
+        ack = await perform_v4_handshake(
+            ws,
+            session_id="ack-probe",
+            project_path="/tmp",
+            plugin_version="9.9.9",
+        )
         assert ack["server_version"] == _SERVER_VERSION, (
             "ack must quote the server's own package version (from "
             "godot_ai.__version__), not echo the handshake's plugin_version"
@@ -131,7 +147,7 @@ class TestHandshake:
         await plugin.send_event("readiness_changed", {"readiness": "ready"})
         await asyncio.sleep(0.05)
 
-        assert session.last_seen > baseline
+        assert harness.registry.get("sess-heartbeat").last_seen > baseline
         await plugin.close()
 
 
@@ -143,7 +159,7 @@ class TestHandshake:
 class TestCommandRoundTrip:
     async def test_send_command_and_receive_response(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -159,7 +175,7 @@ class TestCommandRoundTrip:
 
     async def test_error_watermark_first_observation_baselines_silently(self, harness):
         plugin = await harness.connect_plugin(session_id="err-baseline")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -185,7 +201,7 @@ class TestCommandRoundTrip:
 
     async def test_error_watermark_advance_injects_hint_once(self, harness):
         plugin = await harness.connect_plugin(session_id="err-watermark")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -240,7 +256,7 @@ class TestCommandRoundTrip:
         ## as a Debugger Errors-tab row. Both components advance by 1; the
         ## agent must be told about 1 new error, not 2 (#642 live smoke).
         plugin = await harness.connect_plugin(session_id="err-overlap")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -297,7 +313,7 @@ class TestCommandRoundTrip:
         ## ADVANCED run: the per-run component has no baseline to diff
         ## against, so it counts in full rather than baselining silently.
         plugin = await harness.connect_plugin(session_id="err-first-game")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -324,7 +340,7 @@ class TestCommandRoundTrip:
 
     async def test_error_watermark_component_reset_counts_current_value(self, harness):
         plugin = await harness.connect_plugin(session_id="err-reset")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -359,7 +375,7 @@ class TestCommandRoundTrip:
 
     async def test_error_watermark_missing_key_retains_prior_baseline(self, harness):
         plugin = await harness.connect_plugin(session_id="err-missing-key")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -399,7 +415,7 @@ class TestCommandRoundTrip:
 
     async def test_error_watermark_run_boundary_counts_reaccumulated_game_errors(self, harness):
         plugin = await harness.connect_plugin(session_id="err-run-seq")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -426,7 +442,7 @@ class TestCommandRoundTrip:
 
     async def test_error_watermark_error_response_accumulates_until_success(self, harness):
         plugin = await harness.connect_plugin(session_id="err-accumulate")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -470,7 +486,7 @@ class TestCommandRoundTrip:
 
     async def test_error_watermark_probe_success_does_not_consume_pending_hint(self, harness):
         plugin = await harness.connect_plugin(session_id="err-probe")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -521,7 +537,6 @@ class TestCommandRoundTrip:
         plugin = await harness.connect_plugin(session_id="err-discard")
         client = GodotClient(
             harness.server,
-            harness.registry,
             default_hint_policy="discard",
         )
 
@@ -578,7 +593,7 @@ class TestCommandRoundTrip:
         ## new_warnings_since_last_call — the pre-fix watermark dropped every
         ## warning, so a warning-only run read as clean.
         plugin = await harness.connect_plugin(session_id="warn-watermark")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -618,7 +633,7 @@ class TestCommandRoundTrip:
         ## Errors and warnings advancing in the same response each get their
         ## own hint and count; neither is folded into the other.
         plugin = await harness.connect_plugin(session_id="warn-and-err")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -658,7 +673,7 @@ class TestCommandRoundTrip:
         ## (no shared view like the error path's game/debugger overlap), so
         ## their deltas sum rather than dedupe with max().
         plugin = await harness.connect_plugin(session_id="warn-sum")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -687,7 +702,7 @@ class TestCommandRoundTrip:
         ## game_warn is per-run: first seen on an advanced run has no baseline
         ## to diff, so it counts in full (mirrors game_error_warn).
         plugin = await harness.connect_plugin(session_id="warn-new-run")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -714,7 +729,7 @@ class TestCommandRoundTrip:
 
     async def test_command_with_params(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -732,7 +747,7 @@ class TestCommandRoundTrip:
     async def test_request_id_correlation(self, harness):
         """Two concurrent commands get routed to the correct callers."""
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd1 = await plugin.recv_command()
@@ -756,7 +771,7 @@ class TestCommandRoundTrip:
         """A read and a write in flight at the same time stay on their target sessions."""
         plugin_a = await harness.connect_plugin(session_id="route-a")
         plugin_b = await harness.connect_plugin(session_id="route-b")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def respond_a():
             cmd = await plugin_a.recv_command()
@@ -805,7 +820,7 @@ class TestPendingFutureScoping:
         ConnectionError, not a TimeoutError, so the circuit breaker records
         a disconnect."""
         plugin = await harness.connect_plugin(session_id="dc-inflight")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def crash_mid_command():
             await plugin.recv_command()
@@ -833,7 +848,7 @@ class TestPendingFutureScoping:
         session B's in-flight command."""
         plugin_a = await harness.connect_plugin(session_id="dc-a")
         plugin_b = await harness.connect_plugin(session_id="dc-b")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def respond_b_after_a_dies():
             cmd = await plugin_b.recv_command()
@@ -855,7 +870,7 @@ class TestPendingFutureScoping:
         command was sent to may resolve its future."""
         plugin_a = await harness.connect_plugin(session_id="inj-a")
         plugin_b = await harness.connect_plugin(session_id="inj-b")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def inject_then_answer():
             cmd = await plugin_a.recv_command()
@@ -885,7 +900,7 @@ class TestPendingFutureScoping:
 class TestErrors:
     async def test_plugin_error_raises_godot_command_error(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -902,7 +917,7 @@ class TestErrors:
 
     async def test_plugin_error_preserves_structured_data(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         candidates = ["/Main/VisualA", "/Main/VisualB"]
 
         async def mock_handler():
@@ -930,7 +945,7 @@ class TestErrors:
         dashboards, sub-code visible both structurally and in str(exc)
         for clients that only see the serialized error."""
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -958,7 +973,7 @@ class TestErrors:
         await plugin.close()
 
     async def test_send_to_no_active_session_raises(self, harness):
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         with pytest.raises(GodotCommandError) as exc_info:
             await client.send("anything")
         assert exc_info.value.code == "PLUGIN_DISCONNECTED"
@@ -968,7 +983,7 @@ class TestErrors:
         assert "container localhost is not host localhost" in exc_info.value.data["hint"]
 
     async def test_send_to_unknown_session_raises(self, harness):
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         with pytest.raises(GodotCommandError) as exc_info:
             await client.send("anything", session_id="nonexistent")
         assert exc_info.value.code == "PLUGIN_DISCONNECTED"
@@ -980,7 +995,7 @@ class TestErrors:
 
     async def test_timeout_raises(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         # Don't respond — let it time out
         with pytest.raises(TimeoutError):
@@ -990,7 +1005,7 @@ class TestErrors:
 
     async def test_deferred_timeout_error_reaches_client(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -1017,18 +1032,37 @@ class TestErrors:
 
     async def test_timeout_removes_pending_request_and_ignores_late_reply(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
+
+        await plugin.send_response(
+            "never-pending",
+            {"unsolicited": True},
+            readiness="playing",
+            error_watermark={"run_seq": 1, "debugger_promoted": 100},
+        )
+        await asyncio.sleep(0.05)
+        live = harness.registry.get(plugin.session_id)
+        assert live.readiness == "ready"
+        assert live.error_watermark == {}
 
         with pytest.raises(TimeoutError):
             await client.send("slow_command", timeout=0.05)
 
-        assert harness.server._pending == {}
+        assert harness.registry.pending_count == 0
 
         cmd = await plugin.recv_command()
-        await plugin.send_response(cmd["request_id"], {"arrived": "late"})
+        await plugin.send_response(
+            cmd["request_id"],
+            {"arrived": "late"},
+            readiness="importing",
+            error_watermark={"run_seq": 2, "debugger_promoted": 200},
+        )
         await asyncio.sleep(0.05)
 
-        assert harness.server._pending == {}
+        assert harness.registry.pending_count == 0
+        live = harness.registry.get(plugin.session_id)
+        assert live.readiness == "ready"
+        assert live.error_watermark == {}
         await plugin.close()
 
 
@@ -1063,11 +1097,11 @@ class TestEvents:
 
         await plugin.send_event("readiness_changed", {"readiness": "importing"})
         await asyncio.sleep(0.05)
-        assert session.readiness == "importing"
+        assert harness.registry.get("evt-3").readiness == "importing"
 
         await plugin.send_event("readiness_changed", {"readiness": "ready"})
         await asyncio.sleep(0.05)
-        assert session.readiness == "ready"
+        assert harness.registry.get("evt-3").readiness == "ready"
         await plugin.close()
 
 
@@ -1091,12 +1125,20 @@ class TestEventValidation:
             await plugin.send_event("scene_changed", {"current_scene": 12345})
             await asyncio.sleep(0.05)
 
-        assert session.current_scene == baseline_scene, (
+        assert harness.registry.get("evt-bad-scene").current_scene == baseline_scene, (
             "current_scene must not be overwritten with a non-string"
         )
         assert any("Dropping malformed scene_changed" in m for m in caplog.messages), (
             "expected warning log naming the dropped event"
         )
+        await plugin.close()
+
+    async def test_scene_changed_cannot_retain_oversized_path(self, harness):
+        plugin = await harness.connect_plugin(session_id="evt-huge-scene")
+        await plugin.send_event("scene_changed", {"current_scene": "x" * 4097})
+        await asyncio.sleep(0.05)
+
+        assert harness.registry.get("evt-huge-scene").current_scene == ""
         await plugin.close()
 
     async def test_play_state_changed_with_non_string_payload_is_dropped(self, harness, caplog):
@@ -1108,7 +1150,7 @@ class TestEventValidation:
             await plugin.send_event("play_state_changed", {"play_state": ["running"]})
             await asyncio.sleep(0.05)
 
-        assert session.play_state == baseline_play
+        assert harness.registry.get("evt-bad-play").play_state == baseline_play
         assert any("Dropping malformed play_state_changed" in m for m in caplog.messages)
         await plugin.close()
 
@@ -1121,7 +1163,7 @@ class TestEventValidation:
             await plugin.send_event("readiness_changed", {"readiness": {"nested": "obj"}})
             await asyncio.sleep(0.05)
 
-        assert session.readiness == baseline_ready
+        assert harness.registry.get("evt-bad-ready").readiness == baseline_ready
         assert any("Dropping malformed readiness_changed" in m for m in caplog.messages)
         await plugin.close()
 
@@ -1136,7 +1178,8 @@ class TestEventValidation:
         await plugin.send_event("future_event", {"foo": "bar"})
         await asyncio.sleep(0.05)
 
-        assert (session.current_scene, session.play_state, session.readiness) == before
+        live = harness.registry.get("evt-unknown")
+        assert (live.current_scene, live.play_state, live.readiness) == before
         await plugin.close()
 
     async def test_valid_event_after_malformed_one_still_applies(self, harness, caplog):
@@ -1144,7 +1187,6 @@ class TestEventValidation:
         ## the connection — the next valid event for the same session
         ## should still update the typed field.
         plugin = await harness.connect_plugin(session_id="evt-recover")
-        session = harness.registry.get("evt-recover")
 
         with caplog.at_level("WARNING", logger="godot_ai.transport.websocket"):
             await plugin.send_event("readiness_changed", {"readiness": 42})
@@ -1152,7 +1194,7 @@ class TestEventValidation:
 
         await plugin.send_event("readiness_changed", {"readiness": "importing"})
         await asyncio.sleep(0.05)
-        assert session.readiness == "importing"
+        assert harness.registry.get("evt-recover").readiness == "importing"
         await plugin.close()
 
 
@@ -1165,7 +1207,7 @@ class TestMultipleSessions:
     async def test_two_sessions_independent(self, harness):
         plugin_a = await harness.connect_plugin(session_id="multi-a")
         plugin_b = await harness.connect_plugin(session_id="multi-b")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         assert len(harness.registry) == 2
 
@@ -1233,7 +1275,7 @@ class TestMultipleSessions:
 
         plugin_new = await harness.connect_plugin(session_id="reconnect-new")
         assert harness.registry.active_session_id == "reconnect-new"
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def respond_new():
             cmd = await plugin_new.recv_command()
@@ -1301,21 +1343,7 @@ class TestDnsRebindingGuard:
             f"ws://127.0.0.1:{harness.port}",
             origin="http://localhost:9500",
         )
-        handshake = {
-            "type": "handshake",
-            "session_id": "origin-loopback",
-            "godot_version": "4.4.1",
-            "project_path": "/tmp",
-            "plugin_version": "0.0.1",
-            "protocol_version": 1,
-            "readiness": "ready",
-            "editor_pid": 0,
-        }
-        await ws.send(json.dumps(handshake))
-        await asyncio.sleep(0.05)
-        ## Drain the ack so it doesn't pollute later asserts.
-        ## Mandatory (#716) — see conftest's drain_handshake_ack.
-        await drain_handshake_ack(ws)
+        await perform_v4_handshake(ws, session_id="origin-loopback", project_path="/tmp")
         assert harness.registry.get("origin-loopback") is not None
         await ws.close()
 
@@ -1349,20 +1377,7 @@ class TestDnsRebindingGuard:
             f"ws://127.0.0.1:{harness.port}",
             origin="http://[::1]:9500",
         )
-        handshake = {
-            "type": "handshake",
-            "session_id": "ipv6-loopback",
-            "godot_version": "4.4.1",
-            "project_path": "/tmp",
-            "plugin_version": "0.0.1",
-            "protocol_version": 1,
-            "readiness": "ready",
-            "editor_pid": 0,
-        }
-        await ws.send(json.dumps(handshake))
-        await asyncio.sleep(0.05)
-        ## Mandatory ack drain (#716) — see conftest's drain_handshake_ack.
-        await drain_handshake_ack(ws)
+        await perform_v4_handshake(ws, session_id="ipv6-loopback", project_path="/tmp")
         assert harness.registry.get("ipv6-loopback") is not None
         await ws.close()
 
@@ -1390,8 +1405,8 @@ class TestDuplicateHandshake:
         ## Without rejection, a second handshake with the same session_id
         ## silently overwrites both `_connections[session_id]` and the
         ## registry entry — routing every subsequent command to the
-        ## attacker. session_id is `<slug>@<4hex>` so 16 bits of suffix is
-        ## locally guessable. Reject keeps the first peer authoritative.
+        ## attacker. The v4 suffix is a cryptographic 64-bit collision guard,
+        ## not authorization; rejection still keeps the first peer authoritative.
         first = await harness.connect_plugin(session_id="dup-target")
         original_session = harness.registry.get("dup-target")
         assert original_session is not None
@@ -1400,18 +1415,21 @@ class TestDuplicateHandshake:
         ## Hand-roll the second handshake so we observe the close on the
         ## wire — `connect_plugin()` would assert on the missing ack.
         ws2 = await websockets.connect(f"ws://127.0.0.1:{harness.port}")
+        nonce = await send_auth_hello(ws2)
+        challenge = await receive_auth_challenge(
+            ws2,
+            capability=harness.capability,
+            client_nonce=nonce,
+        )
         await ws2.send(
             json.dumps(
-                {
-                    "type": "handshake",
-                    "session_id": "dup-target",
-                    "godot_version": "4.4.1",
-                    "project_path": "/tmp/attacker",
-                    "plugin_version": "0.0.1",
-                    "protocol_version": 1,
-                    "readiness": "ready",
-                    "editor_pid": 9999,
-                }
+                build_auth_response(
+                    challenge,
+                    capability=harness.capability,
+                    session_id="dup-target",
+                    project_path="/tmp/attacker",
+                    editor_pid=9999,
+                )
             )
         )
 
@@ -1429,7 +1447,7 @@ class TestDuplicateHandshake:
         ## Round-trip a command through the original to prove its WS is
         ## still wired to the routing map (regression: silent overwrite
         ## also hijacks `_connections[session_id]`).
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await first.recv_command()
@@ -1458,94 +1476,233 @@ class TestDuplicateHandshake:
 
 
 # ---------------------------------------------------------------------------
-# Per-launch handshake auth token (#690 finding 4)
+# Secure v4 challenge handshake
 # ---------------------------------------------------------------------------
 
 
-class TestHandshakeAuthToken:
-    async def test_matching_token_is_accepted(self, harness):
-        harness.server._auth_token = "launch-secret"
-        plugin = await harness.connect_plugin(session_id="tok-ok", auth_token="launch-secret")
-        assert harness.registry.get("tok-ok") is not None
-        await plugin.close()
-
-    async def test_wrong_token_is_rejected_before_registration(self, harness):
-        harness.server._auth_token = "launch-secret"
-
-        ## Hand-roll the handshake — connect_plugin() would assert on the
-        ## missing ack; here the server must close us before any ack.
+class TestSecureV4Handshake:
+    async def test_duplicate_client_nonce_is_rejected(self, harness):
         ws = await websockets.connect(f"ws://127.0.0.1:{harness.port}")
+        raw = json.dumps(
+            {
+                "type": "auth_hello",
+                "protocol_version": 2,
+                "client_nonce": "01" * 32,
+            }
+        )
+        await ws.send(raw[:-1] + ', "client_nonce": "' + "02" * 32 + '"}')
+        with pytest.raises(websockets.ConnectionClosed) as exc_info:
+            await asyncio.wait_for(ws.recv(), timeout=2.0)
+        assert exc_info.value.rcvd.code == 1008
+
+    async def test_duplicate_client_proof_is_rejected(self, harness):
+        ws = await websockets.connect(f"ws://127.0.0.1:{harness.port}")
+        nonce = await send_auth_hello(ws)
+        challenge = await receive_auth_challenge(
+            ws, capability=harness.capability, client_nonce=nonce
+        )
+        response = build_auth_response(
+            challenge,
+            capability=harness.capability,
+            session_id="duplicate-proof",
+        )
+        raw = json.dumps(response)
+        await ws.send(raw[:-1] + ', "client_proof": "' + response["client_proof"] + '"}')
+        with pytest.raises(websockets.ConnectionClosed) as exc_info:
+            await asyncio.wait_for(ws.recv(), timeout=2.0)
+        assert exc_info.value.rcvd.code == 1008
+        assert harness.registry.get("duplicate-proof") is None
+
+    @pytest.mark.parametrize(
+        "godot_version", ["4.5.0", "4.6.9", "5.0.0", "4.7rc1"]
+    )
+    async def test_authenticated_unsupported_editor_cannot_publish(self, harness, godot_version):
+        ws = await websockets.connect(f"ws://127.0.0.1:{harness.port}")
+        nonce = await send_auth_hello(ws)
+        challenge = await receive_auth_challenge(
+            ws, capability=harness.capability, client_nonce=nonce
+        )
         await ws.send(
             json.dumps(
-                {
-                    "type": "handshake",
-                    "session_id": "tok-bad",
-                    "godot_version": "4.4.1",
-                    "project_path": "/tmp/attacker",
-                    "plugin_version": "0.0.1",
-                    "protocol_version": 1,
-                    "auth_token": "not-the-secret",
-                }
+                build_auth_response(
+                    challenge,
+                    capability=harness.capability,
+                    session_id=f"old-{godot_version}",
+                    godot_version=godot_version,
+                )
+            )
+        )
+        with pytest.raises(websockets.ConnectionClosed) as exc_info:
+            await asyncio.wait_for(ws.recv(), timeout=2.0)
+        assert exc_info.value.rcvd.code == 4002
+        assert "Godot 4.7 or newer" in exc_info.value.rcvd.reason
+        assert harness.registry.get(f"old-{godot_version}") is None
+
+    async def test_wrong_capability_cannot_publish_session(self, harness):
+        ws = await websockets.connect(f"ws://127.0.0.1:{harness.port}")
+        nonce = await send_auth_hello(ws)
+        ## An attacker may skip server verification, but its proof is still
+        ## bound to a different valid 32-byte capability and must fail closed.
+        challenge = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
+        assert challenge["client_nonce"] == nonce
+        await ws.send(
+            json.dumps(
+                build_auth_response(
+                    challenge,
+                    capability="ab" * 32,
+                    session_id="proof-bad",
+                    project_path="/tmp/attacker",
+                )
             )
         )
         with pytest.raises(websockets.ConnectionClosed) as exc_info:
             await asyncio.wait_for(ws.recv(), timeout=2.0)
         assert exc_info.value.rcvd.code == 4003
-        assert harness.registry.get("tok-bad") is None, "rejected peer must never register"
+        assert harness.registry.get("proof-bad") is None
 
-    async def test_absent_token_is_accepted_for_compat(self, harness):
-        ## Older plugins and editors adopting a server they didn't spawn
-        ## have no token — the gate only rejects PRESENT-but-wrong tokens.
-        harness.server._auth_token = "launch-secret"
-        plugin = await harness.connect_plugin(session_id="tok-absent")
-        assert harness.registry.get("tok-absent") is not None
-        await plugin.close()
+    async def test_legacy_one_message_peer_fails_actionably(self, harness):
+        ws = await websockets.connect(f"ws://127.0.0.1:{harness.port}")
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "handshake",
+                    "session_id": "legacy",
+                    "godot_version": "4.6.0",
+                    "project_path": "/tmp/legacy",
+                    "plugin_version": "3.2.4",
+                    "protocol_version": 1,
+                }
+            )
+        )
+        with pytest.raises(websockets.ConnectionClosed) as exc_info:
+            await asyncio.wait_for(ws.recv(), timeout=2.0)
+        assert exc_info.value.rcvd.code == 4002
+        assert "protocol 2 required" in exc_info.value.rcvd.reason
+        assert harness.registry.get("legacy") is None
 
-    async def test_empty_string_token_is_treated_as_absent(self, harness):
-        ## A client that serializes auth_token: "" instead of omitting the
-        ## field carries no secret — it must ride the same compat path as
-        ## an absent token, not get 4003'd. Rejecting "" buys no security:
-        ## omitting the field is always accepted.
-        harness.server._auth_token = "launch-secret"
-        plugin = await harness.connect_plugin(session_id="tok-empty", auth_token="")
-        assert harness.registry.get("tok-empty") is not None
-        await plugin.close()
+    async def test_metadata_in_auth_hello_is_rejected(self, harness):
+        ws = await websockets.connect(f"ws://127.0.0.1:{harness.port}")
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "auth_hello",
+                    "protocol_version": 2,
+                    "client_nonce": "01" * 32,
+                    "project_path": "/must/not/be/here",
+                }
+            )
+        )
+        with pytest.raises(websockets.ConnectionClosed) as exc_info:
+            await asyncio.wait_for(ws.recv(), timeout=2.0)
+        assert exc_info.value.rcvd.code == 1008
 
-    async def test_token_sent_to_tokenless_server_is_ignored(self, harness):
-        ## A plugin can carry a stale token from a previous managed server
-        ## while connecting to a manually-started (tokenless) dev server —
-        ## that must not lock it out.
-        assert harness.server._auth_token is None
-        plugin = await harness.connect_plugin(session_id="tok-stale", auth_token="stale-token")
-        assert harness.registry.get("tok-stale") is not None
-        await plugin.close()
+    async def test_absolute_deadline_covers_second_client_frame(self, harness, monkeypatch):
+        monkeypatch.setattr(websocket_transport, "DEFAULT_HANDSHAKE_TIMEOUT_SECONDS", 0.05)
+        ws = await websockets.connect(f"ws://127.0.0.1:{harness.port}")
+        nonce = await send_auth_hello(ws)
+        await receive_auth_challenge(
+            ws,
+            capability=harness.capability,
+            client_nonce=nonce,
+        )
+        ## Never send auth_response: the same deadline that covered hello and
+        ## challenge must close this half-authenticated socket.
+        with pytest.raises(websockets.ConnectionClosed) as exc_info:
+            await asyncio.wait_for(ws.recv(), timeout=1.0)
+        assert exc_info.value.rcvd.code == 1008
+        assert len(harness.registry) == 0
 
-    async def test_env_token_reaches_enforcement_end_to_end(self, monkeypatch):
-        ## Pin the GODOT_AI_WS_TOKEN env-var name end to end: create_server
-        ## must hand the env token to the WS server, and a wrong-token
-        ## handshake against that server must be closed with 4003. A rename
-        ## on either side would silently drop enforcement and this test.
+    async def test_pre_auth_frame_bytes_are_bounded(self, harness):
+        ws = await websockets.connect(f"ws://127.0.0.1:{harness.port}")
+        await ws.send("x" * (DEFAULT_MAX_HANDSHAKE_FRAME_BYTES + 1))
+        with pytest.raises(websockets.ConnectionClosed) as exc_info:
+            await asyncio.wait_for(ws.recv(), timeout=2.0)
+        assert exc_info.value.rcvd.code == 1009
+        assert len(harness.registry) == 0
+
+    async def test_authenticated_peer_gets_bounded_normal_frame_budget(self, harness):
+        plugin = await harness.connect_plugin(session_id="frame-budget")
+        await plugin.ws.send("x" * (DEFAULT_MAX_HANDSHAKE_FRAME_BYTES + 1))
+        await asyncio.sleep(0.05)
+        assert harness.registry.get("frame-budget") is not None
+
+        await plugin.ws.send("x" * (DEFAULT_MAX_MESSAGE_BYTES + 1))
+        with pytest.raises(websockets.ConnectionClosed) as exc_info:
+            await asyncio.wait_for(plugin.ws.recv(), timeout=2.0)
+        assert exc_info.value.rcvd.code == 1009
+        await asyncio.sleep(0.05)
+        assert harness.registry.get("frame-budget") is None
+
+    async def test_raw_open_connection_budget_rejects_excess_and_recovers(self):
+        registry = SessionRegistry()
+        port = allocate_free_port()
+        server = GodotWebSocketServer(
+            registry,
+            port=port,
+            auth_token=TEST_WS_CAPABILITY,
+            max_open_connections=1,
+        )
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.05)
+        first = await websockets.connect(f"ws://127.0.0.1:{port}")
+        try:
+            with pytest.raises((websockets.InvalidMessage, OSError)):
+                await websockets.connect(f"ws://127.0.0.1:{port}")
+            await first.close()
+            await asyncio.sleep(0.05)
+            recovered = await websockets.connect(f"ws://127.0.0.1:{port}")
+            await perform_v4_handshake(recovered, session_id="after-raw-cap")
+            assert registry.get("after-raw-cap") is not None
+            await recovered.close()
+        finally:
+            await first.close()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    async def test_server_without_capability_is_locked(self):
+        registry = SessionRegistry()
+        port = allocate_free_port()
+        server = GodotWebSocketServer(registry, port=port)
+        task = asyncio.create_task(server.start())
+        await asyncio.sleep(0.05)
+        try:
+            ws = await websockets.connect(f"ws://127.0.0.1:{port}")
+            with pytest.raises(websockets.ConnectionClosed) as exc_info:
+                await asyncio.wait_for(ws.recv(), timeout=2.0)
+            assert exc_info.value.rcvd.code == 4003
+            assert "restart it from Godot" in exc_info.value.rcvd.reason
+            assert len(registry) == 0
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    async def test_configured_capability_reaches_enforcement_end_to_end(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        ## create_server must hand its explicit launch capability to the WS
+        ## server and reject a wrong transcript proof.
         from fastmcp import Client
 
-        from godot_ai.server import create_server
-        from tests.conftest import allocate_free_port
-
-        port = allocate_free_port()
-        monkeypatch.setenv("GODOT_AI_WS_TOKEN", "env-secret")
-        mcp = create_server(ws_port=port)
+        http_port, port = allocate_free_ports(2)
+        monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path))
+        mcp = create_test_server(ws_port=port, http_port=http_port)
+        assert mcp._transport_capabilities == TEST_TRANSPORT_CAPABILITIES
         async with Client(mcp):
             ws = await websockets.connect(f"ws://127.0.0.1:{port}")
+            nonce = await send_auth_hello(ws)
+            challenge = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
+            assert challenge["client_nonce"] == nonce
             await ws.send(
                 json.dumps(
-                    {
-                        "type": "handshake",
-                        "session_id": "env-tok-bad",
-                        "godot_version": "4.4.1",
-                        "project_path": "/tmp/attacker",
-                        "plugin_version": "0.0.1",
-                        "protocol_version": 1,
-                        "auth_token": "not-the-env-secret",
-                    }
+                    build_auth_response(
+                        challenge,
+                        capability="cd" * 32,
+                        session_id="env-proof-bad",
+                    )
                 )
             )
             with pytest.raises(websockets.ConnectionClosed) as exc_info:
@@ -1563,12 +1720,12 @@ class TestPendingFutureCleanup:
         ## TimeoutError path always cleared the pending dict; this test
         ## pins that behavior so a future refactor doesn't regress it.
         plugin = await harness.connect_plugin(session_id="leak-timeout")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         with pytest.raises(TimeoutError):
             await client.send("never_responded", timeout=0.1)
 
-        assert harness.server._pending == {}, "TimeoutError should not leave entries in _pending"
+        assert harness.registry.pending_count == 0
         await plugin.close()
 
     async def test_send_failure_pops_pending_entry(self, harness):
@@ -1578,7 +1735,7 @@ class TestPendingFutureCleanup:
         ## that raises after the pending entry has been registered.
         plugin = await harness.connect_plugin(session_id="leak-send")
 
-        ws = harness.server._connections["leak-send"]
+        ws = harness.registry._entries["leak-send"].peer
         boom = ConnectionError("simulated mid-send transport error")
 
         async def raising_send(_payload: str) -> None:
@@ -1593,7 +1750,7 @@ class TestPendingFutureCleanup:
                 timeout=1.0,
             )
 
-        assert harness.server._pending == {}, "send-time exception must not leak _pending entries"
+        assert harness.registry.pending_count == 0
         await plugin.close()
 
 
@@ -1603,7 +1760,7 @@ class TestPendingFutureCleanup:
 class TestEditorStateSelfHeal:
     async def test_editor_state_then_scene_save_no_stale_playing_block(self, harness):
         plugin = await harness.connect_plugin(session_id="sh-1", readiness="playing")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         runtime = DirectRuntime(registry=harness.registry, client=client)
         session = harness.registry.get("sh-1")
         assert session.readiness == "playing"
@@ -1636,7 +1793,7 @@ class TestEditorStateSelfHeal:
         try:
             state = await editor_handlers.editor_state(runtime)
             assert state["readiness"] == "ready"
-            assert session.readiness == "ready"
+            assert harness.registry.get("sh-1").readiness == "ready"
             saved = await scene_handlers.scene_save(runtime)
             assert saved["path"] == "res://main.tscn"
         finally:
@@ -1647,7 +1804,7 @@ class TestEditorStateSelfHeal:
         """Self-heal is bidirectional — a stale 'ready' cache also reconciles
         so the next write correctly blocks instead of slipping through."""
         plugin = await harness.connect_plugin(session_id="sh-2", readiness="ready")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         runtime = DirectRuntime(registry=harness.registry, client=client)
         session = harness.registry.get("sh-2")
         assert session.readiness == "ready"
@@ -1668,7 +1825,7 @@ class TestEditorStateSelfHeal:
         task = asyncio.create_task(mock_plugin())
         try:
             await editor_handlers.editor_state(runtime)
-            assert session.readiness == "playing"
+            assert harness.registry.get("sh-2").readiness == "playing"
             with pytest.raises(GodotCommandError) as exc_info:
                 await scene_handlers.scene_save(runtime)
             assert exc_info.value.code == "EDITOR_NOT_READY"
@@ -1696,7 +1853,7 @@ class TestResponseEnvelopeReadinessSelfHeal:
         before exposing the next `require_writable` call to the agent.
         """
         plugin = await harness.connect_plugin(session_id="env-heal-1", readiness="playing")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         runtime = DirectRuntime(registry=harness.registry, client=client)
         session = harness.registry.get("env-heal-1")
         assert session.readiness == "playing"
@@ -1725,7 +1882,7 @@ class TestResponseEnvelopeReadinessSelfHeal:
         task = asyncio.create_task(mock_plugin_loop())
         try:
             await editor_handlers.editor_selection_get(runtime)
-            assert session.readiness == "ready", (
+            assert harness.registry.get("env-heal-1").readiness == "ready", (
                 "envelope-level readiness on the get_selection reply must "
                 "have healed the stale 'playing' cache"
             )
@@ -1739,9 +1896,8 @@ class TestResponseEnvelopeReadinessSelfHeal:
         """Error replies carry the envelope readiness too. Without this, an
         agent retrying a recoverable error would still see a stale cache."""
         plugin = await harness.connect_plugin(session_id="env-heal-err", readiness="playing")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         runtime = DirectRuntime(registry=harness.registry, client=client)
-        session = harness.registry.get("env-heal-err")
 
         async def mock_plugin_loop():
             cmd = await plugin.recv_command()
@@ -1756,7 +1912,7 @@ class TestResponseEnvelopeReadinessSelfHeal:
         try:
             with pytest.raises(GodotCommandError):
                 await runtime.send_command("get_node", {"path": "/None"})
-            assert session.readiness == "ready"
+            assert harness.registry.get("env-heal-err").readiness == "ready"
         finally:
             await asyncio.wait_for(task, timeout=2.0)
             await plugin.close()
@@ -1766,9 +1922,8 @@ class TestResponseEnvelopeReadinessSelfHeal:
         from the envelope, so the next write correctly blocks instead of
         slipping through against a now-running game."""
         plugin = await harness.connect_plugin(session_id="env-heal-2", readiness="ready")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         runtime = DirectRuntime(registry=harness.registry, client=client)
-        session = harness.registry.get("env-heal-2")
 
         async def mock_plugin():
             cmd = await plugin.recv_command()
@@ -1781,65 +1936,12 @@ class TestResponseEnvelopeReadinessSelfHeal:
         task = asyncio.create_task(mock_plugin())
         try:
             await editor_handlers.editor_selection_get(runtime)
-            assert session.readiness == "playing"
+            assert harness.registry.get("env-heal-2").readiness == "playing"
             with pytest.raises(GodotCommandError) as exc_info:
                 await scene_handlers.scene_save(runtime)
             assert exc_info.value.code == "EDITOR_NOT_READY"
             # #651 stage 1: the gate attributes the block to its sub-code.
             assert exc_info.value.data["sub_code"] == "EDITOR_PLAYING"
-        finally:
-            await asyncio.wait_for(task, timeout=2.0)
-            await plugin.close()
-
-    async def test_old_plugin_omitting_envelope_readiness_is_a_no_op(self, harness):
-        """Old plugins (pre-envelope-stamping) don't send the field at all.
-        The cache must keep its current value rather than being blanked."""
-        plugin = await harness.connect_plugin(session_id="env-heal-old", readiness="playing")
-        client = GodotClient(harness.server, harness.registry)
-        runtime = DirectRuntime(registry=harness.registry, client=client)
-        session = harness.registry.get("env-heal-old")
-
-        async def mock_plugin():
-            cmd = await plugin.recv_command()
-            ## `readiness=None` -> field omitted on the wire, exactly what
-            ## an unupgraded plugin would send.
-            await plugin.send_response(
-                cmd["request_id"],
-                {"selected_paths": [], "count": 0},
-                readiness=None,
-            )
-
-        task = asyncio.create_task(mock_plugin())
-        try:
-            await editor_handlers.editor_selection_get(runtime)
-            assert session.readiness == "playing", (
-                "old plugin omitting `readiness` must not blank or change the cache"
-            )
-        finally:
-            await asyncio.wait_for(task, timeout=2.0)
-            await plugin.close()
-
-    async def test_unknown_envelope_readiness_value_is_ignored(self, harness):
-        """A future plugin emitting a state the server doesn't know yet
-        must not corrupt the cache — the canonical KNOWN_READINESS set
-        gates writes through forward-compat omission."""
-        plugin = await harness.connect_plugin(session_id="env-heal-fwd", readiness="ready")
-        client = GodotClient(harness.server, harness.registry)
-        runtime = DirectRuntime(registry=harness.registry, client=client)
-        session = harness.registry.get("env-heal-fwd")
-
-        async def mock_plugin():
-            cmd = await plugin.recv_command()
-            await plugin.send_response(
-                cmd["request_id"],
-                {"selected_paths": [], "count": 0},
-                readiness="bogus_state",
-            )
-
-        task = asyncio.create_task(mock_plugin())
-        try:
-            await editor_handlers.editor_selection_get(runtime)
-            assert session.readiness == "ready"
         finally:
             await asyncio.wait_for(task, timeout=2.0)
             await plugin.close()
@@ -1869,7 +1971,7 @@ class TestMalformedFrameResilience:
         )
 
         ## Subsequent commands still round-trip over the surviving connection.
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -1895,6 +1997,28 @@ class TestMalformedFrameResilience:
         )
         await plugin.close()
 
+    async def test_ambiguous_or_nonfinite_json_is_skipped_and_session_survives(self, harness):
+        plugin = await harness.connect_plugin(session_id="strict-json")
+
+        await plugin.ws.send(
+            '{"type":"event","event":"readiness_changed",'
+            '"event":"scene_changed","data":{"readiness":"playing"}}'
+        )
+        await plugin.ws.send(
+            '{"type":"event","event":"readiness_changed",'
+            '"data":{"readiness":NaN}}'
+        )
+        await asyncio.sleep(0.1)
+
+        live = harness.registry.get("strict-json")
+        assert live is not None
+        assert live.readiness == "ready"
+
+        await plugin.send_event("readiness_changed", {"readiness": "importing"})
+        await asyncio.sleep(0.1)
+        assert harness.registry.get("strict-json").readiness == "importing"
+        await plugin.close()
+
     async def test_invalid_command_response_is_skipped_and_session_survives(self, harness):
         plugin = await harness.connect_plugin(session_id="bad-response")
 
@@ -1906,7 +2030,7 @@ class TestMalformedFrameResilience:
             "one invalid command response must not unregister the session"
         )
 
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -1923,7 +2047,7 @@ class TestMalformedFrameResilience:
         future immediately with a clear error instead of leaving the caller
         to hit its timeout — and the session still survives."""
         plugin = await harness.connect_plugin(session_id="bad-corr")
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -1937,4 +2061,40 @@ class TestMalformedFrameResilience:
         await handler_task
 
         assert harness.registry.get("bad-corr") is not None
+        await plugin.close()
+
+    async def test_adversarial_watermark_is_rejected_without_snapshot_side_effects(self, harness):
+        plugin = await harness.connect_plugin(session_id="bad-watermark")
+        client = GodotClient(harness.server)
+
+        async def mock_handler():
+            cmd = await plugin.recv_command()
+            await plugin.ws.send(
+                json.dumps(
+                    {
+                        "request_id": cmd["request_id"],
+                        "status": "ok",
+                        "data": {},
+                        "readiness": "playing",
+                        "error_watermark": {
+                            "run_seq": 1,
+                            "editor_ring": 2,
+                            "debugger_promoted": 3,
+                            "game_error_warn": 4,
+                            "editor_ring_warn": 5,
+                            "game_warn": 6,
+                            "attacker_component": 7,
+                        },
+                    }
+                )
+            )
+
+        handler_task = asyncio.create_task(mock_handler())
+        with pytest.raises(ConnectionError, match="Malformed response"):
+            await client.send("get_editor_state", timeout=5.0)
+        await handler_task
+
+        live = harness.registry.get("bad-watermark")
+        assert live.readiness == "ready"
+        assert live.error_watermark == {}
         await plugin.close()

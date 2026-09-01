@@ -24,6 +24,29 @@ _JSON_FIXTURE = (
     / "fixtures"
     / "attach_json_sample.json"
 )
+_UVX_POLICY_AND_ENTRYPOINT = [
+    "--isolated",
+    "--no-config",
+    "--no-env-file",
+    "--no-sources",
+    "--no-build",
+    "--index-strategy",
+    "first-index",
+    "--keyring-provider",
+    "disabled",
+    "--index",
+    "https://pypi.org/simple",
+    "--default-index",
+    "https://pypi.org/simple",
+    "--find-links",
+    "https://pypi.org/simple/godot-ai/",
+    "--link-mode",
+    "copy",
+    "--from",
+    "godot-ai==3.0.6",
+    "godot-ai",
+    "attach",
+]
 
 
 def test_gdscript_toml_fixture_round_trips_through_tomllib() -> None:
@@ -34,14 +57,7 @@ def test_gdscript_toml_fixture_round_trips_through_tomllib() -> None:
     assert entry["args"][0] == "-c"
     assert "creationflags=0x08000000" in entry["args"][1]
     assert entry["args"][2] == 'C:\\Users\\Agent "quoted"\\bin\\uvx.exe'
-    assert entry["args"][3:9] == [
-        "--link-mode",
-        "copy",
-        "--from",
-        "godot-ai==3.0.6",
-        "godot-ai",
-        "attach",
-    ]
+    assert entry["args"][3 : 3 + len(_UVX_POLICY_AND_ENTRYPOINT)] == (_UVX_POLICY_AND_ENTRYPOINT)
 
 
 def test_rendered_attach_argv_is_accepted_by_attach_parser() -> None:
@@ -69,14 +85,7 @@ def test_gdscript_json_fixture_round_trips_through_json_and_attach_parser() -> N
     assert entry["args"][0] == "-c"
     assert "creationflags=0x08000000" in entry["args"][1]
     assert entry["args"][2] == 'C:\\Users\\Agent "quoted"\\bin\\uvx.exe'
-    assert entry["args"][3:9] == [
-        "--link-mode",
-        "copy",
-        "--from",
-        "godot-ai==3.0.6",
-        "godot-ai",
-        "attach",
-    ]
+    assert entry["args"][3 : 3 + len(_UVX_POLICY_AND_ENTRYPOINT)] == (_UVX_POLICY_AND_ENTRYPOINT)
 
     attach_index = entry["args"].index("attach")
     namespace = _parser().parse_args(entry["args"][attach_index + 1 :])
