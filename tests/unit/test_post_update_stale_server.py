@@ -52,18 +52,17 @@ def test_stale_server_smoke_accepts_setup_godot_launcher_env(monkeypatch, tmp_pa
 
 
 @pytest.mark.skipif(os.name == "nt", reason="macOS default-path contract")
-def test_stale_server_smoke_uses_isolated_macos_home_for_default_capability_path(
+def test_stale_server_smoke_macos_home_and_override_can_converge(
     monkeypatch, tmp_path
 ) -> None:
     module = runpy.run_path(str(STALE_SERVER_SMOKE))
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path / "override"))
     monkeypatch.setattr(module["platform"], "system", lambda: "Darwin")
-    monkeypatch.delenv("GODOT_AI_CAPABILITY_DIR")
 
     expected = tmp_path / "Library" / "Application Support" / "godot-ai" / "capabilities"
+    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(expected))
     assert module["capability_directory"]() == expected
-    assert "GODOT_AI_CAPABILITY_DIR" not in module["editor_environment"](expected)
+    assert module["editor_environment"](expected)["GODOT_AI_CAPABILITY_DIR"] == str(expected)
 
 
 def test_stale_server_requires_a_fresh_explicit_replacement_action() -> None:

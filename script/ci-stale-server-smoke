@@ -197,7 +197,7 @@ def editor_environment(capability_dir: Path) -> dict[str, str]:
     environment = os.environ.copy()
     environment["GODOT_AI_ALLOW_HEADLESS"] = "1"
     environment["GODOT_AI_DISABLE_TELEMETRY"] = "true"
-    if os.name != "nt" and platform.system() != "Darwin":
+    if os.name != "nt":
         environment["GODOT_AI_CAPABILITY_DIR"] = str(capability_dir)
     return environment
 
@@ -443,11 +443,16 @@ def main() -> int:
             dir=secure_capability_temp_parent(),
         )
         if platform.system() == "Darwin":
-            # Exercise the production macOS location under an isolated HOME.
-            # Hosted Godot has not consistently observed the optional override,
-            # while HOME is the actual default-path contract on this platform.
-            os.environ.pop("GODOT_AI_CAPABILITY_DIR", None)
+            # Point the explicit override at the production HOME fallback so
+            # both supported resolution paths read the same private record.
             os.environ["HOME"] = temporary_capability_dir.name
+            os.environ["GODOT_AI_CAPABILITY_DIR"] = str(
+                Path(temporary_capability_dir.name)
+                / "Library"
+                / "Application Support"
+                / "godot-ai"
+                / "capabilities"
+            )
         else:
             os.environ["GODOT_AI_CAPABILITY_DIR"] = temporary_capability_dir.name
     capability_dir = capability_directory()
