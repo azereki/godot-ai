@@ -47,6 +47,20 @@ def test_stale_server_smoke_accepts_setup_godot_launcher_env(monkeypatch, tmp_pa
     assert module["find_godot"]() == str(launcher)
 
 
+def test_stale_server_smoke_uses_isolated_macos_home_for_default_capability_path(
+    monkeypatch, tmp_path
+) -> None:
+    module = runpy.run_path(str(STALE_SERVER_SMOKE))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(tmp_path / "override"))
+    monkeypatch.setattr(module["platform"], "system", lambda: "Darwin")
+    monkeypatch.delenv("GODOT_AI_CAPABILITY_DIR")
+
+    expected = tmp_path / "Library" / "Application Support" / "godot-ai" / "capabilities"
+    assert module["capability_directory"]() == expected
+    assert "GODOT_AI_CAPABILITY_DIR" not in module["editor_environment"](expected)
+
+
 def test_stale_server_requires_a_fresh_explicit_replacement_action() -> None:
     source = _lifecycle()
     start = get_func_block(source, "func start_server() -> void:")
