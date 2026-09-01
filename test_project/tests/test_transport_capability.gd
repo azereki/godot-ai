@@ -39,6 +39,12 @@ func test_reads_exact_private_record() -> void:
 	assert_eq(result.get("instance_nonce", ""), NONCE)
 
 
+func test_captured_path_is_bound_to_the_requested_port() -> void:
+	_write(_canonical_record())
+	assert_eq(McpTransportCapability.read_for_http_port(8122, _record_path).http, HTTP)
+	assert_true(McpTransportCapability.read_for_http_port(8123, _record_path).is_empty())
+
+
 func test_only_canonical_sticky_temp_root_may_be_a_writable_ancestor() -> void:
 	var writable := (
 		FileAccess.UNIX_READ_OWNER

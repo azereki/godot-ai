@@ -17,8 +17,11 @@ const _KEYS: Array[String] = [
 ]
 
 
-static func read_for_http_port(http_port: int) -> Dictionary:
-	return _read_path(path_for_http_port(http_port))
+static func read_for_http_port(http_port: int, captured_path := "") -> Dictionary:
+	var path := str(captured_path)
+	if not path.is_empty() and path.get_file() != "http-%d.json" % http_port:
+		return {}
+	return _read_path(path if not path.is_empty() else path_for_http_port(http_port))
 
 
 static func _read_path(path: String) -> Dictionary:

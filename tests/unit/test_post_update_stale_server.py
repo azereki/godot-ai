@@ -81,6 +81,20 @@ def test_stale_server_requires_a_fresh_explicit_replacement_action() -> None:
         assert deleted_loop_state not in source
 
 
+def test_lifecycle_worker_uses_the_main_thread_capability_path_snapshot() -> None:
+    plugin = (PLUGIN / "plugin.gd").read_text(encoding="utf-8")
+    lifecycle = _lifecycle()
+    capture = get_func_block(plugin, "func _capture_lifecycle_plan() -> Dictionary:")
+    read = get_func_block(lifecycle, "func _read_capability(port: int) -> Dictionary:")
+
+    assert '"capability_path": str(policy.get("capability_path", ""))' in capture
+    assert '_endpoint_policy["capability_path"] = TransportCapability.path_for_http_port(' in plugin
+    assert 'str(_endpoint_policy.get("capability_path", ""))' in plugin
+    assert 'str(_plan.get("capability_path", ""))' in read
+    assert lifecycle.count("var capability := _read_capability(port)") == 4
+    assert "var final_capability := _read_capability(port)" in lifecycle
+
+
 def test_replacement_is_bound_to_status_instance_and_exact_process() -> None:
     source = _lifecycle()
     block = get_func_block(source, "func _effect_replace(payload: Dictionary) -> Dictionary:")

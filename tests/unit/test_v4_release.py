@@ -95,6 +95,17 @@ def test_standalone_key_matches_the_pre_v4_updater_key():
     )
 
 
+def test_standalone_key_validation_accepts_a_crlf_checkout():
+    source = ROOT / "plugin/addons/godot_ai/utils/update_manager.gd"
+    v4_release._validate_embedded_public_key(source.read_bytes().replace(b"\n", b"\r\n"))
+
+
+def test_standalone_key_validation_rejects_ambiguous_line_endings():
+    source = ROOT / "plugin/addons/godot_ai/utils/update_manager.gd"
+    with pytest.raises(v4_release.ReleaseError, match="unsupported line endings"):
+        v4_release._validate_embedded_public_key(source.read_bytes().replace(b"\n", b"\r"))
+
+
 def test_release_packager_enforces_the_signed_plugin_uv_trust_root():
     source = ROOT / "plugin/addons/godot_ai/utils/uv_resolution_policy.gd"
     v4_release._validate_uv_resolution_policy(source.read_bytes())
@@ -1229,7 +1240,12 @@ def test_build_refuses_linked_plugin_content(signed_release, tmp_path):
 def test_package_reads_exact_commit_and_ignores_all_workspace_bytes(signed_release, tmp_path):
     repo = tmp_path / "repo"
     shutil.copytree(signed_release["repo"], repo)
-    committed = (repo / "plugin/addons/godot_ai/plugin.gd").read_bytes()
+    committed = _run(
+        "git",
+        "show",
+        f'{signed_release["source"]}:plugin/addons/godot_ai/plugin.gd',
+        cwd=repo,
+    )
     (repo / ".git/info/exclude").write_text("plugin/addons/godot_ai/ignored.gd\n")
     (repo / "plugin/addons/godot_ai/plugin.gd").write_text("workspace mutation\n")
     (repo / "plugin/addons/godot_ai/untracked.gd").write_text("extends RefCounted\n")
@@ -1308,7 +1324,12 @@ def test_workspace_mutation_after_source_check_cannot_enter_package(
     repo = tmp_path / "repo"
     shutil.copytree(signed_release["repo"], repo)
     plugin = repo / "plugin/addons/godot_ai/plugin.gd"
-    committed = plugin.read_bytes()
+    committed = _run(
+        "git",
+        "show",
+        f'{signed_release["source"]}:plugin/addons/godot_ai/plugin.gd',
+        cwd=repo,
+    )
     validate = v4_release._validate_source
 
     def validate_then_mutate(*args):

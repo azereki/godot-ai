@@ -52,6 +52,7 @@ func configure(plan: Dictionary) -> void:
 	_plan["http_port"] = int(_plan.get("http_port", ClientConfigurator.DEFAULT_HTTP_PORT))
 	_plan["ws_port"] = int(_plan.get("ws_port", ClientConfigurator.DEFAULT_WS_PORT))
 	_plan["expected_version"] = str(_plan.get("expected_version", ""))
+	_plan["capability_path"] = str(_plan.get("capability_path", ""))
 	_plan["probe_timeout_ms"] = int(_plan.get("probe_timeout_ms", DEFAULT_PROBE_TIMEOUT_MS))
 	_plan["prove_timeout_ms"] = int(_plan.get("prove_timeout_ms", DEFAULT_PROVE_TIMEOUT_MS))
 	_plan["keep_alive"] = bool(_plan.get("keep_alive", false))
@@ -559,7 +560,7 @@ func _effect_probe(payload: Dictionary) -> Dictionary:
 	var port := int(payload.http_port)
 	var expected_version := str(payload.expected_version)
 	var expected_ws_port := int(payload.expected_ws_port)
-	var capability := TransportCapability.read_for_http_port(port)
+	var capability := _read_capability(port)
 	var live := _probe_with_capability(port, capability, int(payload.timeout_ms))
 	if _authenticated_status_matches_record(live, capability):
 		var version := str(live.get("version", ""))
@@ -657,7 +658,7 @@ func _effect_prove(payload: Dictionary) -> Dictionary:
 			"message": "The launched server process exited or changed identity before publishing capabilities.",
 		}
 	var port := int(payload.http_port)
-	var capability := TransportCapability.read_for_http_port(port)
+	var capability := _read_capability(port)
 	if capability.is_empty() or str(capability.get("instance_nonce", "")) == str(payload.get("baseline_instance_id", "")):
 		return {"pending": true}
 	if (
@@ -689,7 +690,7 @@ func _effect_prove(payload: Dictionary) -> Dictionary:
 	## launch-lineage PID must still own the listener, the private capability
 	## record must still name the authenticated instance, and the process
 	## fingerprint must remain unchanged after the final probe.
-	var final_capability := TransportCapability.read_for_http_port(port)
+	var final_capability := _read_capability(port)
 	var final_live := _probe_with_capability(port, final_capability, int(payload.timeout_ms))
 	if (
 		PortResolver.read_pid_file(str(payload.get("pid_file", ""))) != pid
@@ -726,7 +727,7 @@ func _effect_prove(payload: Dictionary) -> Dictionary:
 func _effect_replace(payload: Dictionary) -> Dictionary:
 	var target: Dictionary = payload.get("target", {})
 	var port := int(target.get("port", 0))
-	var capability := TransportCapability.read_for_http_port(port)
+	var capability := _read_capability(port)
 	var live := _probe_with_capability(port, capability, int(payload.timeout_ms))
 	if not _replacement_target_matches(target, live, capability):
 		return {"ok": false, "reason": "replacement_target_changed", "message": "The authorized server changed before replacement."}
@@ -806,7 +807,7 @@ func _launched_server_kill_grant(payload: Dictionary, launch_pid: int) -> Dictio
 		or not PortResolver.find_all_pids_on_port(port).has(server_pid)
 	):
 		return {}
-	var capability := TransportCapability.read_for_http_port(port)
+	var capability := _read_capability(port)
 	if (
 		str(capability.get("http", "")) != str(launch.get("http_capability", ""))
 		or str(capability.get("websocket", "")) != str(launch.get("ws_capability", ""))
@@ -878,8 +879,16 @@ func _probe_current_transport() -> Dictionary:
 	)
 
 
-static func probe_live_server_status(port: int, timeout_ms := DEFAULT_PROBE_TIMEOUT_MS) -> Dictionary:
-	var capability := TransportCapability.read_for_http_port(port)
+func _read_capability(port: int) -> Dictionary:
+	return TransportCapability.read_for_http_port(
+		port, str(_plan.get("capability_path", ""))
+	)
+
+
+static func probe_live_server_status(
+	port: int, timeout_ms := DEFAULT_PROBE_TIMEOUT_MS, captured_path := ""
+) -> Dictionary:
+	var capability := TransportCapability.read_for_http_port(port, captured_path)
 	return _probe_with_capability(port, capability, timeout_ms)
 
 

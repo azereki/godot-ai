@@ -297,9 +297,11 @@ def _openssl(*args: str) -> bytes:
 
 def _validate_embedded_public_key(data: bytes) -> None:
     try:
-        text = data.decode("utf-8")
+        text = data.decode("utf-8").replace("\r\n", "\n")
     except UnicodeDecodeError as exc:
         raise ReleaseError("public key: updater source is not UTF-8") from exc
+    if "\r" in text:
+        _fail("public key", "updater source contains unsupported line endings")
     begin, end = "-----BEGIN PUBLIC KEY-----", "-----END PUBLIC KEY-----"
     if text.count(begin) != 1 or text.count(end) != 1:
         _fail("public key", "expected exactly one embedded PEM")

@@ -34,6 +34,7 @@ const UNSUPPORTED_GODOT_MESSAGE := \
 const ServerLifecycleManager := preload("res://addons/godot_ai/utils/server_lifecycle.gd")
 const PortResolver := preload("res://addons/godot_ai/utils/port_resolver.gd")
 const ServerStateScript := preload("res://addons/godot_ai/utils/mcp_server_state.gd")
+const TransportCapability := preload("res://addons/godot_ai/utils/transport_capability.gd")
 
 ## Plugin-class scripts used by this file. The script-local preload aliases
 ## are ordinary dependency shorthand and keep construction sites compact.
@@ -240,6 +241,9 @@ func _continue_enter_tree_after_update_barrier() -> void:
 	## is an activation effect on Windows (`netsh`), so it runs only after every
 	## owner and the Dock have been constructed and wired below.
 	_endpoint_policy = ClientConfigurator.capture_endpoint_policy()
+	_endpoint_policy["capability_path"] = TransportCapability.path_for_http_port(
+		int(_endpoint_policy.http_port)
+	)
 	_resolved_ws_port = int(_endpoint_policy.ws_port)
 
 	## Construct plugin-lifetime work owners before attaching the replaceable
@@ -635,7 +639,10 @@ func _on_dock_status_snapshot_requested() -> void:
 func _on_dock_live_server_probe_requested(port: int) -> void:
 	if _dock != null:
 		_dock.present_live_server_probe_result(
-			ServerLifecycleManager.probe_live_server_status(port)
+			ServerLifecycleManager.probe_live_server_status(
+				port, ServerLifecycleManager.DEFAULT_PROBE_TIMEOUT_MS,
+				str(_endpoint_policy.get("capability_path", ""))
+			)
 		)
 
 
@@ -1668,6 +1675,7 @@ func _capture_lifecycle_plan() -> Dictionary:
 		)
 	return {
 		"http_port": http_port,
+		"capability_path": str(policy.get("capability_path", "")),
 		"ws_port": int(policy.get("ws_port", ClientConfigurator.DEFAULT_WS_PORT)),
 		"expected_version": ClientConfigurator.get_plugin_version(),
 		"server_command": ClientConfigurator.get_server_command(),

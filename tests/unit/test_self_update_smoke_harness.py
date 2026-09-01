@@ -167,8 +167,9 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     assert f'command = {json.dumps(str(fixture_paths["client_command"]))}' in config_text
     assert "godot-ai==4.0.0" in config_text
     assert "godot-ai==4.0.1" not in config_text
-    assert fixture_paths["client_command"].stat().st_mode & 0o111 == 0
-    assert client_config.stat().st_mode & 0o077 == 0
+    if os.name != "nt":
+        assert fixture_paths["client_command"].stat().st_mode & 0o111 == 0
+        assert client_config.stat().st_mode & 0o077 == 0
 
     base_settings = (project / "addons" / "godot_ai" / "utils" / "settings.gd").read_text(
         encoding="utf-8"
