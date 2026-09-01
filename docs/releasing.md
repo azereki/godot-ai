@@ -3,10 +3,10 @@
 Part of the Godot AI agent guide — see [AGENTS.md](../AGENTS.md) for the
 always-loaded rules.
 
-Godot AI v4 has one signed release tree and one transactional v4→v4 update
-path. It does not publish an overlay-compatible legacy ZIP, and a pre-v4
-installation cannot self-update across the major-version boundary. See the
-[v4 migration guide](v4-migration.md) for that manual clean replacement.
+Godot AI v4 has one signed canonical tree and one exact-tree transaction
+protocol. A temporary, signed v3-compatible capsule carries that same tree
+across the major-version boundary; it is not a second v4 runtime shape. See the
+[v4 migration guide](v4-migration.md) for the one-click user flow.
 
 ## Publication is intentionally closed
 
@@ -26,9 +26,10 @@ rebuild.
 nothing. A green signing check proves only that the stored private key matches
 the embedded public key; it is not release qualification.
 
-## The only v4 plugin assets
+## Exact release asset set
 
-Every release exposes exactly these three same-version assets:
+Every stable release exposes exactly six same-version assets. The canonical v4
+triple is:
 
 - `godot-ai-v4-plugin.zip` — canonical `addons/godot_ai/**` tree;
 - `godot-ai-v4-plugin.manifest.json` — canonical identity, archive metadata,
@@ -36,10 +37,18 @@ Every release exposes exactly these three same-version assets:
 - `godot-ai-v4-plugin.manifest.sig` — 512-byte detached RSA signature over the
   exact manifest bytes.
 
-There is no `godot-ai-plugin.zip` alias and no separate Store ZIP. The manifest
-binds repository, channel, tag, semantic version, source commit, ZIP hash and
-size, and every extracted file hash. The archive itself is deterministic and
-must contain no extra or missing path.
+The v3 migration triple is:
+
+- `godot-ai-plugin.zip` — deterministic temporary bridge with the canonical
+  triple embedded beneath `addons/godot_ai/migration_payload/`;
+- `godot-ai-plugin.zip.sha256` — checksum in the exact format consumed by the
+  signed v3 updater; and
+- `godot-ai-plugin.zip.sha256.sig` — 512-byte RSA signature over that checksum.
+
+The legacy-named ZIP is a migration capsule, not an alias for the canonical v4
+archive and not a final install tree. The manifest binds repository, channel,
+tag, semantic version, source commit, canonical ZIP hash and size, and every
+canonical file hash. Both ZIPs are deterministic.
 
 ## Build, sign, and verify candidate bytes
 
@@ -71,8 +80,10 @@ python3 script/v4-release sign \
   --expected-source <40-hex-source-commit>
 ```
 
-`build` combines local package/sign/verify for development fixtures. It is not
-permission to rebuild a qualified public candidate. Verify any candidate with:
+`build` produces and verifies the complete six-asset release set, including the
+signed migration capsule. It is not permission to rebuild a qualified public
+candidate. `package` and `sign` remain lower-level canonical-triple primitives.
+Verify the canonical tree in any candidate with:
 
 ```bash
 python3 script/v4-release verify \
@@ -90,15 +101,37 @@ The standalone migration verifier is exactly `script/v4-release` plus
 `src/godot_ai/release_verify.py` from the named source commit. GitHub release
 notes are mutable and must not be treated as a trust anchor. Before publication,
 a separately administered channel must authenticate the source commit, both
-verifier digests, all three asset identities, the embedded public-key SPKI
+verifier digests, all six asset identities, the embedded public-key SPKI
 fingerprint, and its own attestation identity. The migration guide must name
 that operational channel; until it does, publication stays closed. The two
 verifier files and repository documentation are not their own trust anchor.
 
+## V3-to-v4 bridge transaction
+
+The last signed v3 line discovers the legacy-named triple and performs its
+existing outer signature/checksum verification. Its updater overlays the
+temporary bridge only long enough to load it. The bridge prepares the embedded
+canonical triple with the target v4 transaction actor, then disables itself and
+uses the same exact-tree activation protocol described below. After the swap,
+Godot performs one graceful automatic editor restart; the new process proves
+the prior editor closed and transfers the inherited nonce-bound lease before
+claiming the transaction. This clean process boundary prevents loaded v3
+`class_name` resources from contaminating v4 startup. The
+complete mixed temporary tree is retained as the old backup; only the verified
+canonical tree becomes live.
+
+The bridge begins automatically after the user's single **Update** click. V4
+startup treats a pre-v4 `from_version` as a major migration, broadly replacing
+owned mismatched client entries before durable completion and managed-server
+startup. It does not wait for an unverifiable global client-restart
+confirmation. Unsupported old updater generations are not carried forward as
+permanent v4 runtime branches.
+
 ## V4 self-update transaction
 
-The dock considers only a newer `v4.*` GitHub release with the exact three
-bounded assets above. An Update click runs this sequence:
+The dock considers only a newer `v4.*` GitHub release with the exact six-name,
+bounded release set above, but downloads only the canonical three. An Update
+click runs this sequence:
 
 1. Preflight refuses an unresolved transaction, retained backup that still
    needs archival, unsafe recovery namespace, active transaction lock, or a
@@ -253,7 +286,7 @@ reload, no parse/load error in the disable→enable window, no new macOS Godot
 crash report, no activation artifact inside the project, and a retained
 recoverable backup. This interactive check is release-blocking and supplements,
 rather than replaces, the automated failpoint, rollback, multi-editor, exact
-release-shape, and clean-migration suites. Pre-v4 updater behavior is a completed
-one-time audit recorded in
+release-shape, bridge-migration, and clean-install suites. Historical pre-v4
+behavior remains recorded in
 [pre-v4-updater-one-time-evidence.md](../verification/pre-v4-updater-one-time-evidence.md),
-not a recurring compatibility obligation.
+but the signed final-v3→v4 bridge path is a recurring release-blocking smoke.

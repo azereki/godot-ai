@@ -22,9 +22,6 @@ WEBSOCKET_PATH = Path("src/godot_ai/transport/websocket.py")
 ENVELOPE_PATH = Path("src/godot_ai/protocol/envelope.py")
 CONNECTION_PATH = Path("plugin/addons/godot_ai/connection.gd")
 RELEASE_VERIFY_PATH = Path("src/godot_ai/release_verify.py")
-RELEASE_WORKFLOW_PATH = Path(".github/workflows/release.yml")
-V4_RELEASE_PATH = Path("script/v4-release")
-
 _CANONICAL_RELEASE_SHAPE = ("godot-ai-v4-plugin.zip", "addons/godot_ai/")
 _LIFECYCLE_VARIANT_FIELDS = {
     "_episode",
@@ -388,19 +385,24 @@ def _owner_dependency_cycles(root: Path) -> dict[str, Any]:
 
 
 def _release_zip_shapes(root: Path) -> dict[str, Any]:
-    """Count the one canonical release ZIP name/prefix contract, not docs/examples."""
+    """Count canonical v4 tree contracts, excluding the temporary v3 capsule."""
 
     literals: list[dict[str, Any]] = []
     archive_names: set[str] = set()
-    for path in (RELEASE_VERIFY_PATH, UPDATE_MANAGER_PATH, V4_RELEASE_PATH, RELEASE_WORKFLOW_PATH):
+    for path in (RELEASE_VERIFY_PATH, UPDATE_MANAGER_PATH):
         source = _read(root, path)
-        for match in re.finditer(r"[A-Za-z0-9_.-]+\.zip", source):
-            value = match.group(0)
+        pattern = (
+            r'^ASSET_NAME\s*=\s*["\']([^"\']+\.zip)["\']'
+            if path == RELEASE_VERIFY_PATH
+            else r'^const\s+ASSET_NAME\s*:=\s*["\']([^"\']+\.zip)["\']'
+        )
+        for match in re.finditer(pattern, source, re.MULTILINE):
+            value = match.group(1)
             archive_names.add(value)
             literals.append(
                 {
                     "path": path.as_posix(),
-                    "line": _line_number(source, match.start()),
+                    "line": _line_number(source, match.start(1)),
                     "value": value,
                 }
             )
@@ -412,7 +414,7 @@ def _release_zip_shapes(root: Path) -> dict[str, Any]:
         shapes = {("<missing>", prefix)}
     valid = shapes == {_CANONICAL_RELEASE_SHAPE}
     return _gate(
-        "distinct v4 plugin release ZIP name/root contracts (canonical contract is mandatory)",
+        "distinct canonical v4 tree ZIP name/root contracts (migration capsule excluded)",
         "release_zip_shapes",
         1 if valid else max(2, len(shapes)),
         1,

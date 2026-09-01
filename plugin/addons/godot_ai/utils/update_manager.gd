@@ -3,7 +3,7 @@ class_name McpUpdateManager
 extends Node
 
 ## v4-only release discovery and download preparation. Python authenticates
-## and extracts the three frozen assets before this manager asks the root to
+## and extracts the three canonical assets before this manager asks the root to
 ## quiesce or disable anything; the transaction actor alone mutates live code.
 
 const RELEASES_URL := "https://api.github.com/repos/hi-godot/godot-ai/releases/latest"
@@ -12,6 +12,9 @@ const REPOSITORY := "hi-godot/godot-ai"
 const ASSET_NAME := "godot-ai-v4-plugin.zip"
 const MANIFEST_NAME := "godot-ai-v4-plugin.manifest.json"
 const SIGNATURE_NAME := "godot-ai-v4-plugin.manifest.sig"
+const LEGACY_ASSET_NAME := "godot-ai-plugin.zip"
+const LEGACY_CHECKSUM_NAME := "godot-ai-plugin.zip.sha256"
+const LEGACY_SIGNATURE_NAME := "godot-ai-plugin.zip.sha256.sig"
 const MAX_RELEASE_METADATA_BYTES := 1024 * 1024
 const MAX_ARCHIVE_SIZE_BYTES := 64 * 1024 * 1024
 const MAX_MANIFEST_SIZE_BYTES := 1024 * 1024
@@ -24,6 +27,17 @@ const _ASSET_LIMITS := {
 	ASSET_NAME: MAX_ARCHIVE_SIZE_BYTES,
 	MANIFEST_NAME: MAX_MANIFEST_SIZE_BYTES,
 	SIGNATURE_NAME: 512,
+}
+## Stable releases also carry one signed, temporary v3 migration capsule.
+## v4 never downloads it, but requires the exact six-name release envelope so
+## an unexpected extra executable asset remains a fail-closed condition.
+const _RELEASE_ASSET_LIMITS := {
+	ASSET_NAME: MAX_ARCHIVE_SIZE_BYTES,
+	MANIFEST_NAME: MAX_MANIFEST_SIZE_BYTES,
+	SIGNATURE_NAME: 512,
+	LEGACY_ASSET_NAME: 66 * 1024 * 1024,
+	LEGACY_CHECKSUM_NAME: 1024,
+	LEGACY_SIGNATURE_NAME: 512,
 }
 const ClientConfigurator := preload("res://addons/godot_ai/client_configurator.gd")
 const TransportCapability := preload("res://addons/godot_ai/utils/transport_capability.gd")
@@ -206,7 +220,7 @@ static func parse_releases_response(
 	if not tag.begins_with("v4.") or not _is_newer(version, local):
 		return empty
 	var assets: Variant = parsed.get("assets", [])
-	if not assets is Array or assets.size() != _ASSET_LIMITS.size():
+	if not assets is Array or assets.size() != _RELEASE_ASSET_LIMITS.size():
 		return empty
 	var urls := {}
 	var sizes := {}
@@ -214,18 +228,19 @@ static func parse_releases_response(
 		if not value is Dictionary:
 			return empty
 		var name := str(value.get("name", ""))
-		if not _ASSET_LIMITS.has(name) or urls.has(name):
+		if not _RELEASE_ASSET_LIMITS.has(name) or sizes.has(name):
 			return empty
 		var size := int(value.get("size", -1))
-		if size <= 0 or size > int(_ASSET_LIMITS[name]):
+		if size <= 0 or size > int(_RELEASE_ASSET_LIMITS[name]):
 			return empty
-		if name == SIGNATURE_NAME and size != int(_ASSET_LIMITS[name]):
+		if name in [SIGNATURE_NAME, LEGACY_SIGNATURE_NAME] and size != 512:
 			return empty
 		var url := str(value.get("browser_download_url", ""))
 		if not _is_trusted_download_url(url, qualification):
 			return empty
-		urls[name] = url
 		sizes[name] = size
+		if _ASSET_LIMITS.has(name):
+			urls[name] = url
 	if urls.size() != 3:
 		return empty
 	return {

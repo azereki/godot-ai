@@ -356,6 +356,7 @@ def test_composition_and_post_update_barriers_precede_every_normal_start_effect(
     assert "_start_server()" not in compose
     assert "check_for_updates" not in compose
     assert "begin_post_update_repin(" in begin
+    assert '"replace_owned_mismatches"' in begin
     assert 'get("manual_migration", false)' in begin
     for effect in (
         "_client_jobs.activate()",

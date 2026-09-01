@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +55,13 @@ def _stage_fixture(_archive, _manifest, _signature, _expected, destination):
     return plugin, "b" * 64, {"inventory": inventory}
 
 
-def _scenario(tmp_path: Path, suffix: str = "0123456789abcdef") -> Scenario:
+def _scenario(
+    tmp_path: Path,
+    suffix: str = "0123456789abcdef",
+    *,
+    from_version: str = "4.0.0",
+    editor: tx.ProcessIdentity | None = None,
+) -> Scenario:
     project = _mkdir(tmp_path / f"project-{suffix}")
     addons = _mkdir(project / "addons")
     install = _mkdir(addons / "godot_ai")
@@ -65,7 +71,8 @@ def _scenario(tmp_path: Path, suffix: str = "0123456789abcdef") -> Scenario:
     stage = _mkdir(_mkdir(_mkdir(stages / suffix) / "addons") / "godot_ai")
     _tree(stage, "new")
     fingerprint = tx.process_start_fingerprint(os.getpid()) or "test-process"
-    editor = tx.ProcessIdentity(os.getpid(), fingerprint, f"editor-{suffix}")
+    if editor is None:
+        editor = tx.ProcessIdentity(os.getpid(), fingerprint, f"editor-{suffix}")
     runner = tx.ProcessIdentity(os.getpid(), fingerprint, f"runner-{suffix}")
     intent = tx.Intent.create(
         transaction=suffix,
@@ -73,7 +80,7 @@ def _scenario(tmp_path: Path, suffix: str = "0123456789abcdef") -> Scenario:
         install_root=install,
         recovery=recovery,
         stage_root=stage,
-        from_version="4.0.0",
+        from_version=from_version,
         to_version="4.0.1",
         manifest_sha256="a" * 64,
         editor=editor,
@@ -221,6 +228,50 @@ def test_actor_response_always_binds_protocol_and_package_version() -> None:
         tx.actor_response({"protocol_version": 2})
 
 
+def test_post_update_client_repin_is_broad_only_across_the_v4_boundary(
+    tmp_path: Path,
+) -> None:
+    intent = _scenario(tmp_path).intent
+    terminal = {"outcome": "success"}
+    assert tx._post_outcome(intent, terminal)["replace_owned_mismatches"] is False
+    assert tx._post_outcome(
+        replace(intent, from_version="3.2.4"), terminal
+    )["replace_owned_mismatches"] is True
+
+
+@pytest.mark.parametrize("predecessor_state", ["dead", "reused"])
+def test_editor_lease_transfers_only_after_nonce_bound_predecessor_is_gone(
+    tmp_path: Path, predecessor_state: str,
+) -> None:
+    scenario = _scenario(tmp_path)
+    leases = tx.EditorLeases(scenario.recovery, scenario.project, scenario.install)
+    previous = scenario.intent.editor
+    current = tx.ProcessIdentity(
+        previous.pid + 1,
+        "restarted-editor-fingerprint",
+        previous.nonce,
+    )
+    leases.acquire(previous)
+
+    with pytest.raises(tx.LockBusy, match="cannot prove its predecessor closed"):
+        leases.transfer_restart(
+            previous,
+            current,
+            timeout=1,
+            process_probe=lambda _identity: "unknown",
+        )
+    leases.transfer_restart(
+        previous,
+        current,
+        timeout=1,
+        process_probe=lambda _identity: predecessor_state,
+    )
+
+    leases.validate(current)
+    with pytest.raises(tx.TransactionError, match="current editor lease"):
+        leases.validate(previous)
+
+
 def test_identity_command_reports_exact_actor_identity_without_inputs(
     capfd: pytest.CaptureFixture[str],
 ) -> None:
@@ -272,6 +323,36 @@ def test_initiating_startup_barrier_writes_readiness_and_claims(tmp_path: Path) 
     assert outcome["outcome"] == "success"
     assert actor.finish()["outcome"] == "success"
     assert not os.path.lexists(scenario.recovery / "activation.lock")
+
+
+def test_pre_v4_restart_transfers_lease_then_claims_from_clean_editor(
+    tmp_path: Path,
+) -> None:
+    nonce = "restart-editor-012345"
+    previous = tx.ProcessIdentity(987654, "dead-editor-start", nonce)
+    scenario = _scenario(
+        tmp_path,
+        from_version="3.2.4",
+        editor=previous,
+    )
+    leases = tx.EditorLeases(scenario.recovery, scenario.project, scenario.install)
+    leases.acquire(previous)
+    actor = Actor(scenario.intent, readiness_timeout=2, claim_timeout=2)
+    _wait_for_phase(scenario, actor, "stage_live")
+
+    outcome = tx.startup_barrier(
+        scenario.project,
+        scenario.install,
+        editor_pid=os.getpid(),
+        editor_nonce=nonce,
+        transaction=scenario.intent.transaction,
+        timeout=2,
+    )
+
+    assert outcome["outcome"] == "success"
+    assert outcome["replace_owned_mismatches"] is True
+    assert actor.finish()["outcome"] == "success"
+    leases.validate(tx.editor_identity(os.getpid(), nonce))
 
 
 def test_startup_retry_finishes_claim_published_before_lock_release(tmp_path: Path) -> None:

@@ -157,10 +157,10 @@ The CI stack should exercise at least four tiers:
 - the retained
   [one-time pre-v4 updater evidence](../verification/pre-v4-updater-one-time-evidence.md).
   It source-classified all 104 tags into 24 behavior classes and ran 29 selected
-  runtime rows on macOS/Godot 4.7. Historical releases are immutable and
-  unsupported after the v4 boundary, so recurring CI tests the durable v4 asset
-  shape and clean-migration contract instead of downloading and executing old
-  release code on every commit.
+  runtime rows on macOS/Godot 4.7. Historical releases remain immutable and
+  unsupported after the v4 boundary. Recurring CI tests one canonical v4 tree,
+  the signed transition-capsule shape, and the exact final-v3 one-click bridge;
+  it does not download every older release on every commit.
 - local interactive self-update smoke for update/reload/extract changes
   (`python script/local-self-update-smoke`)
 - **pixel-level capture smoke** for tools that cross the editor → game-process boundary (3 OS). The `game-capture-smoke-{linux,macos,windows}` jobs launch Godot with a real rendering driver (`xvfb-run -a ... godot --rendering-driver opengl3` on Linux, windowed on macOS and Windows), play `test_project/capture_smoke.tscn` (four colored quadrants), round-trip `editor_screenshot(source="game")` through the debugger-channel bridge, decode the returned PNG with Pillow, and assert the centre of each quadrant matches the expected color within tolerance. Catches regressions in the `_mcp_game_helper` autoload registration, the `DEFERRED_RESPONSE` dispatcher path, and the `McpConnection.send_deferred_response` reply pipeline — none of which are exercised by the headless Godot test suite.

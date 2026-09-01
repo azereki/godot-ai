@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build, sign, verify, or install the single Godot AI v4 release archive.
+"""Build, sign, verify, or install the Godot AI v4 release artifacts.
 
 The migration verifier is this CLI plus its exact sibling
 ``src/godot_ai/release_verify.py`` from one reviewed source commit.  The pair
@@ -44,6 +44,13 @@ PUBLIC_KEY_SPKI_SHA256 = _verify.PUBLIC_KEY_SPKI_SHA256
 REPOSITORY = _verify.REPOSITORY
 SIGNATURE_NAME = _verify.SIGNATURE_NAME
 SIGNATURE_SIZE = _verify.SIGNATURE_SIZE
+LEGACY_ASSET_NAME = "godot-ai-plugin.zip"
+LEGACY_CHECKSUM_NAME = f"{LEGACY_ASSET_NAME}.sha256"
+LEGACY_SIGNATURE_NAME = f"{LEGACY_CHECKSUM_NAME}.sig"
+LEGACY_MAX_ARCHIVE_SIZE = 66 * 1024 * 1024
+LEGACY_MAX_CHECKSUM_SIZE = 1024
+MIGRATION_BRIDGE_SOURCE = "migration_bridge"
+MIGRATION_PAYLOAD_PREFIX = f"{PLUGIN_PREFIX}migration_payload/"
 ReleaseError = _verify.ReleaseError
 _canonical = _verify._canonical
 _extract_verified_archive = _verify._extract_verified_archive
@@ -247,10 +254,30 @@ def _snapshot_tree(plugin_root: Path, version: str) -> list[tuple[str, bytes]]:
 
 def _snapshot_commit(repo: Path, source: str, version: str) -> list[tuple[str, bytes]]:
     """Read only immutable Git blobs bound to ``source``; never the worktree."""
-    source_prefix = f"plugin/{PLUGIN_PREFIX}"
+    snapshot = _snapshot_git_directory(
+        repo,
+        source,
+        f"plugin/{PLUGIN_PREFIX}".rstrip("/"),
+        PLUGIN_PREFIX,
+        "source tree",
+    )
+    configs = [data for path, data in snapshot if path == PLUGIN_CONFIG]
+    if len(configs) != 1 or _plugin_version(configs[0]) != version:
+        _fail("plugin.cfg", "version does not match the release identity")
+    return snapshot
+
+
+def _snapshot_git_directory(
+    repo: Path,
+    source: str,
+    source_prefix: str,
+    destination_prefix: str,
+    context: str,
+) -> list[tuple[str, bytes]]:
+    """Map one immutable Git directory to deterministic archive paths."""
     listing = _run(
         ["git", "-C", str(repo), "ls-tree", "-r", "-z", source, "--", source_prefix],
-        "source tree",
+        context,
     )
     snapshot: list[tuple[str, bytes]] = []
     total = 0
@@ -261,25 +288,27 @@ def _snapshot_commit(repo: Path, source: str, version: str) -> list[tuple[str, b
             header, source_path = raw.decode("utf-8").split("\t", 1)
             mode, kind, object_id = header.split(" ")
         except (UnicodeDecodeError, ValueError) as exc:
-            raise ReleaseError("source tree: malformed or non-UTF-8 Git entry") from exc
+            raise ReleaseError(f"{context}: malformed or non-UTF-8 Git entry") from exc
         if mode not in {"100644", "100755"} or kind != "blob":
-            _fail("source tree", f"non-regular Git entry: {source_path}")
+            _fail(context, f"non-regular Git entry: {source_path}")
         try:
-            size = int(_run(["git", "-C", str(repo), "cat-file", "-s", object_id], "blob size"))
+            size = int(
+                _run(["git", "-C", str(repo), "cat-file", "-s", object_id], "blob size")
+            )
         except ValueError as exc:
-            raise ReleaseError("source tree: malformed Git blob size") from exc
+            raise ReleaseError(f"{context}: malformed Git blob size") from exc
         if not 0 <= size <= MAX_FILE_SIZE or total + size > MAX_TREE_SIZE:
-            _fail("source tree", "Git blob or expanded tree exceeds release bound")
+            _fail(context, "Git blob or expanded tree exceeds release bound")
         data = _run(["git", "-C", str(repo), "cat-file", "blob", object_id], "source blob")
         if len(data) != size:
-            _fail("source tree", "Git blob size changed while reading")
+            _fail(context, "Git blob size changed while reading")
         total += size
-        snapshot.append((source_path.removeprefix("plugin/"), data))
+        relative = source_path.removeprefix(f"{source_prefix}/")
+        if relative == source_path or not relative:
+            _fail(context, f"entry escaped source directory: {source_path}")
+        snapshot.append((f"{destination_prefix}{relative}", data))
     snapshot.sort(key=lambda item: item[0])
-    _validate_paths([path for path, _data in snapshot], "source tree")
-    configs = [data for path, data in snapshot if path == PLUGIN_CONFIG]
-    if len(configs) != 1 or _plugin_version(configs[0]) != version:
-        _fail("plugin.cfg", "version does not match the release identity")
+    _validate_paths([path for path, _data in snapshot], context)
     return snapshot
 
 
@@ -853,6 +882,107 @@ def build_release(
     return destinations
 
 
+def build_migration_capsule(
+    repo_root: Path,
+    output_dir: Path,
+    private_key: Path,
+    canonical: tuple[Path, Path, Path],
+    expected: tuple[str, ...],
+) -> tuple[Path, Path, Path]:
+    """Build the signed v3-compatible capsule around one verified v4 release."""
+    repository, channel, tag, version, source_commit = expected
+    _identity(repository, channel, tag, version, source_commit)
+    verify_release(*canonical, expected)
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destinations = tuple(
+        output_dir / name
+        for name in (LEGACY_ASSET_NAME, LEGACY_CHECKSUM_NAME, LEGACY_SIGNATURE_NAME)
+    )
+    _require_new_destinations(destinations)
+
+    snapshot = _snapshot_git_directory(
+        repo_root.resolve(),
+        source_commit,
+        MIGRATION_BRIDGE_SOURCE,
+        PLUGIN_PREFIX,
+        "migration bridge",
+    )
+    config_rows = [index for index, (path, _data) in enumerate(snapshot) if path == PLUGIN_CONFIG]
+    if len(config_rows) != 1:
+        _fail("migration bridge", "expected exactly one plugin.cfg")
+    config_index = config_rows[0]
+    config_path, config = snapshot[config_index]
+    if config.count(b"@VERSION@") != 1:
+        _fail("migration bridge", "plugin.cfg must contain one @VERSION@ placeholder")
+    snapshot[config_index] = (config_path, config.replace(b"@VERSION@", version.encode("ascii")))
+    if _plugin_version(snapshot[config_index][1]) != version:
+        _fail("migration bridge", "rendered plugin version differs from release identity")
+
+    for artifact, name, maximum in zip(
+        canonical,
+        (ASSET_NAME, MANIFEST_NAME, SIGNATURE_NAME),
+        (MAX_ARCHIVE_SIZE, MAX_MANIFEST_SIZE, SIGNATURE_SIZE),
+        strict=True,
+    ):
+        if artifact.name != name or artifact.is_symlink() or not artifact.is_file():
+            _fail("migration payload", f"expected regular canonical artifact {name}")
+        snapshot.append((f"{MIGRATION_PAYLOAD_PREFIX}{name}", _read_bounded(artifact, maximum)))
+    snapshot.sort(key=lambda item: item[0])
+    _validate_paths([path for path, _data in snapshot], "migration capsule")
+    if sum(len(data) for _path, data in snapshot) > LEGACY_MAX_ARCHIVE_SIZE:
+        _fail("migration capsule", "expanded payload exceeds release bound")
+
+    with tempfile.TemporaryDirectory(prefix=".v4-bridge-", dir=output_dir) as temporary:
+        root = Path(temporary)
+        archive = root / LEGACY_ASSET_NAME
+        checksum = root / LEGACY_CHECKSUM_NAME
+        signature = root / LEGACY_SIGNATURE_NAME
+        _write_zip(archive, snapshot)
+        size, digest = _hash_file(archive, LEGACY_MAX_ARCHIVE_SIZE)
+        if size <= 0:
+            _fail("migration capsule", "archive is empty")
+        checksum.write_bytes(f"{digest}  {LEGACY_ASSET_NAME}\n".encode("ascii"))
+        raw = _read_bounded(checksum, LEGACY_MAX_CHECKSUM_SIZE)
+        _openssl("-sign", str(private_key.resolve()), "-out", str(signature), str(checksum))
+        _verify_signature(raw, _read_bounded(signature, SIGNATURE_SIZE), PUBLIC_KEY_PEM)
+        _publish_new_files((archive, checksum, signature), destinations)
+    return destinations
+
+
+def build_release_set(
+    repo_root: Path,
+    output_dir: Path,
+    private_key: Path,
+    channel: str,
+    tag: str,
+    version: str,
+    source_commit: str,
+) -> tuple[Path, ...]:
+    """Publish the canonical v4 triple plus its signed v3 migration capsule."""
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    names = (
+        ASSET_NAME,
+        MANIFEST_NAME,
+        SIGNATURE_NAME,
+        LEGACY_ASSET_NAME,
+        LEGACY_CHECKSUM_NAME,
+        LEGACY_SIGNATURE_NAME,
+    )
+    destinations = tuple(output_dir / name for name in names)
+    _require_new_destinations(destinations)
+    expected = (REPOSITORY, channel, tag, version, source_commit)
+    with tempfile.TemporaryDirectory(prefix=".v4-release-set-", dir=output_dir) as temporary:
+        root = Path(temporary)
+        canonical = build_release(
+            repo_root, root, private_key, channel, tag, version, source_commit
+        )
+        bridge = build_migration_capsule(repo_root, root, private_key, canonical, expected)
+        _publish_new_files((*canonical, *bridge), destinations)
+    return destinations
+
+
 def _identity_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--channel", choices=("stable",), required=True)
     for name in ("tag", "version", "source-commit"):
@@ -883,7 +1013,9 @@ def _parser() -> argparse.ArgumentParser:
             choices=("stable",) if name == "channel" else None,
             required=True,
         )
-    build = commands.add_parser("build", help="local package/sign/verify orchestration")
+    build = commands.add_parser(
+        "build", help="build the canonical v4 assets and signed v3 migration capsule"
+    )
     build.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     for name in ("output-dir", "private-key"):
         build.add_argument(f"--{name}", type=Path, required=True)
@@ -927,7 +1059,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "sign":
             print(sign_release(args.manifest, args.signature, args.private_key, _expected(args)))
         elif args.command == "build":
-            outputs = build_release(
+            outputs = build_release_set(
                 args.repo_root,
                 args.output_dir,
                 args.private_key,

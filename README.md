@@ -17,9 +17,9 @@ animation, particles, cameras, and environments.
 > 📦 This branch is the unpublished Godot AI v4 candidate. V4 requires Godot
 > 4.7+ within the 4.x line; its publication workflow remains closed while the exact candidate and
 > independent release trust anchor are qualified. Public marketplace listings
-> remain on v3. Do not replace a v3 install yet; see the
-> [v4 migration guide](docs/v4-migration.md) for the release gate and eventual
-> clean-migration procedure.
+> remain on v3. Do not replace a v3 install yet; once publication opens, the
+> [v4 migration](docs/v4-migration.md) is one **Update** click from the final
+> signed v3 line.
 
 > 💬 **[Join the Discord](https://discord.gg/FDZ5fr2QkP)** — questions, showcases, and contributor chat.
 
@@ -56,7 +56,7 @@ animation, particles, cameras, and environments.
 No public v4 install is available while publication is closed. After the
 independent release attestation named in the
 [migration guide](docs/v4-migration.md) exists, a fresh project will verify the
-three v4 assets and extract the verified `godot-ai-v4-plugin.zip` into an absent
+canonical v4 triple and extract `godot-ai-v4-plugin.zip` into an absent
 `addons/godot_ai` path.
 
 For contributor/dev checkouts only:
@@ -67,9 +67,9 @@ mkdir -p your-project/addons   # without this, cp makes addons/ a copy of godot_
 cp -r godot-ai/plugin/addons/godot_ai your-project/addons/
 ```
 
-If the project already has Godot AI v3, do not copy or extract over it. Follow
-the closed-editor migration procedure, which retains the complete old tree
-outside the project before activating v4.
+If the project already has the final signed Godot AI v3 release, do not copy or
+extract over it. Open it in Godot 4.7+ and click **Update** once; the signed
+migration bridge retains the complete old tree before activating v4.
 
 ### 2. Enable the plugin
 

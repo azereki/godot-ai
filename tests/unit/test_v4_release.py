@@ -71,13 +71,14 @@ def _repository(root: Path, public_key: str) -> tuple[Path, str]:
         ROOT / "plugin/addons/godot_ai/utils/uv_resolution_policy.gd",
         plugin / "utils/uv_resolution_policy.gd",
     )
+    shutil.copytree(ROOT / "migration_bridge", repo / "migration_bridge")
     (repo / "pyproject.toml").write_text(
         '[project]\nname="godot-ai"\nversion="4.0.0"\n', encoding="utf-8"
     )
     _run("git", "init", "-q", cwd=repo)
     _run("git", "config", "user.email", "release-test@example.invalid", cwd=repo)
     _run("git", "config", "user.name", "Release Test", cwd=repo)
-    _run("git", "add", "plugin", "pyproject.toml", cwd=repo)
+    _run("git", "add", "plugin", "migration_bridge", "pyproject.toml", cwd=repo)
     _run("git", "commit", "-q", "-m", "fixture", cwd=repo)
     source = _run("git", "rev-parse", "HEAD", cwd=repo).decode().strip()
     _run("git", "tag", "v4.0.0", cwd=repo)
@@ -339,6 +340,55 @@ def test_build_is_deterministic_and_emits_one_archive_shape(signed_release):
         "size": archive.stat().st_size,
         "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
     }
+
+
+def test_release_set_adds_one_deterministic_signed_v3_migration_capsule(
+    signed_release, tmp_path
+):
+    first = tmp_path / "release-set-first"
+    second = tmp_path / "release-set-second"
+    arguments = (
+        signed_release["repo"],
+        signed_release["private"],
+        *IDENTITY[1:],
+        signed_release["source"],
+    )
+    outputs = v4_release.build_release_set(arguments[0], first, *arguments[1:])
+    repeated = v4_release.build_release_set(arguments[0], second, *arguments[1:])
+    expected_names = {
+        v4_release.ASSET_NAME,
+        v4_release.MANIFEST_NAME,
+        v4_release.SIGNATURE_NAME,
+        v4_release.LEGACY_ASSET_NAME,
+        v4_release.LEGACY_CHECKSUM_NAME,
+        v4_release.LEGACY_SIGNATURE_NAME,
+    }
+    assert {path.name for path in outputs} == expected_names
+    assert {path.name for path in first.iterdir()} == expected_names
+    assert [path.read_bytes() for path in outputs] == [path.read_bytes() for path in repeated]
+
+    by_name = {path.name: path for path in outputs}
+    capsule = by_name[v4_release.LEGACY_ASSET_NAME]
+    checksum = by_name[v4_release.LEGACY_CHECKSUM_NAME].read_bytes()
+    signature = by_name[v4_release.LEGACY_SIGNATURE_NAME].read_bytes()
+    digest = hashlib.sha256(capsule.read_bytes()).hexdigest()
+    assert checksum == f"{digest}  {v4_release.LEGACY_ASSET_NAME}\n".encode("ascii")
+    v4_release._verify_signature(checksum, signature, signed_release["public"])
+
+    with zipfile.ZipFile(capsule) as package:
+        names = package.namelist()
+        assert names == sorted(names)
+        assert package.read("addons/godot_ai/plugin.cfg").decode().count(
+            'version="4.0.0"'
+        ) == 1
+        for name in (
+            v4_release.ASSET_NAME,
+            v4_release.MANIFEST_NAME,
+            v4_release.SIGNATURE_NAME,
+        ):
+            assert package.read(f"{v4_release.MIGRATION_PAYLOAD_PREFIX}{name}") == by_name[
+                name
+            ].read_bytes()
 
 
 def test_build_never_overwrites_an_existing_candidate(signed_release):

@@ -112,11 +112,13 @@ the legacy implementation's stale-URL behavior; neither state installed v4.
 | v3.2.3 | class | 6ff766e5f8ddc5a4512b5a418f99328f0581c918a53a8f7a2bf5f00055c8cb20 | 532828083 / 331b202de803cbcb974a8a15bd9b3c8902ec70e726ecae2c281b1e578a83947c | cleared | pass/no mutation |
 | v3.2.4 | milestone | 6ff766e5f8ddc5a4512b5a418f99328f0581c918a53a8f7a2bf5f00055c8cb20 | 532921707 / 8275d98c66b9932feee2a2a5118768e6699a5827ca798fe6032978845ae16321 | cleared | pass/no mutation |
 
-## Permanent v4 policy
+## Historical conclusion and superseding bridge decision
 
-Pre-v4 updater code is immutable and unsupported after the major-version cut.
-The release pipeline must continue to publish only the signed three-asset v4
-shape, with no legacy alias. A v3-or-earlier installation reaches v4 only by
-the documented editor-closed exact-tree migration. Active tests cover those
-two durable properties; recurring CI no longer downloads or executes historical
-release code.
+This audit proved the no-mutation boundary for the then-proposed release shape;
+it did not prove a future transition capsule. Pre-v4 updater code remains
+immutable and unsupported after the major-version cut. The later approved
+design publishes one canonical signed v4 triple plus a separately signed,
+legacy-named temporary capsule for the final v3 line. That capsule is not an
+alias or final v4 tree: it delegates to the exact-tree v4 actor. Recurring CI
+therefore executes the final-v3 bridge separately while this report remains the
+non-recurring historical classification of older updater behavior.

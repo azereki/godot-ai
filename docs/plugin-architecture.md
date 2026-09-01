@@ -235,11 +235,13 @@ HTTP capability as the rest of the server.
 
 ### Transactional self-update boundary
 
-Automatic update is v4-to-v4 only. Crossing from v3 to v4 is the manual signed
-clean migration in [v4-migration.md](v4-migration.md).
+The permanent updater is v4-to-v4. The final v3 line crosses once through a
+signed temporary bridge and then enters this same exact-tree protocol; see
+[v4-migration.md](v4-migration.md).
 
 - `utils/update_manager.gd` performs v4-only release discovery. It requires the
-  exact archive/manifest/signature asset set. Transaction preflight first
+  exact six-name release envelope and downloads only the canonical
+  archive/manifest/signature triple. Transaction preflight first
   allocates a random owner-private directory under the external recovery root;
   the manager writes only those three bounded filenames there and never uses a
   predictable `user://` staging namespace.

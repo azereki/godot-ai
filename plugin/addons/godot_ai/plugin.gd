@@ -749,7 +749,10 @@ func _begin_startup_release() -> void:
 	var started: Dictionary = _client_jobs.begin_post_update_repin(
 		str(_post_update_outcome.get("from_version", "")),
 		str(_post_update_outcome.get("to_version", "")),
-		bool(_post_update_outcome.get("manual_migration", false)),
+		bool(_post_update_outcome.get(
+			"replace_owned_mismatches",
+			_post_update_outcome.get("manual_migration", false),
+		)),
 	)
 	if not bool(started.get("ok", false)):
 		_present_post_update_barrier_failure(str(started.get("error", "Client migration could not start.")))

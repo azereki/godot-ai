@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,8 @@ from tests.integration._self_update_fixture import (
     LIVE_WS_PORT,
     PLUGIN_ROOT,
     POST_UPDATE_STATUS_FILE,
+    POST_UPDATE_TOOL_PROBE_FILE,
+    append_driver_autoload,
     assert_no_update_parse_errors,
     clean_major_install_argv,
     godot_bin_or_skip,
@@ -34,6 +37,7 @@ from tests.integration._self_update_fixture import (
     run_godot_editor,
     write_clean_major_driver,
     write_configure_client_driver,
+    write_driver_support,
     write_install_update_driver,
 )
 
@@ -517,6 +521,337 @@ def test_signed_update_restarts_matching_live_server_without_parse_errors(
     )
     pre_id = pre_line.split("=", 1)[1]
     assert post_id != pre_id
+
+
+def test_final_v3_capsule_automatically_replaces_tree_repins_and_starts(
+    tmp_path: Path,
+) -> None:
+    """Click Update in exact final v3 and prove the rest is automatic."""
+    godot_bin = godot_bin_or_skip()
+    smoke = load_smoke_script()
+    target_version = read_plugin_version(PLUGIN_ROOT / "plugin.cfg")
+    from_version = "3.2.4"
+    http_port, ws_port = allocate_free_ports(2)
+    project = tmp_path / "v3-bridge-update"
+    project.mkdir()
+    smoke.write_project_files(project)
+    append_driver_autoload(project / "project.godot")
+    work = project / ".godot-ai-self-update-smoke"
+    work.mkdir()
+    (work / "marker.txt").write_text("v3 bridge integration fixture\n", encoding="utf-8")
+
+    server_command, runtime_source = smoke.prepare_local_server_runtime(
+        work, "bridge-server", target_version
+    )
+    actor_command, private_key, public_key = smoke.prepare_smoke_actor(work, runtime_source)
+    client_command = smoke.prepare_isolated_client_environment(
+        project,
+        base_version=from_version,
+        http_port=http_port,
+        ws_port=ws_port,
+    )
+    release_tree = work / "release-tree"
+    shutil.copytree(PLUGIN_ROOT, release_tree, ignore=smoke.copy_ignore)
+    smoke.patch_fixture_plugin(
+        release_tree,
+        version=target_version,
+        server_version=target_version,
+        http_port=http_port,
+        ws_port=ws_port,
+        force_local_update=False,
+        next_version=target_version,
+        server_command=server_command,
+        actor_command=actor_command,
+        isolate_client_migration=True,
+        client_launch_command=client_command,
+    )
+    bundle = work / "release"
+    bundle.mkdir()
+    smoke.create_signed_v4_bundle(
+        release_tree, bundle, target_version, private_key, public_key
+    )
+
+    capsule_tree = work / "capsule-tree" / "addons" / "godot_ai"
+    shutil.copytree(PLUGIN_ROOT.parents[2] / "migration_bridge", capsule_tree)
+    capsule_config = capsule_tree / "plugin.cfg"
+    capsule_config.write_text(
+        capsule_config.read_text(encoding="utf-8").replace("@VERSION@", target_version),
+        encoding="utf-8",
+    )
+    payload = capsule_tree / "migration_payload"
+    payload.mkdir()
+    for name in (
+        smoke.SMOKE_ARCHIVE_NAME,
+        smoke.SMOKE_MANIFEST_NAME,
+        smoke.SMOKE_SIGNATURE_NAME,
+    ):
+        shutil.copy2(bundle / name, payload / name)
+    bridge_exec = capsule_tree / "bridge_exec.gd"
+    bridge_exec.write_text(
+        smoke.replace_function(
+            bridge_exec.read_text(encoding="utf-8"),
+            "static func actor_command(version: String) -> Array[String]:",
+            "static func actor_command(_version: String) -> Array[String]:\n"
+            f"\treturn {json.dumps(actor_command)}",
+        ),
+        encoding="utf-8",
+    )
+    bridge = capsule_tree / "migration_bridge.gd"
+    bridge.write_text(
+        smoke.replace_function(
+            bridge.read_text(encoding="utf-8"),
+            "static func _previous_version() -> String:",
+            "static func _previous_version() -> String:\n"
+            f"\treturn {json.dumps(from_version)}",
+        ),
+        encoding="utf-8",
+    )
+    capsule = work / "godot-ai-plugin.zip"
+    with zipfile.ZipFile(capsule, "w", compression=zipfile.ZIP_STORED) as package:
+        for path in sorted(capsule_tree.rglob("*")):
+            if path.is_file():
+                package.write(path, path.relative_to(capsule_tree.parents[1]).as_posix())
+    checksum = work / "godot-ai-plugin.zip.sha256"
+    checksum.write_text(
+        f"{hashlib.sha256(capsule.read_bytes()).hexdigest()}  {capsule.name}\n",
+        encoding="ascii",
+    )
+    signature = work / "godot-ai-plugin.zip.sha256.sig"
+    subprocess.run(
+        [
+            "openssl",
+            "dgst",
+            "-sha256",
+            "-sign",
+            str(private_key),
+            "-out",
+            str(signature),
+            str(checksum),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    private_key.unlink()
+
+    archived = work / "v3.2.4.zip"
+    archived.write_bytes(
+        subprocess.run(
+            ["git", "archive", "--format=zip", "v3.2.4", "plugin/addons/godot_ai"],
+            cwd=PLUGIN_ROOT.parents[2],
+            check=True,
+            capture_output=True,
+        ).stdout
+    )
+    extracted = work / "v3-source"
+    with zipfile.ZipFile(archived) as package:
+        assert all(
+            not Path(info.filename).is_absolute() and ".." not in Path(info.filename).parts
+            for info in package.infolist()
+        )
+        assert all(
+            info.is_dir() or info.filename.startswith("plugin/addons/godot_ai/")
+            for info in package.infolist()
+        )
+        package.extractall(extracted)
+    live = project / "addons" / "godot_ai"
+    shutil.copytree(extracted / "plugin/addons/godot_ai", live)
+    old_plugin = live / "plugin.gd"
+    old_plugin.write_text(
+        smoke.replace_function(
+            old_plugin.read_text(encoding="utf-8"),
+            "func _start_server() -> void:",
+            "func _start_server() -> void:\n\tpass",
+        ),
+        encoding="utf-8",
+    )
+    old_manager = live / "utils" / "update_manager.gd"
+    manager_text = old_manager.read_text(encoding="utf-8")
+    manager_text = smoke.subn_once(
+        old_manager,
+        manager_text,
+        r'const RELEASE_SIGNING_PUBLIC_KEY_PEM := """[\s\S]*?"""',
+        (
+            'const RELEASE_SIGNING_PUBLIC_KEY_PEM := """'
+            + public_key.strip()
+            + '"""'
+        ),
+        "v3 fixture signing key",
+    )
+    manager_text = smoke.replace_once(
+        old_manager,
+        manager_text,
+        'const UPDATE_TEMP_ZIP := "user://godot_ai_update/update.zip"\n',
+        (
+            'const UPDATE_TEMP_ZIP := "user://godot_ai_update/update.zip"\n'
+            f'const CLICK_FIXTURE_ARCHIVE := {json.dumps(str(capsule))}\n'
+            f'const CLICK_FIXTURE_CHECKSUM := {json.dumps(str(checksum))}\n'
+            f'const CLICK_FIXTURE_SIGNATURE := {json.dumps(str(signature))}\n'
+            f'const CLICK_FIXTURE_VERSION := {json.dumps(target_version)}\n'
+        ),
+        "v3 click fixture assets",
+    )
+    manager_text = smoke.replace_function(
+        manager_text,
+        "func check_for_updates() -> void:",
+        """func check_for_updates() -> void:
+\t_latest_download_url = (
+\t\t"https://github.com/hi-godot/godot-ai/releases/download/v%s/" % CLICK_FIXTURE_VERSION
+\t\t+ "godot-ai-plugin.zip"
+\t)
+\t_latest_checksum_url = _latest_download_url + ".sha256"
+\t_latest_signature_url = _latest_checksum_url + ".sig"
+\t_latest_remote_version = CLICK_FIXTURE_VERSION
+\tupdate_check_completed.emit({
+\t\t"has_update": true,
+\t\t"version": CLICK_FIXTURE_VERSION,
+\t\t"label_text": "Update available: v%s" % CLICK_FIXTURE_VERSION,
+\t})""",
+    )
+    manager_text = smoke.replace_function(
+        manager_text,
+        "func start_install() -> void:",
+        """func start_install() -> void:
+\tprint("V3_BRIDGE_TEST | clicked final-v3 Update button")
+\tvar global_zip := ProjectSettings.globalize_path(UPDATE_TEMP_ZIP)
+\tDirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(UPDATE_TEMP_DIR))
+\tif DirAccess.copy_absolute(CLICK_FIXTURE_ARCHIVE, global_zip) != OK:
+\t\t_fail_verification("fixture archive copy failed")
+\t\treturn
+\tvar sidecar := FileAccess.get_file_as_bytes(CLICK_FIXTURE_CHECKSUM)
+\tvar signature := FileAccess.get_file_as_bytes(CLICK_FIXTURE_SIGNATURE)
+\tif not _verify_sidecar_signature(RELEASE_SIGNING_PUBLIC_KEY_PEM, sidecar, signature):
+\t\t_fail_verification("fixture signature failed")
+\t\treturn
+\tprint("MCP | self-update release signature verified")
+\tvar expected := _parse_sha256_digest(sidecar.get_string_from_utf8())
+\t_finish_digest_check_and_install(expected)""",
+    )
+    old_manager.write_text(manager_text, encoding="utf-8")
+
+    write_driver_support(project)
+    (project / "_test_runner_driver.gd").write_text(
+        f'''@tool
+extends Node
+
+const TARGET_VERSION := "{target_version}"
+const HTTP_PORT := {http_port}
+const STATUS_PATH := "res://{POST_UPDATE_STATUS_FILE}"
+const PROBE_DONE_PATH := "res://{POST_UPDATE_TOOL_PROBE_FILE}"
+const COMPLETE_PATH := "res://_test_v3_bridge_complete.done"
+const DriverSupport := preload("res://_test_self_update_driver_support.gd")
+const DEADLINE_MSEC := 180000
+
+var _deadline := 0
+var _migration_ready := false
+var _clicked := false
+
+
+func _ready() -> void:
+\tif not Engine.is_editor_hint():
+\t\tqueue_free()
+\t\treturn
+\t_deadline = Time.get_ticks_msec() + DEADLINE_MSEC
+\tset_process(true)
+
+
+func _process(_delta: float) -> void:
+\tif Time.get_ticks_msec() >= _deadline:
+\t\tpush_error("V3_BRIDGE_TEST | automatic migration timed out")
+\t\tget_tree().quit(41)
+\t\treturn
+\tif not _clicked:
+\t\tvar old_plugin := DriverSupport.find_godot_ai_plugin()
+\t\tif old_plugin == null:
+\t\t\treturn
+\t\tvar dock: Variant = old_plugin.get("_dock")
+\t\tif dock == null or not dock.has_method("_on_update_pressed"):
+\t\t\treturn
+\t\tdock.call("_on_update_pressed")
+\t\t_clicked = true
+\t\treturn
+\tif _migration_ready:
+\t\tif FileAccess.file_exists(PROBE_DONE_PATH):
+\t\t\tprint("V3_BRIDGE_TEST | authenticated tool probe completed")
+\t\t\tvar complete := FileAccess.open(COMPLETE_PATH, FileAccess.WRITE)
+\t\t\tif complete != null:
+\t\t\t\tcomplete.store_string("complete\\n")
+\t\t\t\tcomplete.close()
+\t\t\tget_tree().quit(0)
+\t\treturn
+\tvar plugin := DriverSupport.find_godot_ai_plugin()
+\tif plugin == null or not bool(plugin.call("has_managed_server")):
+\t\treturn
+\tif not DriverSupport.client_config_has_pin(TARGET_VERSION):
+\t\treturn
+\tvar status := DriverSupport.fetch_status(HTTP_PORT)
+\tif str(status.get("server_version", "")) != TARGET_VERSION:
+\t\treturn
+\tvar file := FileAccess.open(STATUS_PATH, FileAccess.WRITE)
+\tif file == null:
+\t\tget_tree().quit(42)
+\t\treturn
+\tfile.store_string(JSON.stringify(status))
+\tfile.close()
+\tprint("V3_BRIDGE_TEST | v4 server and client pin ready")
+\t_migration_ready = true
+''',
+        encoding="utf-8",
+    )
+
+    environment = smoke.godot_child_environment(project)
+    capability_dir = smoke.fixture_environment_paths(project)["capability_dir"]
+    log = run_godot_editor(
+        project,
+        godot_bin,
+        allow_headless=True,
+        timeout=240,
+        environment=environment,
+        live_probe=lambda: _authenticated_tool_probe(
+            http_port,
+            capability_dir,
+            resource_path="res://_test_v3_bridge_probe.txt",
+            content="v3 bridge authenticated write\n",
+        ),
+        restart_completion_file="_test_v3_bridge_complete.done",
+    )
+
+    disable = log.find("MCP | v3 bridge disabling transition plugin")
+    assert disable >= 0, log
+    transition_window = log[disable:]
+    parse_errors = (
+        "SCRIPT ERROR: Parse Error",
+        "ERROR: Failed to load script",
+        "Could not resolve script",
+    )
+    for pattern in parse_errors:
+        assert pattern not in transition_window, transition_window
+    ordered_markers = (
+        "V3_BRIDGE_TEST | clicked final-v3 Update button",
+        "MCP | self-update release signature verified",
+        "MCP | update runner disabling old plugin",
+        "MCP | v3 bridge preparing signed v4 tree",
+        "MCP | v3 bridge activating canonical v4 tree",
+        "MCP | v3 bridge disabling transition plugin",
+        "MCP | v3 bridge restarting editor into canonical v4 tree",
+    )
+    position = -1
+    for marker in ordered_markers:
+        position = log.find(marker, position + 1)
+        assert position >= 0, f"missing/out-of-order {marker!r}:\n{log}"
+    assert read_plugin_version(live / "plugin.cfg") == target_version
+    assert not (live / "migration_payload").exists()
+    assert not (live / "update_reload_runner.gd").exists()
+    codex_home = smoke.fixture_environment_paths(project)["codex_home"]
+    config_text = (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert f"godot-ai=={target_version}" in config_text
+    assert f"godot-ai=={from_version}" not in config_text
+    transaction, backup = smoke.verify_transaction_recovery(project, target_version)
+    intent = smoke.load_intent(
+        smoke.TransactionPaths.for_transaction(backup.parent, transaction)
+    )
+    assert intent.from_version == from_version
+    assert (backup / "migration_payload" / smoke.SMOKE_ARCHIVE_NAME).is_file()
+    assert (backup / "update_reload_runner.gd").is_file()
 
 
 @pytest.mark.parametrize("prewarm_mode", ["cold", "offline", "wedged"])

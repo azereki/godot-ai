@@ -85,21 +85,20 @@ at both the floor and ceiling.
 
 ## 4. Completed historical updater boundary proof
 
-This section is superseded as an executable release gate by the retained
-[one-time evidence](../verification/pre-v4-updater-one-time-evidence.md). That
-audit classified the available tags and established the product boundary:
-pre-v4 updaters select the legacy asset by exact name, while v4 publishes only
-the distinct v4 asset. Its temporary downloaded trees, platform-specific
-harness, and full report were intentionally deleted after review. They are not
-reproducible inputs and must not be described as no-skip candidate evidence.
+The retained
+[one-time evidence](../verification/pre-v4-updater-one-time-evidence.md)
+classified the historical tags and established how they select the legacy
+asset. That evidence remains historical; the new signed final-v3 bridge is a
+separate recurring candidate gate rather than a claim that every old updater is
+supported.
 
 Recurring v4 qualification retains only the durable consequences:
 
-- the release inventory has one v4 plugin ZIP and no legacy
-  `godot-ai-plugin.zip` alias;
-- the v4 migration page and release fallback remain canonical;
-- the manual installer starts from a byte-hashed pre-v4-shaped add-on tree,
-  moves that entire tree externally, and never overlays it; and
+- the release inventory has one canonical v4 plugin ZIP and one legacy-named
+  transition capsule, never an alias or second final tree;
+- the v4 migration page presents the single Update action as the normal path;
+- the bridge starts from a byte-hashed final-v3 add-on tree, moves the complete
+  temporary/old tree externally, and commits only the canonical v4 tree; and
 - no v4 updater or transport compatibility branch is added for pre-v4 code.
 
 Reopening the historical compatibility decision requires a new, independently
@@ -108,7 +107,7 @@ v4 candidate. The retained evidence accurately describes its narrower
 macOS/Godot 4.7 execution; it does not imply Linux, Windows, or historical-
 engine runtime coverage.
 
-## 5. Bootstrap verifier and clean migration
+## 5. Bootstrap verifier and bridge migration
 
 ### 5.1 Independent trust root
 
@@ -139,44 +138,30 @@ because the trusted verifier/key fingerprint is outside that mutable set.
 
 ### 5.2 Documentation-driven migration
 
-The harness executes the published commands and paths verbatim:
+The harness performs the documented single **Update** action from the exact
+final-v3 tree. It then proves, without another user action:
 
-1. download candidate archive/manifest/signature;
-2. run the standalone verifier;
-3. from an initially cold qualification cache, run the documented installer's
-   isolated/no-config/no-build exact
-   `uvx --from godot-ai==<target> godot-ai-update-transaction identity`
-   prewarm, through the explicitly authorized private-index environment, and
-   prove package/protocol identity before any project mutation;
-4. prove every editor using the canonical project/install root is closed;
-5. stop old MCP clients and old managed backend;
-6. canonicalize a recovery destination outside the entire project;
-7. reject source/destination aliases, collisions, symlinks, junctions, reparse
-   traversal, root disagreement, or unsafe permissions under the platform
-   threat claim;
-8. require the recovery root to share the project's filesystem, then rename
-   the old add-on there; refuse cross-filesystem migration before mutation;
-9. extract and verify the exact v4 tree;
-10. reopen/enable v4;
-11. repin owned configuration for configured clients and durably complete
-    migration;
-12. start the matching private candidate server, proving clients can reconnect
-    to the stable endpoint;
-13. exercise authenticated transport, discovery, representative read/write,
-    game run/capture where supported, restart, and editor reopen;
-14. prove the external backup remains intact and restorable.
+1. v3 selects and authenticates the legacy-named capsule;
+2. the bridge resolves the exact actor through the production uv boundary and
+   verifies the embedded canonical signature/inventory before live mutation;
+3. unsafe recovery namespaces, aliases, links/reparse traversal, permissions,
+   cross-filesystem roots, and competing editors fail closed;
+4. the complete temporary/old tree moves to external recovery and the exact v4
+   tree alone becomes live;
+5. Godot gracefully restarts itself, the new editor proves its predecessor
+   closed, and the actor transfers the inherited nonce-bound lease;
+6. first v4 startup claims the transaction, broadly repins owned pre-v4 client
+   entries, durably completes migration, and starts the matching server; and
+7. authenticated tools, later reopen, and retained-backup restoration work.
 
 Missing `uvx`, timeout/offline resolution, malformed identity, wrong package or
 protocol identity, and an extra response field each fail before an install
 claim, recovery directory, marker, backup, or live-tree mutation exists.
 
-Each mandatory desktop row runs the documented installer against fresh,
-byte-hashed pre-v4-shaped trees representing the supported clean-break input:
-an old `plugin.cfg`, old-only files, and owned client entries. At least one row
-uses a retained exact v3.2.4 add-on tree when that artifact is available; its
-absence does not resurrect deleted historical-code execution as a release
-gate. The installer proof concerns exact-tree backup/replacement and the v4
-startup marker, not whether old plugin code still executes on a modern engine.
+Each mandatory desktop row starts from a byte-hashed final-v3 tree with
+old-only files and owned client entries. Older historical classes remain
+outside the recurring support gate; the retained archaeology evidence does not
+substitute for executing the exact final-v3 bridge candidate.
 
 The harness scans the entire project after reopening for duplicate/stale
 `class_name` failures and parse cascades. A backup anywhere under the project
@@ -186,14 +171,14 @@ is a hard failure.
 
 Before publication:
 
-- GitHub release exposes one v4 plugin ZIP and its signed sidecars, no legacy
-  alias and no second store ZIP;
+- GitHub release exposes the canonical v4 triple and the signed transition
+  triple, with no second final plugin shape;
 - README/direct links point to the migration page, not an overlay install;
-- classic Asset Library and Asset Store v3 listings are frozen/deprecated and
-  do not serve v4 bytes;
+- classic Asset Library and Asset Store listings remain on final v3 during
+  qualification; that updater consumes only the signed transition capsule;
 - source archives cannot be mistaken for updater payloads;
-- every old Update fallback lands on instructions that state Godot 4.7+ in 4.x,
-  editor closure, external backup, and exact replacement.
+- the supported final-v3 Update path requires Godot 4.7+ and proves automatic
+  external backup, exact replacement, client repin, and server startup.
 
 ## 6. Exact two-candidate qualification
 
@@ -226,8 +211,8 @@ SHA A / 4.0.0
        `-- protected signer -------> signed digest set B
 
 A + B digests
-  |-> retained historical boundary decision + v4 no-legacy-alias gate
-  |-> clean migration to exact A
+  |-> retained historical boundary decision + signed bridge-shape gate
+  |-> one-click final-v3 migration to exact A
   |-> exact A -> B hot self-update
   |-> failure/lock/repair/storm evidence
   `-> pre-publication qualification bundle
@@ -402,7 +387,7 @@ Qualification therefore runs repeated fresh-snapshot cycles:
 - 10 exact A -> B hot updates on Windows;
 - 10 exact A -> B hot updates on macOS;
 - 5 exact A -> B hot updates on Linux;
-- 5 clean byte-hashed pre-v4-shaped tree -> A migrations per platform;
+- 5 one-click byte-hashed final-v3 -> A migrations per platform;
 - repeated Dock detach/reattach and plugin disable/enable around success and
   failure rows.
 

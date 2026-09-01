@@ -1410,6 +1410,43 @@ class EditorLeases:
         if not _lexists(path) or self._load(path) != editor:
             _fail("post-update migration completion requires the current editor lease")
 
+    def transfer_restart(
+        self,
+        previous: ProcessIdentity,
+        current: ProcessIdentity,
+        *,
+        timeout: float,
+        process_probe: Callable[[ProcessIdentity], str] = probe_process,
+    ) -> None:
+        """Transfer one nonce-bound lease after Godot's graceful restart."""
+
+        if current.nonce != previous.nonce or current == previous:
+            _fail("restart lease transfer requires the inherited editor nonce")
+        path = self.directory / f"{previous.nonce}.json"
+        deadline = time.monotonic() + timeout
+        while True:
+            leased = self._load(path)
+            if leased == current:
+                return
+            if leased != previous:
+                _fail("restart lease changed before transfer")
+            state = process_probe(previous)
+            # A reused PID proves the recorded process identity is gone just as
+            # strongly as a missing PID does.
+            if state in {"dead", "reused"}:
+                replace_record(path, self._record(current))
+                self.validate(current)
+                return
+            if state == "unknown":
+                raise LockBusy(
+                    f"restarted editor cannot prove its predecessor closed: pid={previous.pid}"
+                )
+            if time.monotonic() >= deadline:
+                raise LockBusy(
+                    f"restarted editor timed out waiting for its predecessor: pid={previous.pid}"
+                )
+            time.sleep(POLL_SECONDS)
+
     def release(self, editor: ProcessIdentity) -> None:
         path = self.directory / f"{editor.nonce}.json"
         if not _lexists(path):
@@ -3128,6 +3165,10 @@ def _post_outcome(
     return {
         "backup_root": str(intent.backup_root),
         "from_version": intent.from_version,
+        # A major-version bridge must replace every owned client entry, not
+        # only an entry already pinned to the exact old package. This is still
+        # a normal transaction completion, not the separate manual-marker lane.
+        "replace_owned_mismatches": not intent.from_version.startswith("4."),
         "new_tree": intent.new_tree.record(),
         "outcome": terminal["outcome"],
         "recovery_root": str(intent.recovery_root),
@@ -3255,7 +3296,20 @@ def startup_barrier(
     intent = load_intent(paths)
     current_editor = editor_identity(editor_pid, editor_nonce)
     if current_editor != intent.editor:
-        _fail("startup transaction is bound to another initiating editor")
+        if intent.from_version.startswith("4."):
+            _fail("startup transaction is bound to another initiating editor")
+        if not _lexists(lock.path):
+            _fail("restart handoff lost its activation lock")
+        lock.validate(intent)
+        if load_journal(paths, intent)["phase"] != "stage_live":
+            _fail("restart handoff is not at the live-tree boundary")
+        if hash_tree(intent.install_root) != intent.new_tree:
+            _fail("restart handoff live tree differs from the signed update")
+        EditorLeases(root, project, install).transfer_restart(
+            intent.editor,
+            current_editor,
+            timeout=timeout,
+        )
     if _lexists(paths.claim):
         terminal = claim_result(intent)
         if terminal["outcome"] == "success" and not _lexists(paths.migration_complete):

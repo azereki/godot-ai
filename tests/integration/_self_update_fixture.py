@@ -984,6 +984,7 @@ def run_godot_editor(
     probe_done_file: str = POST_UPDATE_TOOL_PROBE_FILE,
     phase: str = "editor",
     expected_exit_code: int = 0,
+    restart_completion_file: str | None = None,
 ) -> str:
     env = os.environ.copy()
     if allow_headless:
@@ -1033,7 +1034,14 @@ def run_godot_editor(
         )
         _godot_log_path(project_dir, f"{phase}-pid").write_text(f"{proc.pid}\n", encoding="utf-8")
         try:
-            while proc.poll() is None:
+            completion_path = (
+                project_dir / restart_completion_file
+                if restart_completion_file is not None
+                else None
+            )
+            while proc.poll() is None or (
+                completion_path is not None and not completion_path.is_file()
+            ):
                 if (
                     live_probe is not None
                     and not probe_ran
@@ -1047,6 +1055,8 @@ def run_godot_editor(
                 if time.monotonic() >= deadline:
                     raise subprocess.TimeoutExpired(command, timeout)
                 time.sleep(0.05)
+            if completion_path is not None:
+                time.sleep(0.25)
             capture.flush()
             capture.seek(0)
             output = capture.read()

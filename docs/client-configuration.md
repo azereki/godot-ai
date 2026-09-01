@@ -77,9 +77,10 @@ credentials. This removes ambient alternate-index authority; it does not bind
 the bytes later returned by public PyPI. PyPI/TLS, the selected uv executable
 and cache, and same-user machine integrity remain runtime trust roots.
 
-Dock-initiated Configure pre-builds the pinned `godot-ai==X` uv environment
-before the Dock reports completion (`prewarm_attach_plan` /
-`prewarm_attach_launch`), so the first client spawn is a warm cache hit.
+Dock-initiated Configure attempts to pre-build the pinned `godot-ai==X` uv
+environment before the Dock reports completion (`prewarm_attach_plan` /
+`prewarm_attach_launch`). When that best-effort prewarm succeeds, the first
+client spawn is a warm cache hit.
 Without it the *client* pays for building ~67 packages on its own critical
 path, which flashes a terminal window on Windows (#851) and can overrun an MCP
 client's default 30s connect timeout—the tools then appear to vanish until a

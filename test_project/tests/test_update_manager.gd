@@ -27,10 +27,13 @@ static func _valid_assets() -> Array:
 		_asset(Manager.ASSET_NAME, 4096),
 		_asset(Manager.MANIFEST_NAME, 1024),
 		_asset(Manager.SIGNATURE_NAME, 512),
+		_asset(Manager.LEGACY_ASSET_NAME, 8192),
+		_asset(Manager.LEGACY_CHECKSUM_NAME, 88),
+		_asset(Manager.LEGACY_SIGNATURE_NAME, 512),
 	]
 
 
-func test_release_parser_accepts_only_the_exact_bounded_v4_triple() -> void:
+func test_release_parser_accepts_exact_v4_and_migration_asset_set() -> void:
 	var parsed := Manager.parse_releases_response(
 		HTTPRequest.RESULT_SUCCESS, 200, _response(_valid_assets()), "4.0.0"
 	)
@@ -44,9 +47,15 @@ func test_release_parser_accepts_only_the_exact_bounded_v4_triple() -> void:
 
 func test_release_parser_rejects_missing_duplicate_and_unknown_assets() -> void:
 	var cases := [
-		_valid_assets().slice(0, 2),
-		[_valid_assets()[0], _valid_assets()[0], _valid_assets()[2]],
-		[_valid_assets()[0], _valid_assets()[1], _asset("surprise.bin", 512)],
+		_valid_assets().slice(0, 5),
+		[
+			_valid_assets()[0], _valid_assets()[0], _valid_assets()[2],
+			_valid_assets()[3], _valid_assets()[4], _valid_assets()[5],
+		],
+		[
+			_valid_assets()[0], _valid_assets()[1], _valid_assets()[2],
+			_valid_assets()[3], _valid_assets()[4], _asset("surprise.bin", 512),
+		],
 	]
 	for assets in cases:
 		var parsed := Manager.parse_releases_response(

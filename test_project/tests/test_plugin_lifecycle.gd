@@ -266,6 +266,28 @@ func test_manual_major_migration_allows_replacing_owned_mismatches() -> void:
 	plugin.free()
 
 
+func test_transactional_major_bridge_replaces_mismatches_without_manual_completion() -> void:
+	var plugin := Plugin.new()
+	var jobs := FakeClientJobs.new()
+	plugin._client_jobs = jobs
+	plugin._post_update_outcome = {
+		"outcome": "success",
+		"from_version": "3.2.4",
+		"to_version": VERSION,
+		"replace_owned_mismatches": true,
+	}
+	plugin._begin_startup_release()
+	assert_eq(jobs.repin_versions, [{
+		"from": "3.2.4",
+		"to": VERSION,
+		"replace_owned_mismatches": true,
+	}])
+	plugin._client_jobs = null
+	jobs.free()
+	plugin._lifecycle = null
+	plugin.free()
+
+
 func test_rollback_telemetry_uses_the_supported_clean_failure_vocabulary() -> void:
 	var plugin := Plugin.new()
 	var telemetry := FakeTelemetry.new()

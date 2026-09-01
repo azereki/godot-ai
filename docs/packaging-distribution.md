@@ -1,6 +1,6 @@
 # Godot AI v4 — Packaging and Distribution
 
-*Updated 2026-08-31*
+*Updated 2026-09-01*
 
 This document defines the supported v4 install surfaces and artifact shape.
 Release operation and self-update details live in [releasing.md](releasing.md);
@@ -15,6 +15,9 @@ the user migration procedure lives in [v4-migration.md](v4-migration.md).
 - Canonical v4 plugin archive: `godot-ai-v4-plugin.zip`
 - Signed inventory: `godot-ai-v4-plugin.manifest.json`
 - Manifest signature: `godot-ai-v4-plugin.manifest.sig`
+- V3 migration capsule: `godot-ai-plugin.zip`
+- Capsule checksum/signature: `godot-ai-plugin.zip.sha256` and
+  `godot-ai-plugin.zip.sha256.sig`
 
 There is exactly one v4 plugin ZIP shape. It contains only regular files below
 `addons/godot_ai/`, in sorted order, with canonical timestamps, modes, and
@@ -22,18 +25,20 @@ uncompressed ZIP metadata. The signed manifest binds repository, channel, tag,
 version, source commit, archive size/hash, and every path/size/hash in the
 expanded tree.
 
-The old `godot-ai-plugin.zip` name is intentionally not an alias. Historical
-updaters search for that old name; publishing v4 beneath it would turn a clean
-major migration back into an unsafe in-place overlay.
+The legacy-named ZIP is intentionally not an alias. It contains a temporary
+bridge plus the canonical signed triple. Historical updaters overlay the
+bridge, which immediately delegates to the exact-tree v4 actor; the capsule is
+never accepted as the committed v4 tree.
 
 ## Supported install paths
 
 ### Signed GitHub release
 
-This is the v4 plugin distribution surface. A fresh project verifies the three
-assets and extracts the exact archive into an absent `addons/godot_ai` path. A
-project with v3 uses the closed-editor migration command, which moves the entire
-old add-on to an external retained backup before renaming v4 into place.
+This is the v4 plugin distribution surface. A fresh project verifies the
+canonical triple and extracts the exact archive into an absent
+`addons/godot_ai` path. A project on the final signed v3 line clicks **Update**
+once. The signed capsule then moves the complete old tree to external recovery
+before renaming the verified canonical v4 tree into place.
 
 Do not publish or document an overlay-copy shortcut.
 
@@ -67,13 +72,13 @@ captures the worktree `src/` path in its immutable lifecycle plan. The linked
 `test_project/addons/godot_ai` tree is development-only and is rejected as a
 self-update target.
 
-### Frozen v3 marketplaces
+### Marketplace transition
 
-The Godot Asset Store and legacy Asset Library remain on the last v3 line. They
-are discovery surfaces for that frozen major, not v4 installers or update
-channels. Reintroducing either store requires a reviewed clean-install design
-that preserves the single signed tree and cannot overlay an unknown existing
-add-on.
+The Godot Asset Store and legacy Asset Library remain on the last v3 listing
+during qualification. That final signed v3 line can consume the release
+capsule through its existing updater once publication opens. A future v4 store
+listing must still preserve the canonical signed tree and must not overlay an
+unknown existing add-on as its final state.
 
 ### Standalone binary
 
@@ -94,7 +99,7 @@ bind:
 - both verifier file SHA-256 values;
 - their exact source commit;
 - the exported RSA SPKI SHA-256 fingerprint;
-- the three signed plugin-asset names, sizes, hashes, and identity;
+- all six plugin/migration asset names, sizes, hashes, and identity;
 - the `godot-ai` wheel and sdist names, sizes, hashes, version, and source
   identity; and
 - for every qualification OS/Python row, the complete resolved distribution
@@ -156,7 +161,7 @@ oversized files/trees/archives, signature failure, and any exact-tree mismatch.
 4. Retained one-time historical boundary evidence: all 104 tags were
    source-classified into 24 behavior classes, with 29 selected runtime rows on
    macOS/Godot 4.7. This is not a recurring candidate or cross-platform tier.
-5. Signed plugin packaging, verifier, manual migration, v4-to-v4 transactional
+5. Signed plugin packaging, verifier, one-click bridge migration, v4-to-v4 transactional
    update, crash/failpoint, two-editor, reload, stale-server, and stress proof.
 6. Exact private source-A/source-B candidate qualification on all required
    platform/version rows, bound to immutable plugin, Python-package, and
@@ -168,19 +173,21 @@ publication remain unqualified until their retained evidence is reviewed.
 ## Release readiness
 
 - [ ] Source A and the minimal qualification child B are frozen.
-- [ ] Plugin archive, manifest, signature, wheel, and sdist are built once and
+- [ ] Both plugin triples, wheel, and sdist are built once and
       their identities, sizes, and digests recorded.
 - [ ] Every qualification row records the complete resolved distribution
       artifact set; startup proves the exact behavior-defining dependency pins.
 - [ ] The embedded updater key and standalone verifier key are identical; the
       SPKI fingerprint matches the independent publication surface.
-- [ ] Manual v3-to-v4 migration proves an external retained backup and exact
-      signed live tree.
+- [ ] One-click final-v3-to-v4 migration proves both signature layers, an
+      external retained backup, graceful editor restart/lease transfer,
+      automatic client repin/server start, and the exact signed live tree.
 - [ ] V4-to-v4 self-update proves prepare-before-quiesce, signed stage identity,
       install/editor leases, durable journal reduction, rollback/quarantine,
       startup barrier, and repeat-update behavior.
-- [x] Retained one-time evidence shows historical updaters select no v4 payload
-      and mutate no tree within its documented macOS/Godot 4.7 scope.
+- [x] Retained one-time evidence classifies the historical updater boundary;
+      the new signed bridge path is qualified separately against the final v3
+      line.
 - [ ] All mandatory Windows, macOS, Linux, Godot, and Python rows pass with no
       required skip.
 - [ ] Approval names the exact digest set. No source, docs, workflow, or artifact

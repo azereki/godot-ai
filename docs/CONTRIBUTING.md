@@ -85,13 +85,16 @@ It creates a disposable project with a physical `addons/godot_ai/` copy, stages 
 
 ### Self-update compatibility rules
 
-V4 is the updater boundary. V3 and older never consume a v4 payload; crossing
-the major version uses the editor-closed exact-tree migration in
-[`v4-migration.md`](v4-migration.md). Every v4-to-v4 update uses the external
-transaction actor, retained old-tree backup, startup barrier, and exact signed
-inventory.
+V4 is the runtime boundary. The final signed v3 line consumes only the
+temporary signed migration capsule; the capsule then crosses the boundary with
+the same external actor, retained old-tree backup, startup barrier, and exact
+signed inventory used by v4 updates. It gracefully restarts Godot after the
+swap so v4 never runs against cached v3 script classes. V4 carries no permanent
+v3 runtime path.
 
-- Do not add a legacy `godot-ai-plugin.zip` alias to a v4 release.
+- `godot-ai-plugin.zip` must remain a temporary bridge built from the exact
+  source commit with the canonical signed triple embedded. Never make it an
+  alias for the canonical archive or a second final plugin tree.
 - File and `class_name` deletions are permitted only when the signed candidate
   inventory, prepare-before-quiesce path, exact-tree swap, and startup recovery
   tests all pass; never overlay a candidate onto the live tree.

@@ -1,256 +1,109 @@
-# Migrating a project to Godot AI v4
+# Migrating from Godot AI v3 to v4
 
-Godot AI v4 is a clean break. It requires Godot 4.7 or newer within the 4.x
-line, uses a new
-authenticated local transport, and is installed as one signed exact tree. Do
-not extract v4 over an older `addons/godot_ai` directory and do not use a v3
-self-updater to cross the major-version boundary.
+Godot AI v4 is a breaking release and requires Godot 4.7 or newer within the
+4.x line. The normal migration is one click:
 
-The migration command moves the complete old add-on to a retained recovery
-directory outside the project, stages and verifies the complete v4 tree, then
-renames that tree into place. It never merges the two versions. If activation
-or final verification fails, it restores the old tree or reports the exact
-recovery path that needs operator attention.
+1. Back up or commit the project as you normally would before a major update.
+2. Make sure `uvx` is installed and available on `PATH`.
+3. Open the project in Godot 4.7+, then click **Update** once in the Godot AI
+   dock.
 
-## Before starting
+Leave Godot open while the migration finishes; Godot will restart itself once
+to discard v3's loaded script classes and open the authenticated v4 tree in a
+clean process. You do not need to download release files, run a verifier, stop
+the server, edit client configuration, press a second confirmation button, or
+restart Godot yourself. Godot AI prepares and authenticates v4, replaces the
+complete add-on tree, updates owned client entries, and restarts the matching
+managed server automatically.
 
-> **Publication is closed.** There is currently no independently anchored v4
-> release attestation, so GitHub assets and release notes alone are not a safe
-> installation source. Do not run this migration against public downloads
-> until this guide names the separately administered attestation location and
-> the release checklist records its successful verification.
+The public v4 release is not available yet: publication remains fail-closed
+until its immutable cross-platform qualification and independent attestation
+are complete. The steps above describe the supported flow once publication
+opens. Do not install an unpublished candidate into a real project.
 
-You need:
+## What the Update click does
 
-- Godot 4.7 or newer within the 4.x line;
-- Python 3.11 through 3.14;
-- `uv` installed with `uvx` available on `PATH` (Python alone is not enough:
-  the first v4 startup requires the exact-version transaction actor);
-- all Godot editor processes for the project closed;
-- every configured AI client and the old Godot AI managed backend stopped;
-- a recovery path outside the project, on the same filesystem, whose final
-  directory does not already exist;
-- the release-specific independent attestation described below.
+The stable release has six exact assets:
 
-Download these three release assets without renaming them:
+- the canonical v4 archive, manifest, and manifest signature; and
+- a legacy-named migration capsule, checksum, and checksum signature consumed
+  by the v3 updater.
 
-- `godot-ai-v4-plugin.zip`
-- `godot-ai-v4-plugin.manifest.json`
-- `godot-ai-v4-plugin.manifest.sig`
+The capsule is not a second v4 distribution and is never overlaid as the final
+installation. It is a small, temporary bridge containing the three canonical
+v4 assets. The signed v3 updater authenticates the capsule. The bridge then
+uses the v4 transaction actor to authenticate the inner manifest and every v4
+file, stage a fresh tree, and atomically replace `addons/godot_ai`.
 
-Also obtain `script/v4-release` and its sibling
-`src/godot_ai/release_verify.py` from the exact source commit named by the
-release. Preserve that directory layout: the command loads the verifier by
-path and does not import an installed `godot-ai` package.
+The entire pre-update add-on—including any old-only files—is renamed to a
+private recovery location outside the project. V3 and v4 files are never
+merged in the committed installation. If activation fails cleanly, the actor
+restores the prior tree. Ambiguous state fails closed instead of starting a
+possibly mixed plugin.
 
-GitHub release notes are mutable and are not a trust anchor. Before executing
-either verifier file or trusting any release asset, obtain the independently
-published v4 attestation through the separately administered location that
-will be named here when publication opens. That attestation must bind all of:
+After the exact-tree swap, Godot AI gracefully restarts the editor. The new
+process inherits only the bounded transaction handoff, proves the prior editor
+closed, transfers its nonce-bound lease, and starts v4 without any cached v3
+GDScript classes. On that first v4 start, Godot AI automatically:
 
-- repository, stable channel, tag, version, and exact 40-hex source commit;
-- SHA-256 and size of all three release assets;
-- filename, SHA-256, and size of the matching `godot-ai` wheel and sdist;
-- the complete qualified Python distribution inventory for each supported
-  OS/Python row (name, version, artifact filename, size, and SHA-256);
-- SHA-256 of `script/v4-release` and `src/godot_ai/release_verify.py`;
-- the RSA public-key SubjectPublicKeyInfo SHA-256 fingerprint; and
-- the attestation mechanism and identity used to authenticate those values.
+- claims the exact successful transaction before normal startup;
+- replaces owned pre-v4 client entries with v4 authenticated attach entries;
+- records durable migration completion; and
+- starts the matching managed server.
 
-The current candidate's embedded SPKI fingerprint is:
+An individual AI client may still need to be reopened if that application
+does not notice its configuration change, but restarting every client is not a
+migration step or a server-start gate.
 
-```text
-84ebbd811f3a12c09ff4e236bbbbb9310fc23e03fcfc3717ba546747d0d21072
-```
+## Supported boundary
 
-This value in the repository is descriptive, not self-authenticating. If the
-independent attestation is absent, cannot be authenticated, or disagrees with
-the source commit, either verifier hash, the key fingerprint, any plugin or
-Python-package identity, or the applicable dependency inventory, stop. The
-release is not safe to install.
+The supported path is the final signed v3 line to v4 on Godot 4.7+. V4 does not
+carry permanent v3 runtime branches. Very old, unsigned updater generations
+are outside the automatic migration security boundary; update them to the
+latest v3 release first or ask for recovery help.
 
-The dependency inventories attest the environments used to qualify the
-release. Production server and transaction commands run uv in isolated,
-no-config/no-build mode with official PyPI named explicitly; Godot-owned
-spawns also clear inherited uv resolver controls. A later public resolve still
-does not cryptographically compare the selected wheel or every dependency to
-those attested hashes. PyPI/TLS delivery, the installed uv executable/cache,
-and same-user local-machine integrity remain trust roots. Exact critical pins
-are checked before FastMCP imports; other transitive drift remains an explicit
-packaging risk rather than a claim of a fully locked runtime.
+Godot 4.5 and 4.6 can load the temporary bridge only far enough to explain the
+requirement. They do not activate v4. Upgrade Godot, reopen the project, and
+click **Retry migration**.
 
-## Verify the release
+Cherry Studio is not registered in v4 because its MCP entries live in an
+internal database with no verified read/write interface. Remove a stale v3
+Cherry Studio entry in Cherry Studio itself. Other supported, owned client
+entries are migrated automatically.
 
-From the root containing `script/` and `src/`, substitute the source commit
-authenticated by the independent attestation.
+## If the migration is interrupted
 
-POSIX shell:
+Reopen the same project in Godot 4.7+. Durable transaction records determine
+whether Godot AI should continue v4, restore v3, or remain blocked. Do not
+delete `.godot` transaction records, the add-on tree, or a recovery directory
+to force progress.
 
-```bash
-SOURCE_COMMIT=<attested-40-hex-source-commit>
+Common outcomes:
 
-python3 script/v4-release verify \
-  --archive /path/to/godot-ai-v4-plugin.zip \
-  --manifest /path/to/godot-ai-v4-plugin.manifest.json \
-  --signature /path/to/godot-ai-v4-plugin.manifest.sig \
-  --expected-channel stable \
-  --expected-repository hi-godot/godot-ai \
-  --expected-tag v4.0.0 \
-  --expected-version 4.0.0 \
-  --expected-source "$SOURCE_COMMIT"
-```
+- **Install uv / actor unavailable:** install `uv`, reopen Godot, and click
+  **Retry migration**. No live-tree swap has occurred.
+- **Rolled back safely:** the prior add-on is restored and the bridge offers
+  **Retry migration**.
+- **Repair required:** close Godot and preserve the full error, project, and
+  recovery directory. Do not move or delete either retained tree; use the
+  exact paths in the error when requesting support.
+- **V4 is installed but a client is stale:** reopen only that client. The
+  server does not wait for a global client-restart confirmation.
 
-PowerShell (use `python` or `py -3`, whichever resolves Python 3.11–3.14):
+Release engineering retains a closed-editor `script/v4-release install`
+interface for qualification and exceptional recovery. It is not the normal
+user migration path and should not be copied into end-user instructions.
 
-```powershell
-$SourceCommit = "<attested-40-hex-source-commit>"
+## Security boundary
 
-py -3 script/v4-release verify `
-  --archive C:\path\to\godot-ai-v4-plugin.zip `
-  --manifest C:\path\to\godot-ai-v4-plugin.manifest.json `
-  --signature C:\path\to\godot-ai-v4-plugin.manifest.sig `
-  --expected-channel stable `
-  --expected-repository hi-godot/godot-ai `
-  --expected-tag v4.0.0 `
-  --expected-version 4.0.0 `
-  --expected-source $SourceCommit
-```
+The bridge preserves the existing RSA trust anchor across the major update.
+The outer v3 signature prevents an altered capsule from executing; the inner
+v4 signature binds repository, channel, tag, version, source commit, canonical
+archive hash, and complete file inventory. The exact target
+`godot-ai==VERSION` transaction actor is resolved through isolated,
+no-config/no-build uv arguments with official PyPI named explicitly.
 
-Success prints:
-
-```text
-OK: signed v4 release identity, archive, and exact tree verified
-```
-
-This checks the signature, repository/channel/tag/version/source identity,
-archive hash and size, canonical ZIP metadata, path safety, bounded expansion,
-every file hash, and the version inside `plugin.cfg`.
-
-## Install the exact tree
-
-Close every Godot editor using the project. Choose a new recovery path outside
-the project on the same filesystem. Then run the same identity checks through
-the install command:
-
-```bash
-python3 script/v4-release install \
-  --archive /path/to/godot-ai-v4-plugin.zip \
-  --manifest /path/to/godot-ai-v4-plugin.manifest.json \
-  --signature /path/to/godot-ai-v4-plugin.manifest.sig \
-  --expected-channel stable \
-  --expected-repository hi-godot/godot-ai \
-  --expected-tag v4.0.0 \
-  --expected-version 4.0.0 \
-  --expected-source "$SOURCE_COMMIT" \
-  --project-root /path/to/your/project \
-  --recovery-root /path/outside/project/my-game-before-godot-ai-v4 \
-  --editors-closed \
-  --clients-and-backend-stopped
-```
-
-PowerShell equivalent:
-
-```powershell
-py -3 script/v4-release install `
-  --archive C:\path\to\godot-ai-v4-plugin.zip `
-  --manifest C:\path\to\godot-ai-v4-plugin.manifest.json `
-  --signature C:\path\to\godot-ai-v4-plugin.manifest.sig `
-  --expected-channel stable `
-  --expected-repository hi-godot/godot-ai `
-  --expected-tag v4.0.0 `
-  --expected-version 4.0.0 `
-  --expected-source $SourceCommit `
-  --project-root C:\path\to\your\project `
-  --recovery-root C:\path\outside\project\my-game-before-godot-ai-v4 `
-  --editors-closed `
-  --clients-and-backend-stopped
-```
-
-`--editors-closed` and `--clients-and-backend-stopped` are explicit assertions,
-not process killers. If an editor can still write the add-on, a client can
-still invoke the old endpoint, or the old managed backend is running, stop it
-before retrying. A fresh install has no old endpoint, but using both assertions
-keeps the documented command identical for fresh and migrating projects.
-
-Before it creates an install claim, recovery directory, migration marker, or
-add-on tree, `install` runs the exact target actor through the production uv
-resolver policy: isolated/no-config/no-build, official PyPI passed explicitly,
-and inherited `UV_*` controls removed. The command pins
-`godot-ai==4.0.0 godot-ai-update-transaction identity` (with the release's
-target version substituted), has a 120-second deadline, and must return the
-exact package version and transaction protocol. This proves compatibility and
-warms a cold cache; it does not authenticate the wheel independently of the
-PyPI trust root. If it fails, install `uv`, restore official PyPI access, and
-retry; the project has not been mutated. Do not bypass this check with a merely
-compatible or locally different actor.
-
-On success the command prints the retained backup path. Keep that directory
-until the project has been exercised and backed up normally. Godot AI never
-deletes a successful backup automatically.
-
-For a migrated project, the installer writes a small deny-only marker at
-`.godot/godot-ai-v4-migration.json`. Open the project with Godot 4.7 or newer
-within the 4.x line. The first v4 start keeps the server dormant, replaces
-owned pre-v4 `godot-ai` entries for clients registered in v4 with authenticated
-v4 entries. It then removes the marker, records migration completion, and
-starts the matching server automatically. A click cannot prove that another
-application restarted, so v4 has no global restart-confirmation gate. Clients
-normally reconnect to the stable endpoint; restart an individual client only
-if its Godot AI tools remain stale or disconnected. If repinning, durable
-completion, or marker removal fails, the server remains dormant; retry the
-indicated step or restore the retained backup.
-
-The transaction actor atomically elects one editor before any first-start
-client mutation. A simultaneous editor is refused before it can claim the same
-work. Marker removal is actor-owned and bound to the exact marker digest and
-editor process identity; a crashed owner may be replaced only after its process
-fingerprint is proven gone (or by the sole reloaded plugin instance in that
-same editor process).
-
-Automatic client writes are serialized by one durable account-wide mutation
-lock below the OS config directory. If first-start repinning reports that this
-lock is safety-stranded, stop the relevant client processes—or reboot—then
-remove the **entire exact lock directory named by the error** and retry. Merely
-restarting Godot or deleting the lock's `owner.json` does not prove that a
-timed-out CLI descendant stopped and leaves automatic mutation barred.
-
-Cherry Studio is not registered in v4 because its MCP server entries live in
-an internal database for which Godot AI has no verified read/write surface. If
-you configured Godot AI in Cherry Studio before migration, remove that old
-entry manually in Cherry Studio; the clean add-on replacement cannot inspect
-or delete it.
-
-The marker cannot grant transport or process authority and a fresh install
-does not create one. v4 client entries launch the authenticated stdio attach
-bridge; old persistent HTTP URL entries cannot carry the rotating private
-capability and are not a supported v4 configuration.
-
-## What happens to older state
-
-- The entire old `addons/godot_ai` directory is moved, not overlaid.
-- Old `user://godot_ai_update/` state is ignored by v4.
-- The v3 Asset Library surface remains frozen and cannot update a project to
-  v4.
-- Historical v3 updaters do not recognize the v4-only asset name and instead
-  direct the user to the release page.
-- Existing project scenes, scripts, imports, and settings outside
-  `addons/godot_ai` are not migration targets.
-
-Godot 4.5 and 4.6 can parse the v4 entry script only far enough to refuse it.
-They construct no lifecycle, updater, transport, or server objects and report:
-
-```text
-Godot AI v4 requires Godot 4.7 or newer in the 4.x line; plugin remains inactive.
-```
-
-## Recovery
-
-The installer restores the old add-on automatically when a post-backup
-activation check fails. If it reports that manual recovery is required, keep
-all editors closed and follow the exact paths in the error. The retained old
-tree is named `retained-pre-v4-addon`; a rejected v4 tree, when present, is
-named `failed-v4-tree`.
-
-Do not delete either tree while diagnosing a failed migration. Record the full
-command output and preserve the signed assets, manifest, signature, source
-commit, and recovery directory together.
+This still relies on the installed `uv` executable/cache, PyPI/TLS delivery,
+and same-user machine integrity. GitHub release notes are mutable and are not
+a trust anchor. Public migration remains closed until the release runbook
+names and verifies the independent attestation for the exact promoted bytes.

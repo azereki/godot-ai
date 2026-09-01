@@ -55,9 +55,11 @@ requires an explicit plan revision.
 
 ### 2.1 v4 is a clean compatibility break
 
-- No pre-v4 plugin performs an in-place update to v4.
-- v4 publishes no `godot-ai-plugin.zip` legacy alias.
-- The one-time v3-to-v4 transition is an editor-closed, exact-tree replacement.
+- No pre-v4 updater treats an overlaid payload as the final v4 tree.
+- v4 publishes no `godot-ai-plugin.zip` alias; that name is a signed temporary
+  transition capsule.
+- The final-v3-to-v4 transition is one Update click followed by an actor-owned
+  exact-tree replacement.
 - No pre-v4 add-on file is merged into the live v4 tree: the whole old add-on
   moves to an external recovery backup, then the signed v4 inventory becomes
   the entire live add-on. Project content and unrelated user/client settings
@@ -69,16 +71,17 @@ requires an explicit plan revision.
 - A hot update refuses before mutation if another editor uses the same install
   root or if the recovery/lock path cannot be proven safe.
 
-The first boundary removes impossible obligations. Already-released runners
-cannot retroactively authenticate renamed assets, delete old-only files, wait
-for new-code readiness, or retain backups transactionally.
+The bridge supplies the authority that already-released runners lack. The v3
+runner authenticates only the outer capsule; the temporary bridge verifies and
+stages the inner canonical tree, waits for new-code readiness, and retains the
+complete old tree transactionally.
 
 The 30-day latest-plugin cohort was 5.4% pre-v3, 78.5% other v3.x, and
 16.1% exact v3.2.4. Truly old installs are a small minority, but every current
 install must cross the v4 boundary and most are not on the latest v3. In a
 nearby aggregate, 44.8% of active installs had emitted a self-update outcome.
-That supports one clean manual major migration while preserving excellent
-one-click updates after v4.
+That supports a deliberately narrow final-v3 bridge without carrying general
+historical compatibility into the v4 runtime.
 
 ### 2.2 v4 requires Godot 4.7+ within the 4.x line
 
@@ -99,24 +102,24 @@ A major release is the right point to raise the floor. Godot 4.7 removes the
 old installer root-stripping workaround, so v4 can publish one package shape
 instead of separate classic/store ZIP shapes plus a root-license sibling.
 
-The migration page tells 4.5/4.6 users to remain on the final v3 release or
-upgrade Godot before installing v4. Exact floor/latest patch rows are pinned at
-implementation start.
+The migration page tells 4.5/4.6 users to upgrade Godot before activating v4.
+The final signed v3 line presents one ordinary Update action; the temporary
+bridge then enforces the exact-tree boundary. Exact floor/latest patch rows are
+pinned at implementation start.
 
-### 2.3 v4.0 is manual-release-install only
+### 2.3 v4.0 crosses the boundary through a temporary bridge
 
 The classic Asset Library and Asset Store can overlay an existing
 `addons/godot_ai` tree without deleting old-only files. They cannot enforce the
 closed-editor replacement boundary. Their v3 listings therefore remain frozen
-and point to the v4 migration page; they do not serve a v4 in-editor install.
+while v4 is qualified. The final signed v3 updater may consume only the signed
+transition capsule, never the canonical v4 archive as an overlay.
 
-v4.0 is distributed through the official release page with a distinct asset
-name, signed manifest, and standalone verification procedure. Store install
-can return only after a store surface can refuse/cleanly migrate an existing
-tree before extraction.
-
-This costs one manual migration. Once v4 is installed, the hardened one-click
-updater resumes.
+v4.0 publishes one canonical signed tree plus a legacy-named, signed capsule
+that embeds that exact tree and a minimal transition plugin. The capsule is
+temporary: it delegates to the v4 actor, retains the complete mixed old tree,
+and commits only the canonical v4 tree. Store install can return only after a
+store surface can preserve the same clean replacement boundary.
 
 ### 2.4 Keep one retained backup
 
@@ -474,48 +477,34 @@ last-writer seam; it does not claim whole-batch client atomicity.
 Do not create general `TargetResolver` or `EntryPolicy` services in v4. A small
 pure helper is accepted only when it deletes duplicated policy.
 
-### 6.6 Manual v4 migration
+### 6.6 One-click v3-to-v4 migration
 
-All 104 local `v*` tags were inventoried: v0.2.0/v0.3.0 have no updater; the
-other 102 select `godot-ai-plugin.zip` by exact equality. With no legacy alias,
-their actual Update path opens the canonical release page instead of applying a
-payload.
+Historical inventory established that updater-bearing releases select
+`godot-ai-plugin.zip` by exact equality. The release therefore carries two
+roles without creating two v4 runtime shapes:
 
-The v4 release uses one provisionally named `godot-ai-v4-plugin.zip` with an
-existing-key-signed canonical manifest. The small verifier comes from the exact
-immutable v4 release source commit. A separately administered attestation binds
-that commit, both verifier-file digests, every plugin and Python-package asset
-identity, each qualification row's complete resolved distribution artifact
-inventory, and the signing-key fingerprint independently of GitHub release
-assets. The verifier checks repository, source, channel, tag/version, asset
-name/size/digest, inventory, and path rules before extraction; Python startup
-separately enforces the exact behavior-defining dependency versions.
+- `godot-ai-v4-plugin.zip` plus its signed manifest is the only canonical v4
+  tree; and
+- the signed legacy-named ZIP is a minimal bridge with that canonical triple
+  embedded.
 
-Migration order:
+After the one user Update action, the signed v3 updater authenticates and loads
+the bridge. The bridge resolves the exact target transaction actor, verifies
+the inner signature/inventory, prepares a private stage, disables itself, and
+enters the same activation protocol as a v4 update. Once the exact v4 tree is
+live, the bridge asks Godot to restart itself so no loaded v3 `class_name`
+resource can be rebound to a v4 call site. The restarted process inherits the
+bounded nonce/actor handoff and receives the lease only after the actor proves
+the prior editor process closed. The actor retains the
+complete temporary/old tree and renames only the exact canonical stage live.
+First v4 startup broadly replaces owned pre-v4 client entries, durably records
+completion, and starts the managed server without a second confirmation.
 
-1. download v4 archive, manifest, and signature from the official release;
-2. run the exact standalone verification command;
-3. close every Godot editor using the project and stop old clients/backend;
-4. canonicalize a safe recovery root outside the entire project;
-5. require the recovery root to share the project's filesystem, then rename
-   the complete old add-on tree there; a cross-filesystem destination is
-   refused rather than introducing a second copy/delete migration protocol;
-6. extract one exact v4 tree;
-7. open Godot, enable v4, and repin owned client configuration;
-8. durably complete migration, start the matching server, and run
-   representative tools;
-9. retain the backup until the user explicitly cleans it while editors close.
-
-The preferred same-filesystem recovery root is a canonical project-parent
-sibling such as:
-
-```text
-<project-parent>/.godot-ai-recovery/<project-install-hash>/
-```
-
-Every component is checked for path disagreement, collision, symlink/junction,
-and reparse traversal. If a safe root cannot be established, automatic/hot
-update fails and the manual instructions choose an explicit safe destination.
+The separately administered attestation still binds the source commit, both
+verifier-file digests, all six release assets, Python-package artifacts,
+qualification dependency inventories, and signing-key fingerprint. A capsule
+is transitional delivery code, not authority to weaken canonical verification
+or introduce permanent v3 branches into v4.
 
 ### 6.7 Transactional v4 updater
 
@@ -729,7 +718,7 @@ release changelog.
 ### Phase 0 — approve and pin
 
 - review draft 3 and the verification companion;
-- affirm Godot 4.7+ within the 4.x line and manual-only v4.0 install;
+- affirm Godot 4.7+ within the 4.x line and one-click final-v3 bridge;
 - decide #940 independently;
 - fetch/pin landing main and all PR/tag inputs;
 - write the tranche/provenance manifest;
@@ -785,9 +774,10 @@ Exit: O5 and A1-A5 pass; hard lifecycle gates are met.
 - implement one Godot-4.7 v4 package producer and distinct asset name;
 - implement the standalone verifier using the existing signing root;
 - freeze/deprecate overlaying store surfaces;
-- preserve the completed one-time proof that historical updater classes do not
-  select or install the distinct v4 asset shape;
-- test the exact documented external backup and clean migration flow.
+- preserve the completed historical updater classification while adding a
+  recurring final-v3 bridge gate;
+- test both signature layers, external backup, exact replacement, automatic
+  client repin, and server startup after one Update action.
 
 Exit: M1-M6 pass against provisional release-shaped fixtures. No fixture is
 called a final candidate.
@@ -835,7 +825,7 @@ Only after v4 architecture is stable:
 ## 11. Explicit deferrals
 
 - v3 transport inside v4;
-- pre-v4 in-place update to v4;
+- permanent pre-v4 runtime compatibility inside v4;
 - shared multi-project listener;
 - generic JSONC mutation/parser work;
 - `TargetResolver`/`EntryPolicy` service split;
@@ -852,8 +842,8 @@ Only after v4 architecture is stable:
 
 1. Godot 4.7+ within the 4.x line is the v4 support range despite the measured 12.8% 4.6-and-older
    cohort.
-2. v4.0 uses manual GitHub-release clean migration; v3 Store/Asset Library
-   listings remain frozen.
+2. v4.0 uses one signed final-v3 transition capsule around the canonical v4
+   triple; v3 Store/Asset Library listings remain frozen during qualification.
 3. Accept #940 independently before the landing-base pin if its refreshed head
    remains the reviewed clean change; otherwise re-review or explicitly defer.
 4. Zed becomes manual-config rather than carrying #930's general JSONC
