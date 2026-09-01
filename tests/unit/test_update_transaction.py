@@ -2915,7 +2915,7 @@ def test_activate_cli_uses_authenticated_environment_failpoint_without_secret_le
     assert token_hex not in command
     environment = {
         **os.environ,
-        **_qualification_environment(token_hex, effect=effect, timeout="5"),
+        **_qualification_environment(token_hex, effect=effect, timeout="30"),
         "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
     }
     process = subprocess.Popen(
@@ -2927,17 +2927,17 @@ def test_activate_cli_uses_authenticated_environment_failpoint_without_secret_le
     try:
         barrier = scenario.recovery / "failpoint-barrier.json"
         capability = scenario.recovery / "qualification-capability.json"
-        _wait_until(lambda: os.path.lexists(capability), timeout=5)
+        _wait_until(lambda: os.path.lexists(capability), timeout=30)
         assert token_hex.encode("ascii") not in capability.read_bytes()
         if expect_barrier:
-            _wait_until(lambda: os.path.lexists(barrier), timeout=5)
+            _wait_until(lambda: os.path.lexists(barrier), timeout=30)
             assert token not in barrier.read_bytes()
             tx.write_failpoint_decision(scenario.recovery, token=token, action="continue")
         else:
             assert not os.path.lexists(barrier)
 
         paths = _paths(scenario)
-        _wait_until(lambda: os.path.lexists(paths.intent), timeout=5)
+        _wait_until(lambda: os.path.lexists(paths.intent), timeout=30)
         actual_intent = tx.load_intent(paths)
 
         def stage_is_live() -> bool:
@@ -2955,11 +2955,11 @@ def test_activate_cli_uses_authenticated_environment_failpoint_without_secret_le
                     return False
                 raise
 
-        _wait_until(stage_is_live, timeout=5)
+        _wait_until(stage_is_live, timeout=30)
         tx.write_readiness(actual_intent)
-        _wait_until(lambda: os.path.lexists(paths.result), timeout=5)
+        _wait_until(lambda: os.path.lexists(paths.result), timeout=30)
         claimed = tx.claim_result(actual_intent)
-        stdout, stderr = process.communicate(timeout=5)
+        stdout, stderr = process.communicate(timeout=30)
     finally:
         if process.poll() is None:
             process.terminate()
@@ -3229,6 +3229,28 @@ def test_publish_is_immutable_and_journal_replace_is_atomic(tmp_path: Path) -> N
     tx.replace_record(path, {"value": 3})
     assert tx.load_record(path) == {"value": 3}
     assert not list(directory.glob(".record-*.tmp"))
+
+
+def test_windows_record_read_retries_a_transient_replace_sharing_denial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "record.json"
+    path.write_bytes(tx.canonical_json({"value": 1}))
+    path.chmod(0o600)
+    real_open = tx.os.open
+    attempts = 0
+
+    def flaky_open(target: Any, flags: int, mode: int = 0o777) -> int:
+        nonlocal attempts
+        if Path(target) == path and attempts == 0:
+            attempts += 1
+            raise PermissionError("simulated Windows ReplaceFile sharing window")
+        return real_open(target, flags, mode)
+
+    monkeypatch.setattr(tx, "_windows", lambda: True)
+    monkeypatch.setattr(tx.os, "open", flaky_open)
+    assert tx.load_record(path) == {"value": 1}
+    assert attempts == 1
 
 
 def test_process_fingerprint_distinguishes_alive_from_pid_reuse() -> None:

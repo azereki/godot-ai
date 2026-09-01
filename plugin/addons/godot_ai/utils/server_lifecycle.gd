@@ -33,6 +33,7 @@ const STOP := "STOP"
 const STATUS_PATH := "/godot-ai/status"
 const DEFAULT_PROBE_TIMEOUT_MS := 800
 const DEFAULT_PROVE_TIMEOUT_MS := 180_000
+const LAUNCH_FINGERPRINT_TIMEOUT_MS := 15_000
 const REPLACEMENT_TTL_MS := 15_000
 const MAX_STATUS_BODY_BYTES := 8 * 1024
 
@@ -614,10 +615,9 @@ func _effect_launch(payload: Dictionary) -> Dictionary:
 	if pid <= 1:
 		return {"ok": false, "reason": "launch_failed", "message": "The server process could not be launched."}
 	var fingerprint := PortResolver.process_fingerprint(pid)
-	for attempt in range(10):
-		if not fingerprint.is_empty():
-			break
-		OS.delay_msec(20)
+	var fingerprint_deadline := Time.get_ticks_msec() + LAUNCH_FINGERPRINT_TIMEOUT_MS
+	while fingerprint.is_empty() and Time.get_ticks_msec() < fingerprint_deadline:
+		OS.delay_msec(100)
 		fingerprint = PortResolver.process_fingerprint(pid)
 	if fingerprint.is_empty():
 		# Best-effort cleanup still needs an exact, branded process grant. If

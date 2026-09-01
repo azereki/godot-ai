@@ -100,6 +100,17 @@ def test_lifecycle_worker_uses_the_main_thread_capability_path_snapshot() -> Non
     assert "var final_capability := _read_capability(port)" in lifecycle
 
 
+def test_owned_launch_waits_boundedly_for_the_exact_process_fingerprint() -> None:
+    source = _lifecycle()
+    launch = get_func_block(source, "func _effect_launch(payload: Dictionary) -> Dictionary:")
+
+    assert "const LAUNCH_FINGERPRINT_TIMEOUT_MS := 15_000" in source
+    assert "Time.get_ticks_msec() + LAUNCH_FINGERPRINT_TIMEOUT_MS" in launch
+    assert "while fingerprint.is_empty()" in launch
+    assert '"reason": "launch_unproven" if fingerprint.is_empty() else ""' in launch
+    assert "kill_exact_processes([cleanup_grant], true)" in launch
+
+
 def test_replacement_is_bound_to_status_instance_and_exact_process() -> None:
     source = _lifecycle()
     block = get_func_block(source, "func _effect_replace(payload: Dictionary) -> Dictionary:")

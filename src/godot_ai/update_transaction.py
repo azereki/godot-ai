@@ -49,6 +49,7 @@ MAX_RECORD_BYTES = 1_048_576
 MAX_FILES = 20_000
 MAX_TREE_BYTES = 512 * 1024 * 1024
 POLL_SECONDS = 0.02
+WINDOWS_RECORD_OPEN_RETRY_SECONDS = 0.5
 DOWNLOAD_LIMITS = {
     ASSET_NAME: MAX_ARCHIVE_SIZE,
     MANIFEST_NAME: MAX_MANIFEST_SIZE,
@@ -386,7 +387,19 @@ def _secure_file(path: Path) -> os.stat_result:
 
 def _load_json_object(path: Path, *, require_canonical: bool) -> dict[str, Any]:
     before = _secure_file(path)
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    deadline = time.monotonic() + WINDOWS_RECORD_OPEN_RETRY_SECONDS
+    while True:
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            break
+        except PermissionError:
+            # ReplaceFile can expose a short sharing-denial window on Windows
+            # even though the namespace operation is atomic. Retry only that
+            # platform/error pair, for a fixed bound; durable ACL denial still
+            # fails closed with the original exception.
+            if not _windows() or time.monotonic() >= deadline:
+                raise
+            time.sleep(POLL_SECONDS)
     with os.fdopen(fd, "rb") as stream:
         opened = os.fstat(stream.fileno())
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
