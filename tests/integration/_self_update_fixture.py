@@ -831,7 +831,7 @@ const TOOL_PROBE_DONE_PATH := "res://{CLEAN_MAJOR_TOOL_PROBE_FILE}"
 const DriverSupport := preload("res://_test_self_update_driver_support.gd")
 const START_AFTER_FRAMES := 15
 const STARTUP_WAIT_MS := 120000
-const STATUS_WAIT_MS := 120000
+const STATUS_WAIT_MS := 210000
 
 var _frames := 0
 var _migration_observed := false
@@ -869,7 +869,7 @@ func _process(_delta: float) -> void:
 \tif not _migration_observed:
 \t\t_observe_automatic_migration(plugin)
 \t\treturn
-\tif not _tool_probe_ready and _try_write_status():
+\tif not _tool_probe_ready and _try_write_status(plugin):
 \t\t_tool_probe_ready = true
 \t\treturn
 \tif _tool_probe_ready and FileAccess.file_exists(TOOL_PROBE_DONE_PATH):
@@ -878,7 +878,11 @@ func _process(_delta: float) -> void:
 \t\tget_tree().quit(0)
 \t\treturn
 \tif Time.get_ticks_msec() - _status_wait_started_ms > STATUS_WAIT_MS:
-\t\t_fail(22, "post-migration authenticated server timed out")
+\t\t_fail(
+\t\t\t22,
+\t\t\t"post-migration authenticated server timed out; lifecycle=%s"
+\t\t\t% str(plugin.call("get_server_status")),
+\t\t)
 
 
 func _record_wedged_responsiveness() -> void:
@@ -924,7 +928,14 @@ func _installed_tree_is_target() -> bool:
 \t)
 
 
-func _try_write_status() -> bool:
+func _try_write_status(plugin: EditorPlugin) -> bool:
+\tvar lifecycle := plugin.call("get_server_status") as Dictionary
+\tif (
+\t\tstr(lifecycle.get("episode_state", "")) != "READY"
+\t\tor str(lifecycle.get("ready_kind", "")) != "owned"
+\t\tor str(lifecycle.get("actual_version", "")) != TARGET_VERSION
+\t):
+\t\treturn false
 \tvar payload := DriverSupport.fetch_status(HTTP_PORT)
 \tif (
 \t\tpayload.get("name") != "godot-ai"

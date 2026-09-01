@@ -124,6 +124,8 @@ def test_clean_major_driver_waits_for_automatic_marker_migration(tmp_path: Path)
     assert CLEAN_MAJOR_MARKER_RELATIVE.as_posix() in text
     assert "migration marker removed automatically" in text
     assert "repinned owned Codex command pin=" in text
+    assert 'lifecycle.get("episode_state", "")) != "READY"' in text
+    assert 'lifecycle.get("ready_kind", "")) != "owned"' in text
     assert 'plugin.call("_on_dock_post_update_action_requested", "continue")' not in text
     assert "authenticated read/write tool probe completed" in text
 
@@ -569,7 +571,7 @@ def test_clean_major_installer_holds_first_start_until_client_confirmation(
         project,
         godot_bin,
         allow_headless=True,
-        timeout=180,
+        timeout=240,
         environment=environment,
         live_probe=(
             None
@@ -627,8 +629,8 @@ def test_clean_major_installer_holds_first_start_until_client_confirmation(
         f"CLEAN_MAJOR_TEST | repinned owned Codex command pin={target_version}",
         "MCP | client migration durably completed",
         "MCP | plugin loaded",
-        f"CLEAN_MAJOR_TEST | status name=godot-ai server_version={target_version}",
         "MCP | started server (PID ",
+        f"CLEAN_MAJOR_TEST | status name=godot-ai server_version={target_version}",
         "CLEAN_MAJOR_TEST | authenticated read/write tool probe completed",
     ]
     position = -1
