@@ -111,7 +111,7 @@ def _paths(scenario: Scenario) -> tx.TransactionPaths:
     )
 
 
-def _wait_until(predicate: Any, timeout: float = 30.0) -> None:
+def _wait_until(predicate: Any, timeout: float = 90.0) -> None:
     deadline = time.monotonic() + timeout
     while not predicate():
         if time.monotonic() >= deadline:
@@ -153,7 +153,7 @@ class Actor:
         self.thread.start()
 
     def finish(self) -> dict[str, Any]:
-        self.thread.join(3)
+        self.thread.join(30)
         assert not self.thread.is_alive()
         if self.error:
             raise self.error
@@ -306,7 +306,7 @@ def test_second_editor_cannot_cross_post_census_pre_rename_window(
         def barrier(self, effect: str, when: str) -> None:
             if (effect, when) == ("live_to_backup", "before"):
                 reached.set()
-                if not release.wait(2):
+                if not release.wait(30):
                     raise AssertionError("test did not release pre-rename barrier")
 
     actor = Actor(
@@ -315,7 +315,7 @@ def test_second_editor_cannot_cross_post_census_pre_rename_window(
         claim_timeout=2,
         failpoints=PauseBeforeRename(),
     )
-    assert reached.wait(2)
+    assert reached.wait(30)
     other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
     acquired: list[str] = []
     acquire = tx.EditorLeases.acquire

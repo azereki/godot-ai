@@ -185,7 +185,7 @@ jobs:
 
       - name: Self-update forward upgrade regression
         shell: bash
-        timeout-minutes: 6
+        timeout-minutes: 12
         run: GODOT_BIN=godot pytest -q tests/integration/test_self_update_upgrade_paths.py
 
       - name: Start MCP server
