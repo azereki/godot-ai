@@ -54,7 +54,7 @@ The Python server owns orchestration, not editor mutation.
 That includes:
 
 - MCP transport (FastMCP v3 over streamable-http, SSE, or stdio) and tool/resource registration
-- the rolled-up tool surface — ~15 named verbs plus per-domain `<domain>_manage` tools wired by `tools/_meta_tool.py::register_manage_tool`, which builds a dynamic `Literal[...]` op enum so schema-aware clients see every op
+- the rolled-up tool surface — 46 tools comprising 19 named tools and 27 per-domain `<domain>_manage` rollups wired by `tools/_meta_tool.py::register_manage_tool`, which builds a dynamic `Literal[...]` op enum so schema-aware clients see every op
 - read-only `godot://...` MCP resources (sessions, editor state, scenes, nodes, scripts, project, materials, performance, test results) that mirror the cheap reads and don't count against tool-cap budgets
 - per-call session routing — every Godot-talking tool accepts an optional `session_id`, bound at the `DirectRuntime` boundary so `require_writable` and downstream handlers see the pinned session, not the active one
 - middleware that smooths over client quirks and shapes error responses: `PreserveGodotCommandErrorData` (outermost), `StripClientWrapperKwargs`, `ParseStringifiedParams`, `FoldFlatManageParams`, and `HintOpTypoOnManage`, followed by observational `TrackMcpSessions`. The first five positions are load-bearing; the tracker never reshapes requests or responses. The full inventory is locked by `tests/unit/test_server_middleware_order.py`, with rationale above registration in `server.py`.

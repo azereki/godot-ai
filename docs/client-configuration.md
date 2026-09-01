@@ -60,11 +60,13 @@ system install). A disabled telemetry preference renders as
 `--disable-telemetry` on the attach argv — the env-injection path that covers
 plugin-spawned servers never runs for a client-spawned bridge or its backend
 (see docs/TELEMETRY.md). Package pins, command paths, ports, exclusions,
-telemetry, and required uv options are verified as launch drift;
-**Configure all** is the repair path after a self-update, port change,
-telemetry toggle, or tool-domain change. Never silently fall back to a bare `uvx`
-command for these entries—report ERROR and leave the config untouched when no
-verified tier exists.
+telemetry, and required uv options are verified as launch drift. A normal v4
+self-update repins configured clients automatically before it records durable
+migration completion. **Configure all** is manual remediation when that repair
+reports drift or failure, and remains the explicit repair path after a port
+change, telemetry toggle, or tool-domain change. Never silently fall back to a
+bare `uvx` command for these entries—report ERROR and leave the config untouched
+when no verified tier exists.
 
 The uvx tier is isolated/no-config/no-build and names official PyPI explicitly.
 Godot-owned server/prewarm spawns also clear inherited uv resolution controls;

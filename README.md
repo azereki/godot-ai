@@ -82,8 +82,6 @@ The plugin will automatically start the MCP server, connect over WebSocket, and 
 > and not `addons/plugin.cfg` — the latter means the plugin contents were copied
 > one directory too high.
 
-<p align="center"><img src="docs/images/dock.png" alt="Godot AI dock — Clients & Tools button highlighted" width="350"></p>
-
 ### 3. Connect your MCP client
 
 The dock shows every supported client with **Configure** / **Remove** controls;

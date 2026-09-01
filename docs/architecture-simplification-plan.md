@@ -15,7 +15,9 @@
   [review 3](architecture-simplification-plan-review-3.md)
 - Executable release proof:
   [verification plan](architecture-simplification-verification-plan.md)
-- Latest local implementation evidence:
+- Final PR-head implementation evidence:
+  [2026-09-01 checkpoint](v4-pr-head-checkpoint.md)
+- Historical implementation evidence:
   [2026-08-31 checkpoint](v4-local-implementation-checkpoint.md)
 - Draft-3 plan reconciliation at approval: architecture **PASS**, security
   **PASS**, execution/release **PASS**; this records plan consistency, not final
@@ -632,12 +634,13 @@ class-cache evidence rather than being hidden inside a refactor.
 
 The draft estimated 63,605 physical `.py`/`.gd` lines under `src/` and
 `plugin/`. The pinned `a468a7e` gate supersedes that estimate with the measured
-baseline of 59,859. At the final 2026-08-31 local implementation checkpoint the
-working tree contains 64,084 production physical lines, a net increase of
-4,225, while all eleven structural targets above pass. The result is a
-reduction in owners, branches, legal state combinations, and duplicated
-authority—not a LOC reduction. Recompute both values from the frozen candidate
-before approval.
+baseline of 59,859. At the historical `ed69dcd` implementation checkpoint the
+tree contained 64,561 production physical lines, a net increase of 4,702. At
+the final PR head `d6444e6`, the same gate reports 64,581 production physical
+lines, a net increase of 4,722, while all eleven structural targets pass. The
+result is a reduction in owners, branches, legal state combinations, and
+duplicated authority—not a LOC reduction. Recompute both values from the frozen
+candidate before approval.
 
 ## 8. Outstanding PR dispositions
 
