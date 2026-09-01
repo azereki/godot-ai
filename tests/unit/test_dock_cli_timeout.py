@@ -422,16 +422,17 @@ def test_actor_spawn_failure_never_runs_unbounded_cleanup_on_the_editor_thread()
 
 def test_manual_major_marker_is_deny_only_and_removed_before_server_start() -> None:
     plugin_source = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
-    parse = get_func_block(plugin_source, "static func _parse_manual_migration_marker(")
-    complete = get_func_block(plugin_source, "func _complete_post_update_startup() -> void:")
+    actor_source = (
+        Path(__file__).resolve().parents[2] / "src" / "godot_ai" / "update_transaction.py"
+    ).read_text(encoding="utf-8")
+    start = get_func_block(plugin_source, "func _start_post_update_completion() -> bool:")
+    process = get_func_block(plugin_source, "func _process(_delta: float) -> void:")
 
-    assert "MANUAL_MIGRATION_MARKER_SCHEMA" in parse
-    assert "source_commit.length() != 40" in parse
-    assert "str(parsed.to_version) != loaded_version" in parse
-    assert "_remove_manual_migration_marker()" in complete
-    assert complete.index("_remove_manual_migration_marker()") < complete.index(
-        "_release_normal_startup()"
-    )
+    assert "class ManualMigrationElection:" in actor_source
+    assert "def complete_manual_migration(" in actor_source
+    assert '"complete-manual-migration" if manual else "complete-migration"' in start
+    completion_poll = process.index('job == "migration_completion"')
+    assert process.index('_release_normal_startup()', completion_poll) > completion_poll
 
 
 def test_hot_update_migration_is_durably_acknowledged_before_normal_start() -> None:
@@ -451,10 +452,8 @@ def test_hot_update_migration_is_durably_acknowledged_before_normal_start() -> N
     assert "_complete_post_update_startup()" in repin
     assert '"continue"' not in repin
     assert "_start_post_update_completion()" in complete
-    assert complete.index("_start_post_update_completion()") < complete.index(
-        "_release_normal_startup()"
-    )
-    assert 'var arguments: Array[String] = ["complete-migration"]' in start
+    assert "_release_normal_startup()" not in complete
+    assert '"complete-manual-migration" if manual else "complete-migration"' in start
     assert '"--recovery-root"' in start
     assert "_migration_completion_matches(" in worker
     completion_poll = process.index('job == "migration_completion"')

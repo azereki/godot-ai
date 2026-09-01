@@ -583,7 +583,7 @@ def test_clean_major_installer_holds_first_start_until_client_confirmation(
         assert "CLEAN_MAJOR_TEST | editor remained responsive during wedged prewarm" in log
         assert "Post-update package pre-warm could not be proven stopped" in log
         assert "CLEAN_MAJOR_TEST | client migration requested retry" in log
-        assert "MCP | client migration completed" not in log
+        assert "MCP | client migration durably completed" not in log
         assert "MCP | started server (PID " not in log
         assert marker.is_file()
         assert not (project / CLEAN_MAJOR_STATUS_FILE).exists()
@@ -599,10 +599,10 @@ def test_clean_major_installer_holds_first_start_until_client_confirmation(
     assert f"godot-ai=={target_version}" in client_config
     assert f"godot-ai=={from_version}" not in client_config
     ordered_markers = [
-        "MCP | client migration completed",
-        "MCP | plugin loaded",
         "CLEAN_MAJOR_TEST | migration marker removed automatically",
         f"CLEAN_MAJOR_TEST | repinned owned Codex command pin={target_version}",
+        "MCP | client migration durably completed",
+        "MCP | plugin loaded",
         f"CLEAN_MAJOR_TEST | status name=godot-ai server_version={target_version}",
         "MCP | started server (PID ",
         "CLEAN_MAJOR_TEST | authenticated read/write tool probe completed",

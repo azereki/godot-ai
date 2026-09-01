@@ -276,13 +276,103 @@ static func _read_bounded_record(path: String) -> Dictionary:
 	var expected_keys: Array = RECORD_KEYS.get(record, [])
 	if expected_keys.is_empty() or parsed.size() != expected_keys.size():
 		return {}
-	## Godot silently collapses duplicate JSON keys. Qualification decisions
-	## are security records, so require every literal schema key exactly once
-	## before trusting the parsed Dictionary.
-	for key in expected_keys:
-		if text.count('"%s"' % str(key)) != 1 or not parsed.has(key):
+	## Godot silently collapses duplicate JSON keys, including escaped spellings
+	## such as `\u0072ecord`. Decode top-level key tokens before comparing them.
+	var scanned := _top_level_object_keys(text)
+	if not bool(scanned.get("ok", false)):
+		return {}
+	var keys: Array = scanned.get("keys", [])
+	if keys.size() != expected_keys.size():
+		return {}
+	var seen := {}
+	for key in keys:
+		if seen.has(key) or key not in expected_keys or not parsed.has(key):
 			return {}
+		seen[key] = true
 	return parsed
+
+
+static func _top_level_object_keys(text: String) -> Dictionary:
+	var index := _skip_json_space(text, 0)
+	if index >= text.length() or text[index] != "{":
+		return {}
+	index += 1
+	var keys: Array = []
+	while true:
+		index = _skip_json_space(text, index)
+		if index >= text.length():
+			return {}
+		if text[index] == "}":
+			index = _skip_json_space(text, index + 1)
+			return {"ok": index == text.length(), "keys": keys}
+		var token_end := _json_string_end(text, index)
+		if token_end < 0:
+			return {}
+		var key: Variant = JSON.parse_string(text.substr(index, token_end - index))
+		if not key is String:
+			return {}
+		keys.append(key)
+		index = _skip_json_space(text, token_end)
+		if index >= text.length() or text[index] != ":":
+			return {}
+		index += 1
+		var depth := 0
+		var in_string := false
+		var escaped := false
+		while index < text.length():
+			var character := text[index]
+			if in_string:
+				if escaped:
+					escaped = false
+				elif character == "\\":
+					escaped = true
+				elif character == "\"":
+					in_string = false
+			elif character == "\"":
+				in_string = true
+			elif character == "[" or character == "{":
+				depth += 1
+			elif character == "]":
+				if depth <= 0:
+					return {}
+				depth -= 1
+			elif character == "}":
+				if depth == 0:
+					break
+				depth -= 1
+			elif character == "," and depth == 0:
+				break
+			index += 1
+		if index >= text.length() or in_string or depth != 0:
+			return {}
+		if text[index] == ",":
+			index += 1
+			continue
+		index = _skip_json_space(text, index + 1)
+		return {"ok": index == text.length(), "keys": keys}
+	return {}
+
+
+static func _json_string_end(text: String, start: int) -> int:
+	if start >= text.length() or text[start] != "\"":
+		return -1
+	var escaped := false
+	for index in range(start + 1, text.length()):
+		var character := text[index]
+		if escaped:
+			escaped = false
+		elif character == "\\":
+			escaped = true
+		elif character == "\"":
+			return index + 1
+	return -1
+
+
+static func _skip_json_space(text: String, start: int) -> int:
+	var index := start
+	while index < text.length() and text[index] in [" ", "\t", "\r", "\n"]:
+		index += 1
+	return index
 
 
 static func _remove_exact(path: String, expected: Dictionary) -> void:

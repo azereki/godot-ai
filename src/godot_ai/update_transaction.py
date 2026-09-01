@@ -62,6 +62,9 @@ FINGERPRINT = re.compile(r"[ -~]{1,128}")
 EFFECT = re.compile(r"[a-z][a-z0-9_]{0,63}")
 QUALIFICATION_TIMEOUT = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
 MAX_QUALIFICATION_TIMEOUT = 300.0
+MANUAL_MIGRATION_MARKER_RELATIVE = Path(".godot") / "godot-ai-v4-migration.json"
+MANUAL_MIGRATION_STATE_RELATIVE = Path(".godot") / "godot-ai-v4-migration-state"
+MANUAL_MIGRATION_KIND = "pre_v4_migration"
 
 QUALIFICATION_FAILPOINT_TOKEN_ENV = "GODOT_AI_QUALIFICATION_FAILPOINT_TOKEN"
 QUALIFICATION_FAILPOINT_EFFECT_ENV = "GODOT_AI_QUALIFICATION_FAILPOINT_EFFECT"
@@ -192,6 +195,8 @@ RECORD_FIELDS = {
     "readiness": "editor_nonce intent_sha256 live_tree transaction",
     "terminal": "intent_sha256 outcome transaction writer",
     "migration_complete": "claim_sha256 editor intent_sha256 live_tree transaction",
+    "migration_election": "editor install_root project_root transaction",
+    "manual_migration_election": "editor install_root marker_sha256 project_root",
     "qualification_capability": "effect intent_sha256 token_sha256 transaction when",
     "failpoint_barrier": "effect install_root intent_sha256 project_root recovery_root "
     "sequence transaction when",
@@ -1422,6 +1427,294 @@ class EditorLeases:
             _sync_dir(self.directory)
 
 
+class MigrationElection:
+    """Atomic, crash-recoverable single winner for post-update M6 work."""
+
+    def __init__(self, root: Path, project: Path, install: Path):
+        self.root = _private_dir(root)
+        self.project, self.install = _canonical_install(project, install)
+        self.path = self.root / "migration-election.json"
+
+    def _record(self, intent: Intent, editor: ProcessIdentity) -> dict[str, Any]:
+        return {
+            "editor": editor.record(),
+            "install_root": str(self.install),
+            "project_root": str(self.project),
+            "record": "migration_election",
+            "schema_version": SCHEMA_VERSION,
+            "transaction": intent.transaction,
+        }
+
+    def owner(self) -> tuple[dict[str, Any], ProcessIdentity]:
+        row = _typed(load_record(self.path), "migration_election")
+        if row["project_root"] != str(self.project) or row["install_root"] != str(
+            self.install
+        ):
+            _fail("migration election root identity differs from its recovery root")
+        _string(row["transaction"], name="migration election.transaction", pattern=IDENTIFIER)
+        return row, ProcessIdentity.parse(row["editor"], name="migration election.editor")
+
+    def _archive_stale(self, row: Mapping[str, Any]) -> None:
+        digest = hashlib.sha256(canonical_json(row)).hexdigest()[:16]
+        archive = self.root / f"migration-election-stale-{digest}.json"
+        try:
+            os.link(self.path, archive)
+        except FileExistsError:
+            if load_record(archive) != row:
+                _fail("stale migration-election archive has conflicting identity")
+        except FileNotFoundError:
+            return
+        if not _lexists(self.path):
+            return
+        current = _lstat(self.path)
+        archived = _lstat(archive)
+        if (current.st_dev, current.st_ino) != (archived.st_dev, archived.st_ino):
+            return
+        self.path.unlink()
+        _sync_dir(self.root)
+
+    def acquire(
+        self,
+        intent: Intent,
+        editor: ProcessIdentity,
+        *,
+        process_probe: Callable[[ProcessIdentity], str] = probe_process,
+    ) -> None:
+        expected = self._record(intent, editor)
+        for _attempt in range(3):
+            try:
+                publish_record(self.path, expected)
+                return
+            except TransactionError:
+                if not _lexists(self.path):
+                    continue
+            row, owner = self.owner()
+            if row == expected:
+                return
+            same_process = (
+                owner.pid == editor.pid
+                and owner.start_fingerprint == editor.start_fingerprint
+            )
+            state = "reused" if same_process else process_probe(owner)
+            if state == "alive":
+                raise LockBusy(f"another editor owns post-update migration: pid={owner.pid}")
+            if state == "unknown":
+                raise LockBusy(
+                    f"post-update migration owner cannot be proven stale: pid={owner.pid}"
+                )
+            self._archive_stale(row)
+        raise LockBusy("post-update migration election changed concurrently")
+
+    def validate(self, intent: Intent, editor: ProcessIdentity) -> None:
+        if not _lexists(self.path) or self.owner()[0] != self._record(intent, editor):
+            _fail("post-update migration completion requires the elected editor")
+
+    def release(self, intent: Intent, editor: ProcessIdentity) -> None:
+        self.validate(intent, editor)
+        self.path.unlink()
+        _sync_dir(self.root)
+
+    def clear_completed(
+        self,
+        editor: ProcessIdentity,
+        *,
+        process_probe: Callable[[ProcessIdentity], str] = probe_process,
+    ) -> None:
+        """Clear only an election whose exact transaction already completed M6."""
+
+        if not _lexists(self.path):
+            return
+        row, owner = self.owner()
+        paths = TransactionPaths.for_transaction(self.root, row["transaction"])
+        intent = load_intent(paths)
+        if not _lexists(paths.migration_complete):
+            return
+        validate_migration_complete(paths, intent)
+        if owner == editor:
+            self.release(intent, editor)
+            return
+        same_process = (
+            owner.pid == editor.pid
+            and owner.start_fingerprint == editor.start_fingerprint
+        )
+        state = "reused" if same_process else process_probe(owner)
+        if state == "alive":
+            raise LockBusy(f"another editor is releasing completed migration: pid={owner.pid}")
+        if state == "unknown":
+            raise LockBusy(f"completed migration owner cannot be proven stale: pid={owner.pid}")
+        self._archive_stale(row)
+
+
+def _manual_migration_marker(
+    project: Path,
+    install: Path,
+) -> tuple[Path, dict[str, Any]] | None:
+    canonical_project, _canonical_install_root = _canonical_install(project, install)
+    path = canonical_project / MANUAL_MIGRATION_MARKER_RELATIVE
+    if not _lexists(path):
+        return None
+    row = _exact(
+        _load_json_object(path, require_canonical=True),
+        name="manual migration marker",
+        keys={"from_version", "kind", "schema_version", "source_commit", "to_version"},
+    )
+    if _integer(row["schema_version"], name="manual marker.schema_version", minimum=1) != 1:
+        _fail("unsupported manual migration marker schema")
+    if row["kind"] != MANUAL_MIGRATION_KIND:
+        _fail("invalid manual migration marker kind")
+    from_version = _string(row["from_version"], name="manual marker.from_version")
+    if (
+        not from_version
+        or len(from_version) > 64
+        or any(ord(value) < 0x20 for value in from_version)
+    ):
+        _fail("manual migration source version is invalid")
+    _string(
+        row["source_commit"],
+        name="manual marker.source_commit",
+        pattern=re.compile(r"[0-9a-f]{40}"),
+    )
+    to_version = _string(row["to_version"], name="manual marker.to_version", pattern=VERSION)
+    if to_version != PACKAGE_VERSION:
+        _fail("manual migration marker targets another package version")
+    return path, row
+
+
+class ManualMigrationElection:
+    """One durable editor owner for clean-major client repin and marker removal."""
+
+    def __init__(self, project: Path, install: Path):
+        self.project, self.install = _canonical_install(project, install)
+        self.directory = self.project / MANUAL_MIGRATION_STATE_RELATIVE
+        self.path = self.directory / "owner.json"
+
+    def _record(
+        self, marker: Mapping[str, Any], editor: ProcessIdentity
+    ) -> dict[str, Any]:
+        return {
+            "editor": editor.record(),
+            "install_root": str(self.install),
+            "marker_sha256": hashlib.sha256(canonical_json(marker)).hexdigest(),
+            "project_root": str(self.project),
+            "record": "manual_migration_election",
+            "schema_version": SCHEMA_VERSION,
+        }
+
+    def owner(self) -> tuple[dict[str, Any], ProcessIdentity]:
+        _private_dir(self.directory)
+        row = _typed(load_record(self.path), "manual_migration_election")
+        if row["project_root"] != str(self.project) or row["install_root"] != str(self.install):
+            _fail("manual migration election targets another project or install")
+        _string(row["marker_sha256"], name="manual election.marker_sha256", pattern=HEX64)
+        return row, ProcessIdentity.parse(row["editor"], name="manual election.editor")
+
+    def _archive_stale(self, row: Mapping[str, Any]) -> None:
+        digest = hashlib.sha256(canonical_json(row)).hexdigest()[:16]
+        archive = self.directory / f"stale-{digest}.json"
+        try:
+            os.link(self.path, archive)
+        except FileExistsError:
+            if load_record(archive) != row:
+                _fail("manual migration stale-owner archive conflicts")
+        except FileNotFoundError:
+            return
+        if not _lexists(self.path):
+            return
+        current = _lstat(self.path)
+        archived = _lstat(archive)
+        if (current.st_dev, current.st_ino) == (archived.st_dev, archived.st_ino):
+            self.path.unlink()
+            _sync_dir(self.directory)
+
+    def acquire(
+        self,
+        marker: Mapping[str, Any],
+        editor: ProcessIdentity,
+        *,
+        process_probe: Callable[[ProcessIdentity], str] = probe_process,
+    ) -> None:
+        _private_dir(self.directory, create=True)
+        expected = self._record(marker, editor)
+        for _attempt in range(3):
+            try:
+                publish_record(self.path, expected)
+                return
+            except TransactionError:
+                if not _lexists(self.path):
+                    continue
+            row, owner = self.owner()
+            if row == expected:
+                return
+            same_process = (
+                owner.pid == editor.pid
+                and owner.start_fingerprint == editor.start_fingerprint
+            )
+            state = "reused" if same_process else process_probe(owner)
+            if state == "alive":
+                raise LockBusy(f"another editor owns manual migration: pid={owner.pid}")
+            if state == "unknown":
+                raise LockBusy(f"manual migration owner cannot be proven stale: pid={owner.pid}")
+            self._archive_stale(row)
+        raise LockBusy("manual migration election changed concurrently")
+
+    def validate(self, marker: Mapping[str, Any], editor: ProcessIdentity) -> None:
+        if not _lexists(self.path) or self.owner()[0] != self._record(marker, editor):
+            _fail("manual migration completion requires the elected editor")
+
+    def release(self, marker: Mapping[str, Any], editor: ProcessIdentity) -> None:
+        self.validate(marker, editor)
+        self.path.unlink()
+        _sync_dir(self.directory)
+
+    def clear_finished(
+        self,
+        editor: ProcessIdentity,
+        *,
+        process_probe: Callable[[ProcessIdentity], str] = probe_process,
+    ) -> None:
+        if not _lexists(self.path):
+            return
+        if _lexists(self.project / MANUAL_MIGRATION_MARKER_RELATIVE):
+            return
+        row, owner = self.owner()
+        if owner == editor:
+            self.path.unlink()
+            _sync_dir(self.directory)
+            return
+        same_process = (
+            owner.pid == editor.pid
+            and owner.start_fingerprint == editor.start_fingerprint
+        )
+        state = "reused" if same_process else process_probe(owner)
+        if state == "alive":
+            raise LockBusy(f"another editor is finishing manual migration: pid={owner.pid}")
+        if state == "unknown":
+            raise LockBusy(f"manual migration owner cannot be proven stale: pid={owner.pid}")
+        self._archive_stale(row)
+
+
+def complete_manual_migration(
+    project: Path,
+    install: Path,
+    editor: ProcessIdentity,
+) -> dict[str, Any]:
+    marker_value = _manual_migration_marker(project, install)
+    if marker_value is None:
+        _fail("manual migration marker is absent")
+    marker_path, marker = marker_value
+    election = ManualMigrationElection(project, install)
+    election.validate(marker, editor)
+    if _load_json_object(marker_path, require_canonical=True) != marker:
+        _fail("manual migration marker changed before completion")
+    marker_path.unlink()
+    _sync_dir(marker_path.parent)
+    election.release(marker, editor)
+    return {
+        "status": "migration_complete",
+        "transaction": "manual-" + hashlib.sha256(canonical_json(marker)).hexdigest()[:24],
+    }
+
+
 def editor_identity(pid: int, nonce: str) -> ProcessIdentity:
     fingerprint = process_start_fingerprint(pid)
     if fingerprint is None:
@@ -1753,8 +2046,11 @@ def complete_migration(
     if hash_tree(intent.install_root) != intent.new_tree:
         _fail("client migration completion live tree differs from the signed update")
     EditorLeases(root, canonical_project, canonical_install).validate(editor)
+    election = MigrationElection(root, canonical_project, canonical_install)
+    election.acquire(intent, editor)
     if _lexists(paths.migration_complete):
         validate_migration_complete(paths, intent)
+        election.release(intent, editor)
         return {"status": "migration_complete", "transaction": transaction}
     with _mutation(failpoints, "migration_complete"):
         publish_record(
@@ -1762,6 +2058,7 @@ def complete_migration(
             _migration_complete_record(intent, claim, editor),
         )
     validate_migration_complete(paths, intent)
+    election.release(intent, editor)
     return {"status": "migration_complete", "transaction": transaction}
 
 
@@ -2868,12 +3165,16 @@ def startup_barrier(
     if transaction is None:
         current_editor = editor_identity(editor_pid, editor_nonce)
         leases = EditorLeases(root, project, install)
-        leases.acquire(current_editor)
+        election = MigrationElection(root, project, install)
+        manual_election = ManualMigrationElection(project, install)
+        pending: tuple[Intent, dict[str, Any]] | None = None
+        manual: tuple[Path, dict[str, Any]] | None = None
         try:
             if _lexists(lock.path):
                 raise LockBusy(
                     "activation in progress; only the initiating coordinator handoff may start"
                 )
+            election.clear_completed(current_editor)
             canonical_project, canonical_install = _canonical_install(project, install)
             pending = _pending_migration(root, canonical_project, canonical_install)
             if pending is not None:
@@ -2881,13 +3182,42 @@ def startup_barrier(
                 # clients.  Elect one live editor for the durable M6 replay so
                 # two post-crash startups cannot mutate those files together.
                 # Ordinary, fully-completed startup remains multi-editor.
+                election.acquire(pending[0], current_editor)
+            else:
+                manual_election.clear_finished(current_editor)
+                manual = _manual_migration_marker(project, install)
+                if manual is not None:
+                    manual_election.acquire(manual[1], current_editor)
+            leases.acquire(current_editor)
+            if pending is not None:
                 leases.assert_exclusive(current_editor)
         except BaseException:
             leases.release(current_editor)
+            if pending is not None and _lexists(election.path):
+                try:
+                    election.release(pending[0], current_editor)
+                except TransactionError:
+                    pass
+            if manual is not None and _lexists(manual_election.path):
+                try:
+                    manual_election.release(manual[1], current_editor)
+                except TransactionError:
+                    pass
             raise
         if pending is not None:
             intent, terminal = pending
             return _post_outcome(intent, terminal, status="migration_pending")
+        if manual is not None:
+            marker = manual[1]
+            return {
+                "from_version": marker["from_version"],
+                "manual_migration": True,
+                "outcome": "success",
+                "status": "migration_pending",
+                "to_version": marker["to_version"],
+                "transaction": "manual-"
+                + hashlib.sha256(canonical_json(marker)).hexdigest()[:24],
+            }
         return {"status": "none"}
     paths = TransactionPaths.for_transaction(root, transaction)
     intent = load_intent(paths)
@@ -2896,6 +3226,8 @@ def startup_barrier(
         _fail("startup transaction is bound to another initiating editor")
     if _lexists(paths.claim):
         terminal = claim_result(intent)
+        if terminal["outcome"] == "success" and not _lexists(paths.migration_complete):
+            MigrationElection(root, project, install).acquire(intent, current_editor)
         EditorLeases(root, project, install).acquire(current_editor)
         return _post_outcome(intent, terminal)
     if not _lexists(lock.path):
@@ -2910,6 +3242,8 @@ def startup_barrier(
             _fail("timed out waiting for activation result")
         time.sleep(POLL_SECONDS)
     terminal = claim_result(intent)
+    if terminal["outcome"] == "success" and not _lexists(paths.migration_complete):
+        MigrationElection(root, project, install).acquire(intent, current_editor)
     EditorLeases(root, project, install).acquire(current_editor)
     return _post_outcome(intent, terminal)
 
@@ -2995,6 +3329,14 @@ def _parser() -> argparse.ArgumentParser:
     complete.add_argument("--transaction", required=True)
     complete.add_argument("--editor-pid", type=int, required=True)
     complete.add_argument("--editor-nonce", required=True)
+    complete_manual = subparsers.add_parser(
+        "complete-manual-migration",
+        help="atomically consume the clean-major marker held by the elected editor",
+    )
+    for name in ("project", "install"):
+        complete_manual.add_argument(f"--{name}", type=Path, required=True)
+    complete_manual.add_argument("--editor-pid", type=int, required=True)
+    complete_manual.add_argument("--editor-nonce", required=True)
     abort = subparsers.add_parser(
         "abort-prepared",
         help="discard an authenticated stage only if activation never began",
@@ -3126,6 +3468,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.install,
                 args.recovery_root,
                 args.transaction,
+                editor_identity(args.editor_pid, args.editor_nonce),
+            )
+            _write_actor_response(result)
+            return 0
+        if args.command == "complete-manual-migration":
+            result = complete_manual_migration(
+                args.project,
+                args.install,
                 editor_identity(args.editor_pid, args.editor_nonce),
             )
             _write_actor_response(result)

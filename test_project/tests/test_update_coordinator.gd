@@ -225,6 +225,14 @@ func test_qualification_barrier_requires_authenticated_exact_decision() -> void:
 	assert_true(barrier._read_bounded_record(decision_path).is_empty(),
 		"duplicate JSON keys must fail closed before Godot collapses them")
 	file = FileAccess.open(decision_path, FileAccess.WRITE)
+	var escaped_record := '"\\u0072ecord":"coordinator_failpoint_decision"'
+	file.store_string(canonicalish.replace(record_field, '%s,%s' % [record_field, escaped_record]))
+	file.close()
+	if OS.get_name() != "Windows":
+		FileAccess.set_unix_permissions(decision_path, 384)
+	assert_true(barrier._read_bounded_record(decision_path).is_empty(),
+		"JSON-equivalent escaped duplicate keys must fail closed")
+	file = FileAccess.open(decision_path, FileAccess.WRITE)
 	file.store_string(canonicalish)
 	file.close()
 	var reread := barrier._read_bounded_record(decision_path)

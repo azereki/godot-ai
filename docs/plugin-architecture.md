@@ -261,8 +261,13 @@ clean migration in [v4-migration.md](v4-migration.md).
   invokes the frozen old-package startup actor; that actor publishes readiness,
   validates and atomically claims the result, and later publishes
   `migration-complete.json` after GDScript completes the M6 post-update client
-  migration. Active activation is cleared before normal composition; a durable
-  pending M6 permits only inert composition and keeps normal effects barred.
+  migration. A durable actor-owned election gives exactly one live editor that
+  completion authority; dead owners are archived only after process-identity
+  proof. Clean-major first start uses the same pattern in a private state
+  directory beside its deny-only marker, and the actor—not GDScript—removes the
+  exact marker after repin. Active activation is cleared before normal
+  composition; a durable pending M6 permits only inert composition and keeps
+  normal effects barred.
 - The clean-major installer requires `uvx` and proves the exact target actor's
   package/protocol identity before any project mutation. A newly installed tree
   therefore cannot reach first start without the actor its fail-closed lease

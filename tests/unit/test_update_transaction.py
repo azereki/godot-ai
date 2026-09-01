@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
@@ -116,6 +117,25 @@ def _wait_until(predicate: Any, timeout: float = 2.0) -> None:
         if time.monotonic() >= deadline:
             pytest.fail("timed out waiting for transaction state")
         time.sleep(0.01)
+
+
+def _manual_marker(project: Path) -> tuple[Path, dict[str, Any]]:
+    state = project / ".godot"
+    state.mkdir(mode=0o700, exist_ok=True)
+    if os.name != "nt":
+        state.chmod(0o700)
+    marker = state / "godot-ai-v4-migration.json"
+    row = {
+        "from_version": "3.2.4",
+        "kind": "pre_v4_migration",
+        "schema_version": 1,
+        "source_commit": "a" * 40,
+        "to_version": tx.PACKAGE_VERSION,
+    }
+    marker.write_bytes(tx.canonical_json(row))
+    if os.name != "nt":
+        marker.chmod(0o600)
+    return marker, row
 
 
 class Actor:
@@ -324,7 +344,7 @@ def test_second_editor_cannot_cross_post_census_pre_rename_window(
                 timeout=2,
             )
         assert tx.hash_tree(scenario.install) == scenario.intent.old_tree
-        assert "late-editor-01234567" in acquired
+        assert "late-editor-01234567" not in acquired
         assert not (scenario.recovery / "editor-leases" / "late-editor-01234567.json").exists()
 
         release.set()
@@ -359,6 +379,83 @@ def test_startup_barrier_is_inert_without_recovery_state(tmp_path: Path) -> None
     root = tx.recovery_root(project, install)
     lease = tx.load_record(root / "editor-leases" / f"{nonce}.json")
     assert tx.ProcessIdentity.parse(lease["editor"], name="lease editor").pid == os.getpid()
+
+
+def test_manual_migration_has_one_durable_winner_and_actor_owned_completion(
+    tmp_path: Path,
+) -> None:
+    project = _mkdir(tmp_path / "manual-project")
+    install = _mkdir(_mkdir(project / "addons") / "godot_ai")
+    _tree(install, "v4")
+    marker_path, marker = _manual_marker(project)
+    holders = [
+        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+        for _index in range(2)
+    ]
+    start = threading.Barrier(2)
+    outcomes: list[tuple[str, int, str]] = []
+
+    def compete(index: int) -> None:
+        nonce = f"manual-editor-{index}-012345"
+        start.wait()
+        try:
+            result = tx.startup_barrier(
+                project,
+                install,
+                editor_pid=holders[index].pid,
+                editor_nonce=nonce,
+            )
+            outcomes.append(("won", index, str(result["transaction"])))
+        except tx.LockBusy:
+            outcomes.append(("lost", index, nonce))
+
+    threads = [threading.Thread(target=compete, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive()
+
+    try:
+        assert sorted(kind for kind, _index, _value in outcomes) == ["lost", "won"]
+        winner = next(index for kind, index, _value in outcomes if kind == "won")
+        editor = tx.editor_identity(holders[winner].pid, f"manual-editor-{winner}-012345")
+        expected_transaction = "manual-" + hashlib.sha256(
+            tx.canonical_json(marker)
+        ).hexdigest()[:24]
+        assert tx.complete_manual_migration(project, install, editor) == {
+            "status": "migration_complete",
+            "transaction": expected_transaction,
+        }
+        assert not marker_path.exists()
+        assert not tx.ManualMigrationElection(project, install).path.exists()
+    finally:
+        for holder in holders:
+            holder.terminate()
+            holder.wait(timeout=3)
+
+
+def test_manual_migration_marker_rejects_unicode_equivalent_duplicate_key(
+    tmp_path: Path,
+) -> None:
+    project = _mkdir(tmp_path / "manual-duplicate-project")
+    install = _mkdir(_mkdir(project / "addons") / "godot_ai")
+    _tree(install, "v4")
+    marker_path, marker = _manual_marker(project)
+    raw = tx.canonical_json(marker).decode()
+    marker_path.write_text(
+        raw.replace('"kind":', '"kind":"pre_v4_migration","\\u006bind":'),
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        marker_path.chmod(0o600)
+    with pytest.raises(tx.TransactionError, match="duplicate JSON key: kind"):
+        tx.startup_barrier(
+            project,
+            install,
+            editor_pid=os.getpid(),
+            editor_nonce="manual-duplicate-012345",
+        )
 
 
 def test_successful_claim_replays_m6_across_every_editor_crash_window(
@@ -464,6 +561,53 @@ def test_pending_migration_refuses_a_second_live_editor(tmp_path: Path) -> None:
     finally:
         holder.terminate()
         holder.wait(timeout=3)
+
+
+def test_simultaneous_post_crash_startups_have_one_durable_m6_winner(
+    tmp_path: Path,
+) -> None:
+    scenario = _scenario(tmp_path)
+    assert _claim_success_without_migration(scenario)["outcome"] == "success"
+    holders = [
+        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+        for _index in range(2)
+    ]
+    start = threading.Barrier(2)
+    outcomes: list[tuple[str, str]] = []
+
+    def compete(index: int) -> None:
+        nonce = f"simultaneous-editor-{index}-012345"
+        start.wait()
+        try:
+            result = tx.startup_barrier(
+                scenario.project,
+                scenario.install,
+                editor_pid=holders[index].pid,
+                editor_nonce=nonce,
+            )
+            outcomes.append(("won", str(result["transaction"])))
+        except tx.LockBusy:
+            outcomes.append(("lost", nonce))
+
+    threads = [threading.Thread(target=compete, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive()
+
+    try:
+        assert sorted(kind for kind, _value in outcomes) == ["lost", "won"]
+        election = tx.MigrationElection(
+            scenario.recovery, scenario.project, scenario.install
+        )
+        row, owner = election.owner()
+        assert row["transaction"] == scenario.intent.transaction
+        assert owner.pid in {holder.pid for holder in holders}
+    finally:
+        for holder in holders:
+            holder.terminate()
+            holder.wait(timeout=3)
 
 
 def test_pending_migration_removes_stale_lease_and_elects_current_editor(

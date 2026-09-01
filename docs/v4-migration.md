@@ -200,6 +200,13 @@ if its Godot AI tools remain stale or disconnected. If repinning, durable
 completion, or marker removal fails, the server remains dormant; retry the
 indicated step or restore the retained backup.
 
+The transaction actor atomically elects one editor before any first-start
+client mutation. A simultaneous editor is refused before it can claim the same
+work. Marker removal is actor-owned and bound to the exact marker digest and
+editor process identity; a crashed owner may be replaced only after its process
+fingerprint is proven gone (or by the sole reloaded plugin instance in that
+same editor process).
+
 Automatic client writes are serialized by one durable account-wide mutation
 lock below the OS config directory. If first-start repinning reports that this
 lock is safety-stranded, stop the relevant client processes—or reboot—then

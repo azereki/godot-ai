@@ -23,10 +23,6 @@ const UPDATE_ACTOR_COMMAND_TIMEOUT_MS := 60000
 const UPDATE_ACTOR_RELEASE_TIMEOUT_MS := 5000
 const UPDATE_ACTOR_ERROR_PREFIX := "update transaction refused: "
 const MAX_UPDATE_ACTOR_ERROR_BYTES := 1024
-const MANUAL_MIGRATION_MARKER_PATH := "res://.godot/godot-ai-v4-migration.json"
-const MANUAL_MIGRATION_MARKER_KIND := "pre_v4_migration"
-const MANUAL_MIGRATION_MARKER_SCHEMA := 1
-const MAX_MANUAL_MIGRATION_MARKER_BYTES := 4096
 const MIN_GODOT_MAJOR := 4
 const MIN_GODOT_MINOR := 7
 const UNSUPPORTED_GODOT_MESSAGE := \
@@ -137,7 +133,6 @@ var _post_update_outcome: Dictionary = {}
 var _post_update_actor_command = []
 var _post_update_actor_version := ""
 var _post_update_action := ""
-var _manual_migration_record: Dictionary = {}
 var _normal_start_released := false
 var _update_barrier_blocked := false
 ## One actor worker is sufficient: startup finishes before composition can
@@ -740,24 +735,6 @@ func _on_update_activation_requested(package: Dictionary) -> void:
 ## Hold successful activation behind the client-migration barrier. Rollback
 ## resumes normally after recording its terminal outcome.
 func _begin_startup_release() -> void:
-	if _post_update_outcome.is_empty():
-		var manual := _read_manual_migration_marker()
-		match str(manual.get("status", "invalid")):
-			"pending":
-				_manual_migration_record = (manual.get("record", {}) as Dictionary).duplicate(true)
-				_post_update_outcome = {
-					"outcome": "success",
-					"from_version": str(_manual_migration_record.from_version),
-					"to_version": str(_manual_migration_record.to_version),
-					"manual_migration": true,
-				}
-			"none":
-				pass
-			_:
-				_present_post_update_barrier_failure(
-					"The manual v4 migration marker is invalid. Re-run the signed clean installer."
-				)
-				return
 	if str(_post_update_outcome.get("outcome", "")) != "success":
 		_fan_post_update_outcome()
 		_release_normal_startup()
@@ -832,22 +809,12 @@ func _present_post_update_complete() -> void:
 
 
 func _complete_post_update_startup() -> void:
-	if bool(_post_update_outcome.get("manual_migration", false)):
-		if not _remove_manual_migration_marker():
-			_present_post_update_barrier_failure(
-				"The manual migration marker could not be removed; server startup remains blocked."
-			)
-			return
-		print("MCP | client migration completed")
-	else:
-		if not _start_post_update_completion():
-			_present_post_update_barrier_failure(
-				"The transaction actor could not durably complete client migration."
-			)
+	if not _start_post_update_completion():
+		_present_post_update_barrier_failure(
+			"The transaction actor could not durably complete client migration."
+		)
 		return
-	_present_post_update_complete()
-	_fan_post_update_outcome()
-	_release_normal_startup()
+	return
 
 
 func _start_post_update_completion() -> bool:
@@ -855,16 +822,22 @@ func _start_post_update_completion() -> bool:
 		return false
 	var command: Array[String] = []
 	command.assign(_post_update_actor_command)
-	var recovery_root := str(_post_update_outcome.get("recovery_root", ""))
 	var transaction := str(_post_update_outcome.get("transaction", ""))
-	if command.is_empty() or recovery_root.is_empty() or transaction.is_empty():
+	if command.is_empty() or transaction.is_empty():
 		return false
-	var arguments: Array[String] = ["complete-migration"]
+	var manual := bool(_post_update_outcome.get("manual_migration", false))
+	var arguments: Array[String] = [
+		"complete-manual-migration" if manual else "complete-migration"
+	]
 	arguments.append_array(_transaction_identity_arguments())
-	arguments.append_array([
-		"--recovery-root", recovery_root,
-		"--transaction", transaction,
-	])
+	if not manual:
+		var recovery_root := str(_post_update_outcome.get("recovery_root", ""))
+		if recovery_root.is_empty():
+			return false
+		arguments.append_array([
+			"--recovery-root", recovery_root,
+			"--transaction", transaction,
+		])
 	_set_update_startup_cancelled(false)
 	_update_actor_thread = Thread.new()
 	_update_actor_job = "migration_completion"
@@ -963,64 +936,8 @@ func _fan_post_update_outcome() -> void:
 	if _telemetry != null and not bool(_post_update_outcome.get("manual_migration", false)):
 		_telemetry.record_self_update(status, from_version, to_version, error)
 	_post_update_outcome.clear()
-	_manual_migration_record.clear()
 	_post_update_actor_command.clear()
 	_post_update_actor_version = ""
-
-
-func _read_manual_migration_marker() -> Dictionary:
-	if not FileAccess.file_exists(MANUAL_MIGRATION_MARKER_PATH):
-		return {"status": "none"}
-	var file := FileAccess.open(MANUAL_MIGRATION_MARKER_PATH, FileAccess.READ)
-	if file == null:
-		return {"status": "invalid"}
-	var size := file.get_length()
-	if size <= 0 or size > MAX_MANUAL_MIGRATION_MARKER_BYTES:
-		return {"status": "invalid"}
-	return _parse_manual_migration_marker(
-		file.get_buffer(size).get_string_from_utf8(), _loaded_plugin_version
-	)
-
-
-static func _parse_manual_migration_marker(raw: String, loaded_version: String) -> Dictionary:
-	var parsed: Variant = JSON.parse_string(raw)
-	if not parsed is Dictionary or (parsed as Dictionary).size() != 5:
-		return {"status": "invalid"}
-	for key in ["from_version", "kind", "schema_version", "source_commit", "to_version"]:
-		if not parsed.has(key):
-			return {"status": "invalid"}
-	var from_version := str(parsed.from_version)
-	var source_commit := str(parsed.source_commit)
-	if (
-		int(parsed.schema_version) != MANUAL_MIGRATION_MARKER_SCHEMA
-		or str(parsed.kind) != MANUAL_MIGRATION_MARKER_KIND
-		or from_version.is_empty()
-		or from_version.length() > 64
-		or str(parsed.to_version) != loaded_version
-		or source_commit.length() != 40
-	):
-		return {"status": "invalid"}
-	for character in from_version:
-		if character.unicode_at(0) < 0x20:
-			return {"status": "invalid"}
-	for character in source_commit:
-		if not "0123456789abcdef".contains(character):
-			return {"status": "invalid"}
-	return {"status": "pending", "record": (parsed as Dictionary).duplicate(true)}
-
-
-func _remove_manual_migration_marker() -> bool:
-	var current := _read_manual_migration_marker()
-	if (
-		str(current.get("status", "")) != "pending"
-		or (current.get("record", {}) as Dictionary) != _manual_migration_record
-	):
-		return false
-	var absolute := ProjectSettings.globalize_path(MANUAL_MIGRATION_MARKER_PATH)
-	return (
-		DirAccess.remove_absolute(absolute) == OK
-		and not FileAccess.file_exists(MANUAL_MIGRATION_MARKER_PATH)
-	)
 
 
 func _ensure_update_editor_nonce() -> void:

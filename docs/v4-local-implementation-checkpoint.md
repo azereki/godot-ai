@@ -43,6 +43,7 @@ capability directories were used; the user's server on 8000/9500 was untouched.
 | Stale/foreign/adopted server smokes | pass; foreign occupants preserved, compatible external server survived reload |
 | Signed v4-to-v4 update | current automated and interactive rows pass; exact signed tree, retained backup, durable claim-before-startup, automatic client repin/completion, fresh authenticated v4.0.1 server, clean banner transition, and no new crash report |
 | Signed/clean-major integration file | 11 passed on current source with `GODOT_BIN` set to pinned Godot 4.7 |
+| Durable M6 election follow-up | hot-update and clean-major completion now use actor-owned atomic elections; simultaneous two-process tests have exactly one winner; five real-Godot clean-major rows pass |
 | Clean-major migration | simulated cold and offline rows pass through a fake `uvx`; wedged prewarm fails before client repin, marker removal, server start, or tool write because descendant authority cannot be disproved |
 | Rendering/game capture | pass; 1,920×1,080 output and exact red/green/blue/white quadrant samples |
 | Product quit | pass; exact editor process exited with its managed server |
@@ -117,11 +118,6 @@ The following remain deliberately open and must not be described as completed:
 - the complete uniquely addressable section-8.1 external failpoint surface and
   Phase-6 actual-path two-editor/crash/rollback/quarantine/repair matrix against
   signed fixtures;
-- qualification-record parsing that rejects JSON-equivalent duplicate keys,
-  including Unicode-escaped key spellings, rather than only repeated literal
-  keys;
-- durable single-winner election for both manual clean-major M6 and simultaneous
-  post-crash hot-update startup, rather than the current race-prone lease scan;
 - the required Windows/macOS/Linux/Godot/Python qualification matrix;
 - frozen exact source A and minimal qualification child B, signed plugin assets,
   complete dependency inventories, and independent approval;
