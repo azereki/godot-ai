@@ -1606,7 +1606,13 @@ static func get_update_transaction_command() -> Array[String]:
 		if OS.get_name() == "Windows"
 		else "godot-ai-update-transaction"
 	)
-	return [executable] if FileAccess.file_exists(executable) else []
+	## A ternary of array literals loses its element type at runtime even though
+	## this function declares Array[String]. Installed-mode startup then fails
+	## when the caller assigns the result to its typed command array.
+	var actor_command: Array[String] = []
+	if FileAccess.file_exists(executable):
+		actor_command.append(executable)
+	return actor_command
 static func update_actor_requires_uv_environment_isolation(command: Array[String]) -> bool:
 	return UvResolution.is_production_command(command)
 
