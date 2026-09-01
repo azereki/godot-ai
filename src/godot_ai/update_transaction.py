@@ -50,6 +50,7 @@ MAX_FILES = 20_000
 MAX_TREE_BYTES = 512 * 1024 * 1024
 POLL_SECONDS = 0.02
 WINDOWS_SHARING_RETRY_SECONDS = 0.5
+HARD_LINK_SETTLE_SECONDS = 1.0
 DOWNLOAD_LIMITS = {
     ASSET_NAME: MAX_ARCHIVE_SIZE,
     MANIFEST_NAME: MAX_MANIFEST_SIZE,
@@ -371,13 +372,14 @@ def _secure_file(path: Path) -> os.stat_result:
     _posix_private(info, path=path, directory=False)
     if os.name != "nt" and info.st_nlink == 2:
         # Immutable publication links the complete temp inode into place, then
-        # immediately drops the temp name. Let a racing reader cross that tiny
-        # visibility window; persistent or additional links still fail closed.
-        for _attempt in range(10):
-            time.sleep(0.001)
+        # immediately drops the temp name. A heavily contended writer can be
+        # descheduled between those two syscalls, so wait by elapsed time rather
+        # than a 10 ms attempt count. Persistent or additional links still fail
+        # closed, and link counts above two never enter this settle path.
+        deadline = time.monotonic() + HARD_LINK_SETTLE_SECONDS
+        while info.st_nlink == 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
             info = _lstat(path)
-            if info.st_nlink == 1:
-                break
     if os.name != "nt" and info.st_nlink != 1:
         _fail(f"{path}: record has an unexpected hard link")
     if info.st_size > MAX_RECORD_BYTES:

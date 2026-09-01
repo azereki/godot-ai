@@ -3237,6 +3237,44 @@ def test_publish_is_immutable_and_journal_replace_is_atomic(tmp_path: Path) -> N
     assert not list(directory.glob(".record-*.tmp"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX immutable-publication link window")
+def test_record_reader_waits_for_a_descheduled_publish_unlink(tmp_path: Path) -> None:
+    directory = _mkdir(tmp_path / "private")
+    path = directory / "record.json"
+    path.write_bytes(tx.canonical_json({"value": 1}))
+    path.chmod(0o600)
+    temporary = directory / ".record-delayed.tmp"
+    os.link(path, temporary)
+
+    def finish_publication() -> None:
+        time.sleep(0.05)
+        temporary.unlink()
+
+    publisher = threading.Thread(target=finish_publication)
+    publisher.start()
+    try:
+        assert tx.load_record(path) == {"value": 1}
+    finally:
+        publisher.join(1)
+        temporary.unlink(missing_ok=True)
+    assert not publisher.is_alive()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX exact-record link contract")
+def test_record_reader_rejects_a_persistent_hard_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = _mkdir(tmp_path / "private")
+    path = directory / "record.json"
+    path.write_bytes(tx.canonical_json({"value": 1}))
+    path.chmod(0o600)
+    os.link(path, directory / "persistent-alias.json")
+    monkeypatch.setattr(tx, "HARD_LINK_SETTLE_SECONDS", 0.01)
+
+    with pytest.raises(tx.TransactionError, match="unexpected hard link"):
+        tx.load_record(path)
+
+
 def test_windows_record_read_retries_a_transient_replace_sharing_denial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
