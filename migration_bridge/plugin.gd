@@ -100,6 +100,8 @@ func _activate_prepared(package: Dictionary) -> void:
 	parent.add_child(coordinator)
 	if _dock != null and is_instance_valid(_dock):
 		remove_control_from_docks(_dock)
+		_dock.queue_free()
+	_dock = null
 	coordinator.start(package)
 
 

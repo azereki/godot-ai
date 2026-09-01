@@ -13,6 +13,7 @@ const EDITOR_NONCE_ENV := "GODOT_AI_UPDATE_EDITOR_NONCE"
 const ACTOR_HANDOFF_ENV := "GODOT_AI_UPDATE_ACTOR_HANDOFF"
 const POLL_MSEC := 50
 const DEADLINE_MSEC := 90 * 1000
+const STARTUP_TIMEOUT_SECONDS := 180
 
 enum Phase { DRAIN, WAIT_STAGE, WAIT_SCAN, DONE }
 
@@ -89,6 +90,8 @@ func _disable_and_activate() -> void:
 		"--manifest-sha256", str(_package.manifest_sha256),
 		"--editor-pid", str(OS.get_process_id()),
 		"--editor-nonce", str(_package.editor_nonce),
+		"--readiness-timeout", str(STARTUP_TIMEOUT_SECONDS),
+		"--claim-timeout", str(STARTUP_TIMEOUT_SECONDS),
 	]
 	_actor_pid = BridgeExec.create_process(_package.actor_command, arguments)
 	if _actor_pid <= 1:
