@@ -311,7 +311,7 @@ def run_occupant_mode(
     editor_output = None
     try:
         occupant_log = log_dir / f"{mode}-occupant.log"
-        wait_for_log(occupant_log, OCCUPANT_READY_MARKER, occupant, 15)
+        wait_for_log(occupant_log, OCCUPANT_READY_MARKER, occupant, timeout)
         editor_log = log_dir / f"godot-{mode}-smoke.log"
         editor, editor_output = start_editor(
             godot, project, editor_log, editor_environment(capability_dir)

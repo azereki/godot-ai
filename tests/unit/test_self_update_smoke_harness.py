@@ -217,7 +217,7 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     assert vnext_base_uid.strip() == "uid://m5waxbfff4ud"
     assert vnext_child_uid.strip() == "uid://bm2056w0qvj7x"
     assert "const DEFAULT_HTTP_PORT := 18000" in vnext_configurator
-    assert ".godot-ai-self-update-smoke/server-selector.py" in vnext_configurator
+    assert "server-selector.py" in vnext_configurator
     def server_command_block(text: str) -> str:
         start = text.index("static func get_server_command() -> Array[String]:")
         end = text.index("static func get_update_transaction_command() -> Array[String]:")

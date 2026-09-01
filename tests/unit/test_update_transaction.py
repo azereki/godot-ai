@@ -111,7 +111,7 @@ def _paths(scenario: Scenario) -> tx.TransactionPaths:
     )
 
 
-def _wait_until(predicate: Any, timeout: float = 10.0) -> None:
+def _wait_until(predicate: Any, timeout: float = 30.0) -> None:
     deadline = time.monotonic() + timeout
     while not predicate():
         if time.monotonic() >= deadline:

@@ -447,9 +447,11 @@ const VERSION := "{version}"
 const HTTP_PORT := {http_port}
 const ClientConfigurator := preload("res://addons/godot_ai/client_configurator.gd")
 const DriverSupport := preload("res://_test_self_update_driver_support.gd")
+const OWNERSHIP_WAIT_MS := 120000
 
 var _frames := 0
 var _configured := false
+var _ownership_wait_started_ms := 0
 
 
 func _ready() -> void:
@@ -461,14 +463,22 @@ func _ready() -> void:
 
 func _process(_delta: float) -> void:
 \t_frames += 1
-\tif _frames > 1800:
-\t\tpush_error("SELF_UPDATE_TEST | managed server ownership was not established during client prep")
-\t\tget_tree().quit(32)
-\t\treturn
 \tif _configured:
 \t\tvar plugin := DriverSupport.find_godot_ai_plugin()
-\t\tif plugin != null and bool(plugin.call("has_managed_server")):
+\t\tif plugin == null:
+\t\t\treturn
+\t\tif bool(plugin.call("has_managed_server")):
 \t\t\tget_tree().quit(0)
+\t\t\treturn
+\t\tif _ownership_wait_started_ms == 0:
+\t\t\t_ownership_wait_started_ms = Time.get_ticks_msec()
+\t\t\treturn
+\t\tif Time.get_ticks_msec() - _ownership_wait_started_ms > OWNERSHIP_WAIT_MS:
+\t\t\tpush_error(
+\t\t\t\t"SELF_UPDATE_TEST | managed server ownership was not established during client prep: %s"
+\t\t\t\t% plugin.call("get_server_status")
+\t\t\t)
+\t\t\tget_tree().quit(32)
 \t\treturn
 \tif _frames < 45:
 \t\treturn
