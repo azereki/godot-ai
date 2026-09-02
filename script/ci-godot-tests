@@ -1,59 +1,143 @@
 #!/usr/bin/env bash
 # Run Godot handler tests via MCP in CI.
+# Usage: ci-godot-tests [python-command]
 # Expects: Python server reachable at $MCP_SERVER_URL (default :8000, set in
 # _ci_env.sh), Godot editor launched with plugin.
 # This script waits for the plugin to connect before running tests.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PYTHON_CMD="${1:-${PYTHON_CMD:-python}}"
+export PYTHON_CMD
 source "$SCRIPT_DIR/_ci_env.sh"
 source "$SCRIPT_DIR/_ci_session_guard.sh"
 
 SERVER_URL="$MCP_SERVER_URL"
 ci_load_http_auth
 HEADERS=("${HTTP_AUTH_HEADERS[@]}" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
+SESSION_ID=""
+
+close_mcp_session() {
+  if [ -z "$SESSION_ID" ]; then
+    return
+  fi
+  curl -fsS --connect-timeout 3 --max-time 10 "$SERVER_URL" -X DELETE "${HEADERS[@]}" \
+    -H "Mcp-Session-Id: $SESSION_ID" > /dev/null 2>&1 || true
+  SESSION_ID=""
+}
+trap close_mcp_session EXIT
+
+initialize_mcp_session() {
+  local response
+  local new_session_id
+  if ! response=$(curl -fsiS --connect-timeout 3 --max-time 10 \
+    "$SERVER_URL" -X POST "${HEADERS[@]}" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}'); then
+    return 1
+  fi
+  new_session_id=$(printf '%s\n' "$response" | tr -d '\r' | awk '
+    tolower($1) == "mcp-session-id:" {
+      print $2
+      exit
+    }
+  ')
+  if [ -z "$new_session_id" ]; then
+    return 1
+  fi
+  SESSION_ID="$new_session_id"
+  if ! curl -fsS --connect-timeout 3 --max-time 10 \
+    "$SERVER_URL" -X POST "${HEADERS[@]}" \
+    -H "Mcp-Session-Id: $SESSION_ID" \
+    -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' > /dev/null; then
+    close_mcp_session
+    return 1
+  fi
+}
+
+# FastMCP can return streamable HTTP tool results as either an SSE ``data:``
+# frame or a plain JSON body. Normalize both to the structured content object.
+extract_mcp_content() {
+  "$PYTHON_CMD" -c "
+import json, sys
+
+raw = sys.stdin.read().lstrip('\\ufeff').strip()
+payload = None
+try:
+    candidate = json.loads(raw)
+    if isinstance(candidate, dict):
+        payload = candidate
+except json.JSONDecodeError:
+    pass
+if payload is None:
+    for line in raw.splitlines():
+        if not line.startswith('data:'):
+            continue
+        try:
+            candidate = json.loads(line[5:].lstrip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+            break
+if payload is None:
+    print(f'No JSON-RPC payload in response (first 500 chars): {raw[:500]}', file=sys.stderr)
+    raise SystemExit(1)
+if payload.get('error'):
+    print(f'RPC error: {json.dumps(payload[\"error\"])}', file=sys.stderr)
+    raise SystemExit(1)
+result = payload.get('result')
+if not isinstance(result, dict):
+    print('JSON-RPC response has no result object', file=sys.stderr)
+    raise SystemExit(1)
+blocks = result.get('content')
+if not isinstance(blocks, list):
+    blocks = []
+if result.get('isError'):
+    first = blocks[0] if blocks and isinstance(blocks[0], dict) else {}
+    message = first.get('text', 'unknown tool error')
+    print(f'Tool error: {message}', file=sys.stderr)
+    raise SystemExit(1)
+content = result.get('structuredContent')
+if not isinstance(content, dict) or not content:
+    first = blocks[0] if blocks and isinstance(blocks[0], dict) else {}
+    text = first.get('text', '{}')
+    try:
+        content = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        print('Tool response content is not valid JSON', file=sys.stderr)
+        raise SystemExit(1)
+if not isinstance(content, dict):
+    print('Tool response content is not an object', file=sys.stderr)
+    raise SystemExit(1)
+print(json.dumps(content))
+"
+}
 
 # Wait for Godot plugin to connect (session_manage(op="list") returns count > 0)
 echo "Waiting for Godot plugin to connect (server: $SERVER_URL)..."
+GODOT_CONNECTED=0
 for i in $(seq 1 60); do
-  # `|| true` neutralizes the pipeline status under `set -euo pipefail`:
-  # a down server (curl exit 7) or a missing header (grep exit 1) must fall
-  # through to the empty-SESSION_ID retry below, not abort the script (#668).
-  SESSION_ID=$(curl -si "$SERVER_URL" -X POST "${HEADERS[@]}" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}' \
-    2>&1 | grep -i 'mcp-session-id' | tr -d '\r' | awk '{print $2}' || true)
-
   if [ -z "$SESSION_ID" ]; then
-    sleep 2
-    continue
+    if ! initialize_mcp_session; then
+      sleep 2
+      continue
+    fi
   fi
 
-  curl -s "$SERVER_URL" -X POST "${HEADERS[@]}" \
-    -H "Mcp-Session-Id: $SESSION_ID" \
-    -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' > /dev/null || true
-
-  SESSIONS=$(curl -s "$SERVER_URL" -X POST "${HEADERS[@]}" \
+  RAW_SESSIONS=$(curl -fsS --connect-timeout 3 --max-time 10 \
+    "$SERVER_URL" -X POST "${HEADERS[@]}" \
     -H "Mcp-Session-Id: $SESSION_ID" \
     -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"session_manage","arguments":{"op":"list"}}}' || true)
-
-  if echo "$SESSIONS" | grep -q '"count":'; then
-    COUNT=$(echo "$SESSIONS" | python3 -c "
-import json, sys
-raw = sys.stdin.read()
-for line in raw.split('\n'):
-    if line.startswith('data: '):
-        data = json.loads(line[6:])
-        sc = data.get('result',{}).get('structuredContent',{})
-        if not sc:
-            text = data.get('result',{}).get('content',[{}])[0].get('text','{}')
-            sc = json.loads(text)
-        print(sc.get('count', 0))
-        break
-" 2>/dev/null || echo "0")
-    if [ "$COUNT" -gt 0 ] 2>/dev/null; then
-      echo "Godot plugin connected (session count: $COUNT)"
-      break
-    fi
+  if SESSIONS=$(printf '%s' "$RAW_SESSIONS" | extract_mcp_content 2>/dev/null); then
+    COUNT=$(printf '%s' "$SESSIONS" | "$PYTHON_CMD" -c \
+      "import json, sys; print(json.load(sys.stdin).get('count', 0))" 2>/dev/null || echo "0")
+  else
+    COUNT=0
+  fi
+  if [ "$COUNT" -gt 0 ] 2>/dev/null; then
+    GODOT_CONNECTED=1
+    echo "Godot plugin connected (session count: $COUNT)"
+    break
   fi
 
   echo "  attempt $i — no session yet"
@@ -64,26 +148,19 @@ if [ -z "${SESSION_ID:-}" ]; then
   echo "ERROR: Could not connect to MCP server at $SERVER_URL"
   exit 1
 fi
+if [ "$GODOT_CONNECTED" -ne 1 ]; then
+  echo "ERROR: MCP server is reachable, but no Godot plugin connected"
+  exit 1
+fi
 
 # Resolve the exact editor this run will drive. A lone session is not trusted
 # until its project_path matches this checkout; after selection every call is
 # pinned so a later connection cannot change the active target (#885).
-FINAL_SESSIONS=$(curl -s "$SERVER_URL" -X POST "${HEADERS[@]}" \
+FINAL_SESSIONS_RAW=$(curl -fsS --connect-timeout 3 --max-time 10 \
+  "$SERVER_URL" -X POST "${HEADERS[@]}" \
   -H "Mcp-Session-Id: $SESSION_ID" \
-  -d '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"session_manage","arguments":{"op":"list"}}}' \
-  | python3 -c "
-import json, sys
-raw = sys.stdin.read()
-for line in raw.split('\n'):
-    if line.startswith('data: '):
-        data = json.loads(line[6:])
-        sc = data.get('result',{}).get('structuredContent',{})
-        if not sc:
-            text = data.get('result',{}).get('content',[{}])[0].get('text','{}')
-            sc = json.loads(text)
-        print(json.dumps(sc))
-        break
-" 2>/dev/null || true)
+  -d '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"session_manage","arguments":{"op":"list"}}}' || true)
+FINAL_SESSIONS=$(printf '%s' "$FINAL_SESSIONS_RAW" | extract_mcp_content 2>/dev/null || true)
 
 if [ -z "$FINAL_SESSIONS" ]; then
   echo "ERROR: Could not read connected sessions from $SERVER_URL."
@@ -94,13 +171,13 @@ if ! PIN_SESSION=$(ci_select_godot_session \
   exit 1
 fi
 
-# Built via python3 so the id is JSON-escaped rather than spliced into the body.
+# Built via the selected Python so the id is JSON-escaped rather than spliced into the body.
 # `set -e` does not propagate failures out of a command substitution, so a
-# broken python3 would otherwise splice an empty string into the request body
+# a broken interpreter would otherwise splice an empty string into the request body
 # and surface as a confusing parse error downstream. Fail here instead.
 _tool_args() {
   local out
-  out=$(GODOT_AI_PIN="$PIN_SESSION" python3 -c "
+  out=$(GODOT_AI_PIN="$PIN_SESSION" "$PYTHON_CMD" -c "
 import json, os, sys
 args = json.loads(sys.argv[1])
 pin = os.environ.get('GODOT_AI_PIN', '')
@@ -130,36 +207,21 @@ echo "Opening main.tscn..."
 # swallow its failure, since exiting a command substitution does not exit the
 # parent shell. The assignment propagates the status so `|| exit 1` can catch it.
 SCENE_ARGS=$(_tool_args '{"path":"res://main.tscn"}') || exit 1
-SCENE_OPEN_RESULT=$(curl -s "$SERVER_URL" -X POST "${HEADERS[@]}" \
+SCENE_OPEN_RESULT=$(curl -fsS "$SERVER_URL" -X POST "${HEADERS[@]}" \
   -H "Mcp-Session-Id: $SESSION_ID" \
   -d "$(printf '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"scene_open","arguments":%s}}' "$SCENE_ARGS")")
 # A failed open hollows the run out: scene-dependent tests skip and the
 # summary still reads green. Fail loudly instead (audit backlog).
-echo "$SCENE_OPEN_RESULT" | python3 -c "
-import json, sys
-raw = sys.stdin.read()
-saw_data_line = False
-for line in raw.split('\n'):
-    if line.startswith('data: '):
-        saw_data_line = True
-        data = json.loads(line[6:])
-        result = data.get('result', {})
-        if result.get('isError'):
-            print('ERROR: scene_open failed:', json.dumps(result)[:500])
-            sys.exit(1)
-        break
-if not saw_data_line:
-    # Fail closed: an empty/non-SSE response is exactly the server-hiccup
-    # case this gate exists to catch — falling off the end must not pass.
-    print('ERROR: scene_open returned no SSE data line:', raw[:300])
-    sys.exit(1)
-" || { echo "ERROR: could not open main.tscn — aborting before a hollow run"; exit 1; }
+printf '%s' "$SCENE_OPEN_RESULT" | extract_mcp_content > /dev/null || {
+  echo "ERROR: could not open main.tscn — aborting before a hollow run"
+  exit 1
+}
 sleep 2
 
 # Call test_run
 echo "Running handler tests..."
 TEST_ARGS=$(_tool_args '{}') || exit 1
-RESULT=$(curl -s "$SERVER_URL" -X POST "${HEADERS[@]}" \
+RESULT=$(curl -fsS "$SERVER_URL" -X POST "${HEADERS[@]}" \
   -H "Mcp-Session-Id: $SESSION_ID" \
   -d "$(printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"test_run","arguments":%s}}' "$TEST_ARGS")")
 
@@ -183,65 +245,60 @@ if [ "$EXPECTED_SUITES" -eq 0 ]; then
 fi
 
 # Parse and report results
-echo "$RESULT" | EXPECTED_SUITES="$EXPECTED_SUITES" EXPECTED_SUITE_NAMES="$EXPECTED_SUITE_NAMES" python3 -c "
+RESULT_CONTENT=$(printf '%s' "$RESULT" | extract_mcp_content) || {
+  echo "ERROR: No valid response from test_run"
+  exit 1
+}
+printf '%s' "$RESULT_CONTENT" | \
+  EXPECTED_SUITES="$EXPECTED_SUITES" \
+  EXPECTED_SUITE_NAMES="$EXPECTED_SUITE_NAMES" \
+  "$PYTHON_CMD" -c "
 import json, os, sys
-raw = sys.stdin.read()
-for line in raw.split('\n'):
-    if line.startswith('data: '):
-        data = json.loads(line[6:])
-        content = data.get('result', {}).get('structuredContent', {})
-        if not content:
-            text = data.get('result', {}).get('content', [{}])[0].get('text', '{}')
-            content = json.loads(text)
-        passed = content.get('passed', 0)
-        failed = content.get('failed', 0)
-        total = content.get('total', 0)
-        load_errors = content.get('load_errors', []) or []
-        skipped = content.get('skipped', 0)
-        print(f'Godot tests: {passed}/{total} passed, {failed} failed, {skipped} skipped')
-        if content.get('failures'):
-            for f in content['failures']:
-                print(f'  FAIL: {f[\"suite\"]}.{f[\"test\"]}: {f[\"message\"]}')
-        if load_errors:
-            print(f'  LOAD ERRORS: {len(load_errors)} test file(s) failed to parse:')
-            for le in load_errors:
-                print(f'    - {le}')
-        if failed > 0:
-            sys.exit(1)
-        if load_errors:
-            print('ERROR: At least one test file failed to load (parse error?). Treating as failure so silent test-loss does not slip past CI.')
-            sys.exit(1)
-        if total == 0:
-            print('ERROR: No tests ran — Godot plugin may not have connected')
-            sys.exit(1)
-        # #882: fail on partial discovery, not just all-or-nothing loss.
-        expected_suites = int(os.environ.get('EXPECTED_SUITES', '0') or 0)
-        suite_count = content.get('suite_count', 0)
-        suites_run = content.get('suites_run', []) or []
-        if expected_suites and suite_count < expected_suites:
-            print(f'ERROR: only {suite_count} of {expected_suites} expected suites ran — suite discovery was truncated (#882).')
-            # Normalize BOTH sides by stripping an optional test_ prefix:
-            # suite_name() usually drops it (test_clients.gd -> 'clients')
-            # but not always (test_runner.gd -> 'test_runner'), and naming
-            # the wrong missing suite would misdirect the debugging.
-            def stripped(name):
-                return name[5:] if name.startswith('test_') else name
-            expected_names = set(os.environ.get('EXPECTED_SUITE_NAMES', '').split())
-            missing = sorted(expected_names - {stripped(s) for s in suites_run})
-            if missing:
-                print('  suites with no matching run (filename-derived names): ' + ', '.join(missing))
-            print('  Re-import and restart the editor, then re-run.')
-            sys.exit(1)
-        min_tests = int(os.environ.get('GODOT_AI_MIN_TESTS', '0') or 0)
-        if min_tests and total < min_tests:
-            print(f'ERROR: total {total} is below the GODOT_AI_MIN_TESTS floor of {min_tests} — in-suite discovery was truncated (#882).')
-            print('  If tests were legitimately removed, lower GODOT_AI_MIN_TESTS in .github/workflows/ci.yml.')
-            sys.exit(1)
-        if expected_suites:
-            print(f'Suites: {suite_count}/{expected_suites} expected' + (f'; total floor: {min_tests}' if min_tests else ''))
-        break
-else:
-    print('ERROR: No valid response from test_run')
-    print(f'Raw response: {raw[:500]}')
+content = json.load(sys.stdin)
+passed = content.get('passed', 0)
+failed = content.get('failed', 0)
+total = content.get('total', 0)
+load_errors = content.get('load_errors', []) or []
+skipped = content.get('skipped', 0)
+print(f'Godot tests: {passed}/{total} passed, {failed} failed, {skipped} skipped')
+if content.get('failures'):
+    for f in content['failures']:
+        print(f'  FAIL: {f[\"suite\"]}.{f[\"test\"]}: {f[\"message\"]}')
+if load_errors:
+    print(f'  LOAD ERRORS: {len(load_errors)} test file(s) failed to parse:')
+    for le in load_errors:
+        print(f'    - {le}')
+if failed > 0:
     sys.exit(1)
+if load_errors:
+    print('ERROR: At least one test file failed to load (parse error?). Treating as failure so silent test-loss does not slip past CI.')
+    sys.exit(1)
+if total == 0:
+    print('ERROR: No tests ran — Godot plugin may not have connected')
+    sys.exit(1)
+# #882: fail on partial discovery, not just all-or-nothing loss.
+expected_suites = int(os.environ.get('EXPECTED_SUITES', '0') or 0)
+suite_count = content.get('suite_count', 0)
+suites_run = content.get('suites_run', []) or []
+if expected_suites and suite_count < expected_suites:
+    print(f'ERROR: only {suite_count} of {expected_suites} expected suites ran — suite discovery was truncated (#882).')
+    # Normalize BOTH sides by stripping an optional test_ prefix:
+    # suite_name() usually drops it (test_clients.gd -> 'clients')
+    # but not always (test_runner.gd -> 'test_runner'), and naming
+    # the wrong missing suite would misdirect the debugging.
+    def stripped(name):
+        return name[5:] if name.startswith('test_') else name
+    expected_names = set(os.environ.get('EXPECTED_SUITE_NAMES', '').split())
+    missing = sorted(expected_names - {stripped(s) for s in suites_run})
+    if missing:
+        print('  suites with no matching run (filename-derived names): ' + ', '.join(missing))
+    print('  Re-import and restart the editor, then re-run.')
+    sys.exit(1)
+min_tests = int(os.environ.get('GODOT_AI_MIN_TESTS', '0') or 0)
+if min_tests and total < min_tests:
+    print(f'ERROR: total {total} is below the GODOT_AI_MIN_TESTS floor of {min_tests} — in-suite discovery was truncated (#882).')
+    print('  If tests were legitimately removed, lower GODOT_AI_MIN_TESTS in .github/workflows/ci.yml.')
+    sys.exit(1)
+if expected_suites:
+    print(f'Suites: {suite_count}/{expected_suites} expected' + (f'; total floor: {min_tests}' if min_tests else ''))
 "
