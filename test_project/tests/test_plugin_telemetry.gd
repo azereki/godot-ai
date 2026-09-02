@@ -66,6 +66,16 @@ func _clear_telemetry_env_vars() -> void:
 	OS.unset_environment(_TENV2)
 
 
+## Frames the telemetry pipeline actually recorded, ignoring the opt-out
+## control frame that rides the same connection.
+func _plugin_event_count(conn) -> int:
+	var count := 0
+	for entry in conn.sent:
+		if str(entry.get("event", "")) == "plugin_event":
+			count += 1
+	return count
+
+
 # ----- opt-out -----
 
 func test_disabled_when_editor_setting_is_false() -> void:
@@ -191,7 +201,12 @@ func test_buffered_events_flush_when_connection_signal_fires() -> void:
 	conn.flip_connected(true)
 
 	assert_eq(t._test_pending_count(), 0, "Buffer must drain on connection_state_changed(true)")
-	assert_eq(conn.sent.size(), 2, "Both buffered events should ship without a third record_event call")
+	## Count plugin_event frames rather than everything on the wire: the same
+	## signal also asserts a telemetry opt-out when this editor is opted out
+	## (#913), which CI always is via GODOT_AI_DISABLE_TELEMETRY. That frame
+	## is not a buffered record and must not be counted as one.
+	assert_eq(_plugin_event_count(conn), 2,
+		"Both buffered events should ship without a third record_event call")
 
 
 func test_buffer_drops_oldest_at_cap() -> void:
