@@ -26,12 +26,12 @@ from typing import Any
 
 import pytest
 
-from godot_ai.server import create_server
 from godot_ai.tools._meta_tool import (
     MANAGE_TOOL_HANDLERS,
     MANAGE_TOOL_OPS,
     MANAGE_TOOL_RESOURCE_FORMS,
 )
+from tests.conftest import create_test_server as create_server
 
 
 @pytest.fixture(scope="module")

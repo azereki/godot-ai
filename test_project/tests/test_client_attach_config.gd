@@ -144,6 +144,16 @@ func test_launch_resolver_uvx_is_strict_and_pinned() -> void:
 	assert_eq(
 		launch.get("args", []).slice(3),
 		[
+			"--isolated",
+			"--no-config",
+			"--no-env-file",
+			"--no-sources",
+			"--no-build",
+			"--index-strategy", "first-index",
+			"--keyring-provider", "disabled",
+			"--index", "https://pypi.org/simple",
+			"--default-index", "https://pypi.org/simple",
+			"--find-links", "https://pypi.org/simple/godot-ai/",
 			"--link-mode", "copy",
 			"--from", "godot-ai==3.0.6",
 			"godot-ai", "attach",
@@ -230,7 +240,9 @@ func test_non_windows_launch_shape_stays_direct() -> void:
 	)
 	assert_true(bool(launch.get("ok", false)))
 	assert_eq(launch.get("command"), "/home/agent/.local/bin/uvx")
-	assert_eq(launch.get("args", [])[0], "--link-mode")
+	var args: Array = launch.get("args", [])
+	assert_eq(args[0], "--isolated")
+	assert_eq(args[args.find("--link-mode") + 1], "copy")
 
 
 func test_launch_for_client_unwraps_pythonw_for_opted_out_clients() -> void:
@@ -246,7 +258,9 @@ func test_launch_for_client_unwraps_pythonw_for_opted_out_clients() -> void:
 	assert_eq(launch.get("command"), "C:/Python313/pythonw.exe")
 	var console := McpClientConfigurator.launch_for_client(antigravity, launch)
 	assert_eq(console.get("command"), "C:/Tools/uv/uvx.exe")
-	assert_eq(console.get("args", [])[0], "--link-mode")
+	var args: Array = console.get("args", [])
+	assert_eq(args[0], "--isolated")
+	assert_eq(args[args.find("--link-mode") + 1], "copy")
 	assert_false(
 		str(console.get("args", [])).contains("creationflags"),
 		"console launch must not carry the pythonw bootstrap",
@@ -605,7 +619,7 @@ func test_legacy_url_is_mismatch_and_missing_launcher_is_error_without_write() -
 	var launch := _uvx_launch()
 	assert_eq(McpTomlStrategy.check_status(client, "godot-ai", "", launch), McpClient.Status.CONFIGURED_MISMATCH)
 
-	var unavailable := {"ok": false, "error": "Install uv or use URL mode."}
+	var unavailable := {"ok": false, "error": "Install uv."}
 	var details := McpTomlStrategy.check_status_details(client, "godot-ai", "", unavailable)
 	assert_eq(details.get("status"), McpClient.Status.ERROR)
 	assert_contains(str(details.get("error_msg", "")), "Install uv")
@@ -614,7 +628,7 @@ func test_legacy_url_is_mismatch_and_missing_launcher_is_error_without_write() -
 	assert_eq(_read(path), original, "failed discovery must leave the config byte-identical")
 
 
-func test_codex_manual_command_shows_attach_and_advanced_url_fallback() -> void:
+func test_codex_manual_command_shows_only_authenticated_attach() -> void:
 	var client := _codex_client("C:/Users/Agent/.codex/config.toml")
 	var manual := McpManualCommand.build(
 		client,
@@ -625,10 +639,8 @@ func test_codex_manual_command_shows_attach_and_advanced_url_fallback() -> void:
 	)
 	assert_contains(manual, "command = ")
 	assert_contains(manual, '"attach"')
-	assert_contains(manual, "Advanced fallback")
-	assert_contains(manual, "replace the command/args block above")
-	assert_contains(manual, "never configure both shapes together")
-	assert_contains(manual, 'url = "http://127.0.0.1:8123/mcp"')
+	assert_false(manual.contains("Advanced fallback"))
+	assert_false(manual.contains('url = "http://127.0.0.1:8123/mcp"'))
 
 
 func test_toml_command_transport_rejects_unsupported_values() -> void:
@@ -676,9 +688,6 @@ func test_registry_wide_attach_shape_declarations() -> void:
 		## DeepSeek Harness nests the launch under the loader entry's `config`
 		## and pins `transport` next to command/args (see _dsh_strategy.gd).
 		"deepseek_harness": [McpClient.CommandShape.FLAT, "stdio", ["url"]],
-		## cherry_studio deliberately stays URL-mode: its mcp_servers.json is
-		## not read by the app at all (SQLite-backed) — see #838 follow-up.
-		"cherry_studio": [McpClient.CommandShape.NONE, null, []],
 	}
 	for id in McpClientRegistry.ids():
 		assert_true(expectations.has(String(id)), "client %s has no #838 shape expectation — add one" % id)
@@ -694,8 +703,7 @@ func test_registry_wide_attach_shape_declarations() -> void:
 				client.command_legacy_keys.has(String(legacy_key)),
 				"%s must scrub legacy key %s" % [id, legacy_key],
 			)
-		if client.command_shape != McpClient.CommandShape.NONE and String(id) != "claude_desktop":
-			assert_true(client.command_supports_url_fallback, "%s keeps a URL fallback" % id)
+		assert_ne(client.command_shape, McpClient.CommandShape.NONE, "%s must use authenticated attach" % id)
 
 
 func test_cli_format_args_expands_launch_tokens_whole_element_only() -> void:
@@ -1120,7 +1128,19 @@ func test_prewarm_argv_pins_exact_version_and_exits_via_version_flag() -> void:
 	## server (#890).
 	assert_eq(
 		McpClientConfigurator.prewarm_server_package_argv("3.2.0"),
-		["--from", "godot-ai==3.2.0", "godot-ai", "--version"] as Array[String]
+		[
+			"--isolated",
+			"--no-config",
+			"--no-env-file",
+			"--no-sources",
+			"--no-build",
+			"--index-strategy", "first-index",
+			"--keyring-provider", "disabled",
+			"--index", "https://pypi.org/simple",
+			"--default-index", "https://pypi.org/simple",
+			"--find-links", "https://pypi.org/simple/godot-ai/",
+			"--from", "godot-ai==3.2.0", "godot-ai", "--version",
+		] as Array[String]
 	)
 
 
@@ -1269,7 +1289,6 @@ func _pi_clone(path: String) -> McpClient:
 	client.command_user_fields = registered.command_user_fields
 	client.command_timeout_fields = registered.command_timeout_fields
 	client.command_env_legacy_keys = registered.command_env_legacy_keys
-	client.command_supports_url_fallback = registered.command_supports_url_fallback
 	return client
 
 
@@ -1291,7 +1310,6 @@ func _claude_cli_clone(path: String) -> McpClient:
 	client.command_transport_value = registered.command_transport_value
 	client.command_legacy_keys = registered.command_legacy_keys
 	client.command_user_fields = registered.command_user_fields
-	client.command_supports_url_fallback = registered.command_supports_url_fallback
 	return client
 
 
@@ -1305,7 +1323,6 @@ func _grok_clone(path: String) -> McpClient:
 	client.toml_section_path = registered.toml_section_path
 	client.toml_legacy_section_aliases = registered.toml_legacy_section_aliases
 	client.command_shape = registered.command_shape
-	client.command_supports_url_fallback = registered.command_supports_url_fallback
 	client.command_legacy_keys = registered.command_legacy_keys
 	client.command_initial_fields = registered.command_initial_fields.duplicate(true)
 	client.command_user_fields = registered.command_user_fields
@@ -1355,7 +1372,6 @@ func _codex_client(path: String) -> McpClient:
 	client.toml_section_path = registered.toml_section_path
 	client.toml_legacy_section_aliases = registered.toml_legacy_section_aliases
 	client.command_shape = registered.command_shape
-	client.command_supports_url_fallback = registered.command_supports_url_fallback
 	client.command_legacy_keys = registered.command_legacy_keys
 	client.command_initial_fields = registered.command_initial_fields.duplicate(true)
 	client.command_user_fields = registered.command_user_fields

@@ -21,15 +21,52 @@ import os
 os.environ.setdefault("GODOT_AI_DISABLE_TELEMETRY", "true")
 
 import asyncio
+import hmac
 import json
+import secrets
 import socket
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 import websockets
 
+from godot_ai.protocol.envelope import WS_PROTOCOL_VERSION
 from godot_ai.sessions.registry import SessionRegistry
-from godot_ai.transport.websocket import GodotWebSocketServer
+from godot_ai.transport.capability import LaunchCapabilities
+from godot_ai.transport.websocket import (
+    GodotWebSocketServer,
+    websocket_client_proof,
+    websocket_server_proof,
+)
+
+TEST_WS_CAPABILITY = "0123456789abcdef" * 4
+TEST_HTTP_CAPABILITY = "test-http-capability-0123456789abcdef"
+TEST_TRANSPORT_CAPABILITIES = LaunchCapabilities(
+    http=TEST_HTTP_CAPABILITY,
+    websocket=TEST_WS_CAPABILITY,
+)
+TEST_HTTP_AUTH_HEADERS = {"Authorization": f"Bearer {TEST_HTTP_CAPABILITY}"}
+
+
+def isolate_capability_directory(monkeypatch, root) -> Path:
+    """Point capability records at test-owned storage on every platform."""
+
+    root = Path(root)
+    if os.name == "nt":
+        monkeypatch.delenv("GODOT_AI_CAPABILITY_DIR", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", str(root))
+        return root / "godot-ai" / "capabilities"
+    monkeypatch.setenv("GODOT_AI_CAPABILITY_DIR", str(root))
+    return root
+
+
+def create_test_server(**kwargs):
+    """Build a server with the suite's explicit, instance-bound capabilities."""
+
+    from godot_ai.server import create_server
+
+    return create_server(capabilities=TEST_TRANSPORT_CAPABILITIES, **kwargs)
 
 
 def allocate_free_ports(count: int) -> list[int]:
@@ -82,8 +119,130 @@ async def drain_handshake_ack(ws) -> dict:
     except asyncio.TimeoutError:
         pytest.fail("no handshake_ack within 2s — the ack contract is mandatory")
     ack = json.loads(ack_raw)
+    assert set(ack) == {"type", "protocol_version", "server_version"}
     assert ack.get("type") == "handshake_ack", f"expected handshake_ack, got {ack!r}"
+    assert ack.get("protocol_version") == WS_PROTOCOL_VERSION
     return ack
+
+
+async def send_auth_hello(ws, *, client_nonce: str | None = None) -> str:
+    """Send the metadata-free first v4 frame and return its client nonce."""
+
+    nonce = client_nonce or secrets.token_hex(32)
+    await ws.send(
+        json.dumps(
+            {
+                "type": "auth_hello",
+                "protocol_version": WS_PROTOCOL_VERSION,
+                "client_nonce": nonce,
+            }
+        )
+    )
+    return nonce
+
+
+async def receive_auth_challenge(ws, *, capability: str, client_nonce: str) -> dict:
+    """Receive and verify the server before test code discloses metadata."""
+
+    raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+    challenge = json.loads(raw)
+    assert set(challenge) == {
+        "type",
+        "protocol_version",
+        "client_nonce",
+        "server_nonce",
+        "server_version",
+        "server_proof",
+    }
+    assert challenge["type"] == "auth_challenge"
+    assert challenge["protocol_version"] == WS_PROTOCOL_VERSION
+    assert challenge["client_nonce"] == client_nonce
+    expected = websocket_server_proof(
+        capability,
+        client_nonce=client_nonce,
+        server_nonce=challenge["server_nonce"],
+        server_version=challenge["server_version"],
+    )
+    assert hmac.compare_digest(challenge["server_proof"], expected)
+    return challenge
+
+
+def build_auth_response(
+    challenge: dict,
+    *,
+    capability: str,
+    session_id: str,
+    godot_version: str = "4.7.0",
+    project_path: str = "/tmp/test_project",
+    plugin_version: str = "4.0.0",
+    readiness: str = "ready",
+    editor_pid: int = 0,
+    server_launch_mode: str = "unknown",
+) -> dict:
+    """Build the one authenticated v4 metadata frame."""
+
+    response = {
+        "type": "auth_response",
+        "protocol_version": WS_PROTOCOL_VERSION,
+        "client_nonce": challenge["client_nonce"],
+        "server_nonce": challenge["server_nonce"],
+        "session_id": session_id,
+        "godot_version": godot_version,
+        "project_path": project_path,
+        "plugin_version": plugin_version,
+        "readiness": readiness,
+        "editor_pid": editor_pid,
+        "server_launch_mode": server_launch_mode,
+    }
+    response["client_proof"] = websocket_client_proof(
+        capability,
+        client_nonce=response["client_nonce"],
+        server_nonce=response["server_nonce"],
+        session_id=session_id,
+        godot_version=godot_version,
+        project_path=project_path,
+        plugin_version=plugin_version,
+        readiness=readiness,
+        editor_pid=editor_pid,
+        server_launch_mode=server_launch_mode,
+        server_version=challenge["server_version"],
+    )
+    return response
+
+
+async def perform_v4_handshake(
+    ws,
+    *,
+    capability: str = TEST_WS_CAPABILITY,
+    session_id: str = "test-session",
+    godot_version: str = "4.7.0",
+    project_path: str = "/tmp/test_project",
+    plugin_version: str = "4.0.0",
+    readiness: str = "ready",
+    editor_pid: int = 0,
+    server_launch_mode: str = "unknown",
+) -> dict:
+    """Perform and verify the complete v4 editor handshake."""
+
+    client_nonce = await send_auth_hello(ws)
+    challenge = await receive_auth_challenge(
+        ws,
+        capability=capability,
+        client_nonce=client_nonce,
+    )
+    response = build_auth_response(
+        challenge,
+        capability=capability,
+        session_id=session_id,
+        godot_version=godot_version,
+        project_path=project_path,
+        plugin_version=plugin_version,
+        readiness=readiness,
+        editor_pid=editor_pid,
+        server_launch_mode=server_launch_mode,
+    )
+    await ws.send(json.dumps(response))
+    return await drain_handshake_ack(ws)
 
 
 @dataclass
@@ -102,15 +261,11 @@ class MockGodotPlugin:
         request_id: str,
         data: dict,
         status: str = "ok",
-        readiness: str | None = None,
+        readiness: str = "ready",
         error_watermark: dict[str, int] | None = None,
     ) -> None:
         msg: dict = {"request_id": request_id, "status": status, "data": data}
-        ## Mirror the real plugin: every dispatcher response carries a live
-        ## `readiness` envelope field. Tests that pass `readiness=None`
-        ## simulate an old plugin pre-dating the per-envelope self-heal.
-        if readiness is not None:
-            msg["readiness"] = readiness
+        msg["readiness"] = readiness
         if error_watermark is not None:
             msg["error_watermark"] = error_watermark
         await self.ws.send(json.dumps(msg))
@@ -121,7 +276,7 @@ class MockGodotPlugin:
         code: str,
         message: str,
         data: dict | None = None,
-        readiness: str | None = None,
+        readiness: str = "ready",
         error_watermark: dict[str, int] | None = None,
     ) -> None:
         msg: dict = {
@@ -130,8 +285,7 @@ class MockGodotPlugin:
             "data": {},
             "error": {"code": code, "message": message, "data": data or {}},
         }
-        if readiness is not None:
-            msg["readiness"] = readiness
+        msg["readiness"] = readiness
         if error_watermark is not None:
             msg["error_watermark"] = error_watermark
         await self.ws.send(json.dumps(msg))
@@ -151,68 +305,52 @@ class ServerHarness:
     registry: SessionRegistry
     server: GodotWebSocketServer
     port: int
+    capability: str = TEST_WS_CAPABILITY
     _task: asyncio.Task = field(repr=False, default=None)
 
     async def connect_plugin(
         self,
         session_id: str = "test-session",
-        godot_version: str = "4.4.1",
+        godot_version: str = "4.7.0",
         project_path: str = "/tmp/test_project",
-        plugin_version: str = "0.0.1",
+        plugin_version: str = "4.0.0",
         readiness: str = "ready",
         editor_pid: int = 0,
-        server_launch_mode: str | None = None,
-        auth_token: str | None = None,
+        server_launch_mode: str = "unknown",
+        capability: str | None = None,
     ) -> MockGodotPlugin:
         ws = await websockets.connect(f"ws://127.0.0.1:{self.port}")
-        handshake = {
-            "type": "handshake",
-            "session_id": session_id,
-            "godot_version": godot_version,
-            "project_path": project_path,
-            "plugin_version": plugin_version,
-            "protocol_version": 1,
-            "readiness": readiness,
-            "editor_pid": editor_pid,
-        }
-        ## Older plugins don't send server_launch_mode at all; keep the field
-        ## absent when caller passes None so tests can exercise both the
-        ## legacy ("falls through to 'unknown'") and explicit paths.
-        if server_launch_mode is not None:
-            handshake["server_launch_mode"] = server_launch_mode
-        ## Same absent-vs-present distinction for the #690 auth token: the
-        ## plugin omits the field entirely when it has no token.
-        if auth_token is not None:
-            handshake["auth_token"] = auth_token
-        await ws.send(json.dumps(handshake))
-        # Give the server a moment to process the handshake
-        await asyncio.sleep(0.05)
-        await drain_handshake_ack(ws)
+        await perform_v4_handshake(
+            ws,
+            capability=self.capability if capability is None else capability,
+            session_id=session_id,
+            godot_version=godot_version,
+            project_path=project_path,
+            plugin_version=plugin_version,
+            readiness=readiness,
+            editor_pid=editor_pid,
+            server_launch_mode=server_launch_mode,
+        )
         return MockGodotPlugin(ws=ws, session_id=session_id)
 
 
 @pytest.fixture
-async def mcp_stack(mcp_ws_port):
+async def mcp_stack(mcp_ws_port, monkeypatch, tmp_path):
     """Full MCP server + mock Godot plugin connected via FastMCP Client."""
     from fastmcp import Client
 
     from godot_ai.server import create_server
 
     port = mcp_ws_port
-    mcp = create_server(ws_port=port)
+    isolate_capability_directory(monkeypatch, tmp_path / "capabilities")
+    mcp = create_server(
+        ws_port=port,
+        http_port=allocate_free_port(),
+        capabilities=TEST_TRANSPORT_CAPABILITIES,
+    )
     async with Client(mcp) as client:
         ws = await websockets.connect(f"ws://127.0.0.1:{port}")
-        handshake = {
-            "type": "handshake",
-            "session_id": "mcp-test",
-            "godot_version": "4.4.1",
-            "project_path": "/tmp/test_project",
-            "plugin_version": "0.0.1",
-            "protocol_version": 1,
-        }
-        await ws.send(json.dumps(handshake))
-        await asyncio.sleep(0.05)
-        await drain_handshake_ack(ws)
+        await perform_v4_handshake(ws, session_id="mcp-test")
         plugin = MockGodotPlugin(ws=ws, session_id="mcp-test")
         yield client, plugin
         await plugin.close()
@@ -223,11 +361,17 @@ async def harness():
     """Spin up a GodotWebSocketServer on a free port, yield a ServerHarness, tear down."""
     registry = SessionRegistry()
     port = allocate_free_port()
-    server = GodotWebSocketServer(registry, port=port)
+    server = GodotWebSocketServer(registry, port=port, auth_token=TEST_WS_CAPABILITY)
     task = asyncio.create_task(server.start())
-    await asyncio.sleep(0.1)  # let server bind
+    await server.wait_until_ready()
 
-    h = ServerHarness(registry=registry, server=server, port=port, _task=task)
+    h = ServerHarness(
+        registry=registry,
+        server=server,
+        port=port,
+        capability=TEST_WS_CAPABILITY,
+        _task=task,
+    )
     yield h
 
     task.cancel()

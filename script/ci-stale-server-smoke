@@ -1,1165 +1,468 @@
 #!/usr/bin/env python3
-"""Live smoke for the plugin's port-8000 conflict handling. Three scenarios,
-selected by `--mode`:
+"""Live v4 lifecycle smoke: detect occupants without ambient kill authority.
 
-`--mode stale` (default) — *recoverable* path:
-  Plants a synthetic godot-ai server simulator (different version) that brands
-  itself as godot-ai on `/godot-ai/status`, launches Godot headless against
-  test_project/, and asserts the plugin's `recover_strong_port_occupant` path
-  observably:
-
-    1. Detects the version mismatch.
-    2. Logs `MCP | strong proof: <name>`.
-    3. Logs `MCP | killed pids [...]`.
-    4. Spawns its own server (`/godot-ai/status` reports the plugin version).
-    5. The simulator PID is gone.
-
-`--mode foreign` — *non-recoverable* path (mirror image):
-  Plants a plain, non-godot-ai listener that 404s on `/godot-ai/status`. The
-  plugin gets no strong proof, so it must classify the port as a foreign
-  occupant and land in terminal `INCOMPATIBLE` with `can_recover_incompatible
-  == false`. Asserts the plugin observably:
-
-    1. Logs `MCP | proof: (none)` (no ownership proof → not recoverable).
-    2. Logs the suggested-free-port diagnosis (names a concrete alternate port).
-    3. NEVER logs `MCP | strong proof:` or `MCP | killed pids` — it must not
-       try to reclaim a port it can't prove it owns.
-    4. Leaves the planted listener's PID alive.
-
-`--mode stale-compatible-reload` — *compatible but externally owned* path:
-  Starts a real current-version external godot-ai server, plants a matching-
-  version managed record naming a dead PID, and launches Godot headless. It
-  asserts the plugin:
-
-    1. Adopts the compatible server as external, never managed.
-    2. Reloads through MCP and registers a distinct replacement session.
-    3. Answers an editor-state probe through the replacement bridge.
-    4. Never kills/replaces the external server during teardown or reload.
-
-Backfills the automated coverage gap: the unit tests in test_plugin_lifecycle.gd
-and test_dock.gd mock all OS interactions, and `script/manual-orphan-test`
-exercises the real kill path but is a manual operator helper. This script runs
-the real per-OS classification + kill / cmdline-brand machinery in CI on every
-OS, so a regression is caught before merge.
-
-Windows bind nuance (#679): both planted occupants bind `127.0.0.1`
-EXPLICITLY, and that is load-bearing. Windows (no `SO_EXCLUSIVEADDRUSE` on
-either side) allows a specific-address `127.0.0.1` bind to coexist with a
-foreign process's wildcard `0.0.0.0` bind on the same port — so a squatter
-bound to the wildcard address does NOT produce a conflict: the plugin's server
-binds loopback alongside it and startup proceeds normally. Only a loopback
-squatter reproduces the conflict path on Windows. Keep the planted listeners
-on `127.0.0.1`, and bind loopback explicitly in any manual repro too.
+``stale`` plants an authenticated, mismatched godot-ai endpoint and proves the
+editor probes it but leaves it alive. ``foreign`` plants an unidentifiable
+listener and proves it is also left alone. ``stale-compatible-reload`` starts a
+real capability-pair server, proves external adoption, reloads the plugin, and
+proves both the replacement session and external process survive.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import errno
 import json
 import os
 import platform
+import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
 
 ROOT = Path(__file__).resolve().parent.parent
-TEST_PROJECT = ROOT / "test_project"
-PORT = 8000
-WS_PORT = 9500
+DEFAULT_PROJECT = ROOT / "test_project"
+HTTP_PORT = int(os.environ.get("GODOT_AI_HTTP_PORT", "8000"))
+WS_PORT = int(os.environ.get("GODOT_AI_WS_PORT", "9500"))
 STALE_VERSION = "0.0.0-stale"
-STATUS_URL = f"http://127.0.0.1:{PORT}/godot-ai/status"
-MCP_URL = f"http://127.0.0.1:{PORT}/mcp"
-EXPECTED_PROOF_NAMES = ("managed_record", "pidfile_listener", "status_matches_record")
-LOG_LINES_TIMEOUT = 60.0
-FRESH_STATUS_TIMEOUT = 30.0
-
-DISCOVER_USER_DIR_GD = '''\
-extends SceneTree
-
-func _initialize() -> void:
-\tprint("USER_DATA_DIR=" + OS.get_user_data_dir())
-\tquit()
-'''
-
-
-MANAGED_RECORD_GD = '''\
-@tool
-extends EditorPlugin
-
-func _enter_tree() -> void:
-\tvar es := EditorInterface.get_editor_settings()
-\tif es == null:
-\t\tpush_error("MANAGED_RECORD_WRITE_FAILED: no EditorSettings")
-\t\tget_tree().quit(1)
-\t\treturn
-\tif OS.has_environment("GODOT_AI_RECORD_READBACK"):
-\t\tvar record := {
-\t\t\t"pid": int(es.get_setting("godot_ai/managed_server_pid")),
-\t\t\t"version": str(es.get_setting("godot_ai/managed_server_version")),
-\t\t\t"ws_port": int(es.get_setting("godot_ai/managed_server_ws_port")),
-\t\t\t"ws_token": str(es.get_setting("godot_ai/managed_server_ws_token")),
-\t\t}
-\t\tprint("MANAGED_RECORD_READBACK " + JSON.stringify(record))
-\t\tget_tree().quit()
-\t\treturn
-\tes.set_setting("godot_ai/managed_server_pid", __PID__)
-\tes.set_setting("godot_ai/managed_server_version", __VERSION__)
-\tes.set_setting("godot_ai/managed_server_ws_port", __WS_PORT__)
-\tes.set_setting("godot_ai/managed_server_ws_token", "")
-\tprint("MANAGED_RECORD_WRITTEN pid=__PID__ version=" + __VERSION__)
-\tget_tree().quit()
-'''
-
-
-SIM_SOURCE = '''\
-"""Stale godot-ai server simulator for ci-stale-server-smoke."""
-import argparse
-import json
-import os
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from socketserver import TCPServer
-
-ap = argparse.ArgumentParser()
-ap.add_argument("--transport", default="streamable-http")
-ap.add_argument("--port", type=int, default=8000)
-ap.add_argument("--ws-port", type=int, default=9500)
-ap.add_argument("--pid-file", required=True)
-ap.add_argument("--fake-version", default="0.0.0-stale")
-args, _ = ap.parse_known_args()
-
-os.makedirs(os.path.dirname(args.pid_file), exist_ok=True)
-with open(args.pid_file, "w", encoding="utf-8") as f:
-    f.write(str(os.getpid()))
-
-
-class H(BaseHTTPRequestHandler):
-    def log_message(self, *a, **kw):  # silence
-        pass
-
-    def do_GET(self):
-        if self.path == "/godot-ai/status":
-            body = json.dumps({
-                "name": "godot-ai",
-                "version": args.fake_version,
-                "ws_port": args.ws_port,
-            }).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        self.send_response(404)
-        self.end_headers()
-
-
-class FastBindServer(ThreadingHTTPServer):
-    """Skip HTTPServer's reverse-DNS lookup. The stock server_bind calls
-    socket.getfqdn(host) to set self.server_name — on macOS CI runners
-    with no PTR for 127.0.0.1 and unreachable upstream DNS, that hangs
-    ~30s before falling back. We don't need server_name; route by path."""
-    def server_bind(self):
-        TCPServer.server_bind(self)
-        host, port = self.server_address[:2]
-        self.server_name = host
-        self.server_port = port
-
-
-# Bind FIRST so the "listening" print isn't a lie — the smoke polls
-# /godot-ai/status immediately after seeing it. Loopback EXPLICITLY, not
-# the wildcard address: on Windows a 0.0.0.0 bind coexists with the
-# plugin's 127.0.0.1 bind and no conflict ever materializes (#679).
-server = FastBindServer(("127.0.0.1", args.port), H)
-print(f"stale-sim pid={os.getpid()} listening on :{args.port}", flush=True)
-server.serve_forever()
-'''
-
-
-FOREIGN_SOURCE = '''\
-"""Plain, non-godot-ai listener for `ci-stale-server-smoke --mode foreign`.
-
-The mirror image of the stale godot-ai simulator: it holds the HTTP port but
-does NOT identify as godot-ai — every path, including /godot-ai/status, returns
-404. The plugin therefore gets no strong proof of ownership and must classify
-the port as a foreign occupant: terminal INCOMPATIBLE, no kill attempt.
-
-It writes NO pidfile and NO managed-server record on purpose; those are the
-ownership signals the plugin would (correctly) refuse to fabricate for a port
-it doesn't own."""
-import argparse
-import os
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from socketserver import TCPServer
-
-# Mirror script/_ci_env.sh: smoke-run editors/servers must not send
-# telemetry from CI (audit backlog). setdefault keeps explicit overrides.
-os.environ.setdefault("GODOT_AI_DISABLE_TELEMETRY", "true")
-
-ap = argparse.ArgumentParser()
-ap.add_argument("--port", type=int, default=8000)
-args, _ = ap.parse_known_args()
-
-
-class H(BaseHTTPRequestHandler):
-    def log_message(self, *a, **kw):  # silence
-        pass
-
-    def do_GET(self):
-        # 404 everything — a foreign service does not answer /godot-ai/status.
-        self.send_response(404)
-        self.end_headers()
-
-
-class FastBindServer(ThreadingHTTPServer):
-    """Skip HTTPServer's reverse-DNS lookup (hangs ~30s on macOS CI runners
-    with no PTR for 127.0.0.1). We don't need server_name; 404 by default."""
-    def server_bind(self):
-        TCPServer.server_bind(self)
-        host, port = self.server_address[:2]
-        self.server_name = host
-        self.server_port = port
-
-
-# Bind FIRST so the "listening" print isn't a lie — the smoke polls the port
-# immediately after seeing it. Loopback EXPLICITLY, not the wildcard
-# address: on Windows a 0.0.0.0 bind coexists with the plugin's 127.0.0.1
-# bind and the conflict path is never exercised (#679).
-server = FastBindServer(("127.0.0.1", args.port), H)
-print(f"foreign-sim pid={os.getpid()} listening on :{args.port}", flush=True)
-server.serve_forever()
-'''
-
-
-# Foreign-occupant guard: after the non-recoverable diagnosis lands, watch this
-# long for a (forbidden) kill attempt before declaring the occupant safe.
-KILL_GUARD_WINDOW = 8.0
+OCCUPANT_READY_MARKER = "smoke occupant bound"
+PROBE_MARKER = "authenticated stale status probe"
 
 
 class SmokeError(RuntimeError):
     pass
 
 
-def port_in_use(port: int) -> bool:
-    """True when something is bound on 127.0.0.1:`port`, probed by BINDING —
-    the exact operation the planted sim/listener will perform. Connect-based
-    probing is unusable here: GitHub's Windows runners silently drop SYNs to
-    closed loopback ports (no RST), so a connect probe can never distinguish
-    free from occupied and the drain stalls to its timeout (#682 CI).
+def find_godot() -> str:
+    for candidate in (
+        os.environ.get("GODOT_BIN"),
+        os.environ.get("GODOT4_BIN"),
+        ## setup-godot exports these extensionless launcher paths. Git Bash
+        ## resolves them, but Windows shutil.which("godot") does not.
+        os.environ.get("GODOT"),
+        os.environ.get("GODOT4"),
+        "godot",
+        "Godot",
+    ):
+        if candidate and (shutil.which(candidate) or Path(candidate).is_file()):
+            return candidate
+    raise SmokeError("Godot not found; set GODOT_BIN")
 
-    Mirrors `preflight_check_port` in src/godot_ai/__init__.py: SO_REUSEADDR
-    on POSIX so a just-freed port's TIME_WAIT connections don't read as an
-    occupant (the sim's HTTPServer sets allow_reuse_address too), skipped on
-    Windows where SO_REUSEADDR means "hijack the active listener". Only
-    EADDRINUSE counts as occupied — any other bind failure (EACCES, winnat
-    exclusion ranges) is not a drainable occupant, and the plant will surface
-    its own honest failure for those.
 
-    Known Windows residual: without SO_REUSEADDR, server-side TIME_WAIT
-    sockets (connections the previous run's server closed first) also
-    bind-fail EADDRINUSE, and Windows' TIME_WAIT default (~4 min) exceeds
-    the 150s drain timeout. If the Windows smoke ever flakes on
-    "port(s) still occupied" with occupant "unknown", look here first."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+def plugin_version() -> str:
+    cfg = ROOT / "plugin" / "addons" / "godot_ai" / "plugin.cfg"
+    for line in cfg.read_text(encoding="utf-8").splitlines():
+        if line.startswith("version="):
+            return line.split("=", 1)[1].strip().strip('"')
+    raise SmokeError(f"missing version in {cfg}")
+
+
+def port_is_free(port: int) -> bool:
+    with socket.socket() as probe:
         if os.name != "nt":
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            s.bind(("127.0.0.1", port))
-        except OSError as exc:
-            return (
-                exc.errno == errno.EADDRINUSE
-                or exc.errno == 10048
-                or getattr(exc, "winerror", None) == 10048
-            )
-    return False
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
 
 
-def drain_leftover_servers(timeout_s: float = 150.0) -> None:
-    """Wait until the HTTP and WS ports are actually free before planting the
-    sim/listener (#671). A run started right after a previous run can race that
-    run's plugin-spawned server: it lingers in its orphan-reap window (owner-pid
-    poll ~5s, idle grace up to 120s) and, if still bound when our editor starts,
-    gets *adopted* as a live compatible godot-ai server — so the planted
-    occupant is never diagnosed and the mode's assertions can't match.
-
-    We only wait — never kill. The leftover is marked plugin-spawned with a
-    dead owner, so its own reaper takes it down; a genuinely foreign occupant
-    that never frees the port is a real environment problem the operator has to
-    resolve, and gets a clear failure here instead of a confusing one later."""
-    deadline = time.monotonic() + timeout_s
-    reported = False
+def wait_for_free_ports(timeout: float = 150.0) -> None:
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        busy = [p for p in (PORT, WS_PORT) if port_in_use(p)]
-        if not busy:
-            if reported:
-                print("drain: ports are free, continuing")
+        if port_is_free(HTTP_PORT) and port_is_free(WS_PORT):
             return
-        if not reported:
-            reported = True
-            occupant = "unknown"
-            try:
-                with urllib.request.urlopen(STATUS_URL, timeout=2) as r:
-                    payload = json.loads(r.read().decode())
-                    occupant = (
-                        f"godot-ai v{extract_version(payload)} "
-                        f"(likely a previous run's server in its reap window)"
-                    )
-            except (urllib.error.URLError, ConnectionError, TimeoutError, ValueError):
-                pass
-            print(
-                f"drain: port(s) {busy} still occupied by {occupant}; "
-                f"waiting up to {timeout_s:.0f}s for them to free..."
-            )
-        time.sleep(1.0)
-    busy = [p for p in (PORT, WS_PORT) if port_in_use(p)]
-    if busy:
-        raise SmokeError(
-            f"port(s) {busy} still occupied after {timeout_s:.0f}s pre-plant "
-            f"drain; refusing to run — the smoke would race the occupant "
-            f"instead of testing the planted one (#671)"
-        )
+        time.sleep(0.5)
+    raise SmokeError(f"ports {HTTP_PORT}/{WS_PORT} remained occupied")
 
 
-def discover_user_dir(godot: str) -> Path:
-    """Ask Godot itself for `OS.get_user_data_dir()`. More reliable than
-    re-deriving the per-OS convention by hand — the plugin reads
-    `user://godot_ai_server.pid` via Godot's own resolution, so we must
-    write the pidfile to the *exact* same place."""
-    helper = TEST_PROJECT / "_smoke_get_user_dir.gd"
-    helper.write_text(DISCOVER_USER_DIR_GD, encoding="utf-8")
+def secure_capability_temp_parent() -> Path:
+    """Return a canonical root-owned sticky temp root accepted by both runtimes."""
+
+    for candidate in (Path("/private/tmp"), Path("/tmp"), Path("/var/tmp")):
+        try:
+            info = candidate.lstat()
+        except OSError:
+            continue
+        mode = stat.S_IMODE(info.st_mode)
+        if (
+            stat.S_ISDIR(info.st_mode)
+            and not stat.S_ISLNK(info.st_mode)
+            and info.st_uid == 0
+            and bool(mode & stat.S_ISVTX)
+        ):
+            return candidate
+    raise SmokeError("no canonical root-owned sticky temporary directory is available")
+
+
+def capability_directory() -> Path:
+    override = os.environ.get("GODOT_AI_CAPABILITY_DIR", "").strip()
+    if override and os.name != "nt":
+        return Path(override)
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA", "")
+        if not base:
+            raise SmokeError("LOCALAPPDATA is unavailable")
+        return Path(base) / "godot-ai" / "capabilities"
+    if platform.system() == "Darwin":
+        home = os.environ.get("HOME", "").strip()
+        if not home:
+            raise SmokeError("HOME is unavailable")
+        return Path(home) / "Library" / "Application Support" / "godot-ai" / "capabilities"
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "godot-ai" / "capabilities"
+
+
+def capability_path() -> Path:
+    return capability_directory() / f"http-{HTTP_PORT}.json"
+
+
+def write_capability_record(http: str, websocket: str, instance: str) -> None:
+    directory = capability_directory()
+    directory.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        directory.chmod(0o700)
+    path = capability_path()
+    staged = path.with_name(path.name + f".{os.getpid()}.tmp")
+    staged.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "http": http,
+                "websocket": websocket,
+                "instance_nonce": instance,
+            },
+            separators=(",", ":"),
+        ),
+        encoding="ascii",
+    )
+    if os.name != "nt":
+        staged.chmod(0o600)
+    staged.replace(path)
+
+
+def request_status(http_capability: str, timeout: float = 2.0) -> dict:
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{HTTP_PORT}/godot-ai/status",
+        headers={"Authorization": f"Bearer {http_capability}"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read())
+
+
+def wait_for_status(http_capability: str, expected: str, process: subprocess.Popen) -> dict:
+    deadline = time.monotonic() + 45.0
+    last_error: object = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise SmokeError(f"server exited early ({process.returncode})")
+        try:
+            status = request_status(http_capability)
+            version = str(status.get("server_version", status.get("version", "")))
+            if version == expected:
+                return status
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            last_error = exc
+        time.sleep(0.25)
+    raise SmokeError(f"status never became ready: {last_error}")
+
+
+def terminate(process: subprocess.Popen | None) -> None:
+    if process is None or process.poll() is not None:
+        return
     try:
-        result = subprocess.run(
-            [godot, "--headless", "--path", str(TEST_PROJECT),
-             "--script", "res://_smoke_get_user_dir.gd"],
-            capture_output=True, text=True, timeout=60, check=False,
-        )
-        for line in result.stdout.splitlines():
-            if line.startswith("USER_DATA_DIR="):
-                return Path(line[len("USER_DATA_DIR="):].strip())
-        raise SmokeError(
-            f"discover_user_dir: no marker line in Godot output.\n"
-            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
-        )
-    finally:
-        helper.unlink(missing_ok=True)
+        process.send_signal(signal.SIGTERM)
+        process.wait(timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
-def write_managed_record(godot: str, pid: int, version: str, ws_port: int) -> None:
-    """Persist the exact EditorSettings ownership record the plugin reads.
+def editor_environment(capability_dir: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["GODOT_AI_ALLOW_HEADLESS"] = "1"
+    environment["GODOT_AI_DISABLE_TELEMETRY"] = "true"
+    if os.name != "nt":
+        environment["GODOT_AI_CAPABILITY_DIR"] = str(capability_dir)
+    return environment
 
-    Use a minimal temporary editor project so writing the global EditorSettings
-    does not load the godot-ai plugin and race the record plant. After the
-    writer exits cleanly, a fresh editor process reads the record back through
-    the public API. This is the CI equivalent of a reused EditorSettings profile
-    carrying #759-shaped stale ownership into startup.
-    """
-    workdir = Path(tempfile.mkdtemp(prefix="managed-record-"))
-    try:
-        (workdir / "project.godot").write_text(
-            (
-                '[application]\nconfig/name="Managed Record Writer"\n\n'
-                '[editor_plugins]\n'
-                'enabled=PackedStringArray("res://addons/record_writer/plugin.cfg")\n'
-            ),
-            encoding="utf-8",
-        )
-        version_literal = json.dumps(version)
-        source = (
-            MANAGED_RECORD_GD
-            .replace("__PID__", str(pid))
-            .replace("__VERSION__", version_literal)
-            .replace("__WS_PORT__", str(ws_port))
-        )
-        addon = workdir / "addons" / "record_writer"
-        addon.mkdir(parents=True)
-        (addon / "plugin.cfg").write_text(
-            (
-                '[plugin]\n\n'
-                'name="Managed Record Writer"\n'
-                'description="CI-only EditorSettings record writer"\n'
-                'author="godot-ai CI"\n'
-                'version="1.0.0"\n'
-                'script="write_record.gd"\n'
-            ),
-            encoding="utf-8",
-        )
-        helper = addon / "write_record.gd"
-        helper.write_text(source, encoding="utf-8")
-        command = [
+
+def start_editor(godot: str, project: Path, log_path: Path, environment: dict[str, str]):
+    output = log_path.open("wb")
+    engine_log = log_path.with_name(log_path.name + ".godot")
+    process = subprocess.Popen(
+        [
             godot,
             "--headless",
             "--editor",
             "--path",
-            str(workdir),
-        ]
-        writer_env = os.environ.copy()
-        writer_env.pop("GODOT_AI_RECORD_READBACK", None)
-        result = subprocess.run(
-            command,
-            env=writer_env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        if result.returncode != 0 or "MANAGED_RECORD_WRITTEN" not in result.stdout:
-            raise SmokeError(
-                "managed-record helper failed "
-                f"(exit {result.returncode}).\n"
-                f"--- stdout ---\n{result.stdout}\n"
-                f"--- stderr ---\n{result.stderr}"
-            )
-
-        # A successful writer marker alone is insufficient: if EditorSettings
-        # were not persisted, the adoption/reload smoke would still pass
-        # vacuously through the no-record external path. Read from a new editor
-        # process so every platform proves the exact #759-shaped record crossed
-        # the process boundary before the plugin under test starts.
-        readback_env = os.environ.copy()
-        readback_env["GODOT_AI_RECORD_READBACK"] = "1"
-        readback_result = subprocess.run(
-            command,
-            env=readback_env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        marker = "MANAGED_RECORD_READBACK "
-        marker_line = next(
-            (line for line in readback_result.stdout.splitlines() if line.startswith(marker)),
-            "",
-        )
-        if readback_result.returncode != 0 or not marker_line:
-            raise SmokeError(
-                "managed-record read-back helper failed "
-                f"(exit {readback_result.returncode}).\n"
-                f"--- stdout ---\n{readback_result.stdout}\n"
-                f"--- stderr ---\n{readback_result.stderr}"
-            )
-        try:
-            persisted = json.loads(marker_line[len(marker):])
-        except json.JSONDecodeError as exc:
-            raise SmokeError(
-                f"managed-record read-back emitted invalid JSON: {marker_line!r}"
-            ) from exc
-        expected = {
-            "pid": pid,
-            "version": version,
-            "ws_port": ws_port,
-            "ws_token": "",
-        }
-        if persisted != expected:
-            raise SmokeError(
-                "managed record did not persist across editor processes: "
-                f"expected {expected}, got {persisted}"
-            )
-        print(f"managed record persisted: pid={pid}, version={version!r}, ws_port={ws_port}")
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-
-
-def tool_payload(result: object) -> dict:
-    structured = getattr(result, "structured_content", None)
-    if isinstance(structured, dict):
-        return structured
-    data = getattr(result, "data", None)
-    if isinstance(data, dict):
-        return data
-    raise SmokeError(f"MCP tool returned no structured dictionary: {result!r}")
-
-
-async def reload_and_probe_external_server() -> tuple[dict, dict]:
-    """Reload through the real MCP surface, then probe the replacement bridge."""
-    async with Client(MCP_URL) as client:
-        reload_result = tool_payload(await client.call_tool("editor_reload_plugin", {}))
-        state_result = tool_payload(await client.call_tool("editor_state", {}))
-        return reload_result, state_result
-
-
-def write_sim(workdir: Path) -> Path:
-    pkg = workdir / "godot_ai"
-    pkg.mkdir(parents=True, exist_ok=True)
-    # Explicit UTF-8 — Path.write_text defaults to locale encoding (cp1252 on
-    # Windows), which would mangle non-ASCII chars in docstrings into bytes
-    # the child Python (reading source as UTF-8) rejects with SyntaxError.
-    (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "__main__.py").write_text(SIM_SOURCE, encoding="utf-8")
-    return workdir
-
-
-def extract_version(payload: dict) -> str:
-    """Mirror plugin.gd::_extract_server_version: try server_version first,
-    then version. The real server emits server_version; the sim emits version."""
-    return str(payload.get("server_version") or payload.get("version") or "")
-
-
-def wait_for_status(
-    version: str | None,
-    timeout_s: float,
-    sim: subprocess.Popen | None = None,
-) -> dict:
-    """Poll /godot-ai/status until it returns the expected version (or any
-    JSON if version is None). Returns the parsed payload. When `sim` is
-    given, fail fast if it dies — there's no point waiting 30s for a port
-    nobody is bound to anymore."""
-    deadline = time.monotonic() + timeout_s
-    last_err: str | None = None
-    while time.monotonic() < deadline:
-        if sim is not None and sim.poll() is not None:
-            raise SmokeError(
-                f"stale sim died early (exit {sim.returncode}) while waiting "
-                f"for status; last urlopen error: {last_err!r}"
-            )
-        try:
-            with urllib.request.urlopen(STATUS_URL, timeout=2) as r:
-                payload = json.loads(r.read().decode())
-                found = extract_version(payload)
-                if version is None or found == version:
-                    return payload
-                last_err = f"version={found!r} (waiting for {version!r})"
-        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
-            last_err = str(e)
-        time.sleep(0.5)
-    raise SmokeError(f"status endpoint did not match within {timeout_s}s: {last_err}")
-
-
-def wait_for_listener(
-    url: str,
-    timeout_s: float,
-    proc: subprocess.Popen | None = None,
-) -> None:
-    """Poll `url` until the listener responds at all — any HTTP status counts,
-    including 404. Unlike `wait_for_status` we are NOT waiting for godot-ai to
-    identify itself; a foreign occupant deliberately 404s. Distinguishing a
-    bound-but-404 server (HTTPError → up) from a refused connection (URLError →
-    not up yet) is the whole point. Fails fast if `proc` dies."""
-    deadline = time.monotonic() + timeout_s
-    last_err: str | None = None
-    while time.monotonic() < deadline:
-        if proc is not None and proc.poll() is not None:
-            raise SmokeError(
-                f"foreign listener died early (exit {proc.returncode}) while "
-                f"waiting for it to bind; last urlopen error: {last_err!r}"
-            )
-        try:
-            with urllib.request.urlopen(url, timeout=2):
-                return
-        except urllib.error.HTTPError:
-            # The server answered (e.g. 404) — it is bound and listening.
-            return
-        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
-            last_err = str(e)
-        time.sleep(0.5)
-    raise SmokeError(f"listener never bound within {timeout_s}s: {last_err}")
-
-
-def parse_suggested_port(line: str) -> int:
-    """Pull the integer after 'suggested free port' out of the plugin's
-    non-recoverable INCOMPATIBLE diagnosis line. Returns -1 if absent."""
-    marker = "suggested free port"
-    idx = line.find(marker)
-    if idx < 0:
-        return -1
-    tail = line[idx + len(marker):].lstrip()
-    digits = ""
-    for ch in tail:
-        if ch.isdigit():
-            digits += ch
-        else:
-            break
-    return int(digits) if digits else -1
-
-
-def wait_for_log_lines(log_path: Path, needles: list[str], timeout_s: float) -> dict[str, str]:
-    """Tail `log_path` until every needle matches at least one line. Returns
-    a {needle: matched_line} dict."""
-    found: dict[str, str] = {}
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if log_path.exists():
-            for line in log_path.read_text(errors="replace").splitlines():
-                for needle in needles:
-                    if needle in found:
-                        continue
-                    if needle in line:
-                        found[needle] = line
-            if len(found) == len(needles):
-                return found
-        time.sleep(0.5)
-    missing = [n for n in needles if n not in found]
-    raise SmokeError(f"never saw log lines: {missing!r}. found: {list(found.keys())!r}")
-
-
-def child_is_alive(proc: subprocess.Popen) -> bool:
-    """Reap the child via Popen.poll() before answering. A naive
-    `os.kill(pid, 0)` check returns True for unreaped zombies — so when
-    the plugin kills the sim externally, the sim becomes a zombie under
-    our smoke (its parent) and the cheap signal-zero probe lies. poll()
-    issues waitpid and clears the zombie, giving us an honest answer."""
-    return proc.poll() is None
-
-
-def find_godot() -> str:
-    """Locate the Godot binary. shutil.which is fine on POSIX, but on
-    Windows the chickensoft action sometimes registers godot via a
-    name that PATHEXT/which logic doesn't find from Python (it works
-    from bash because bash uses its own resolution). Fall back to the
-    OS-native `where`/`which` shell command which mirrors what bash
-    sees."""
-    candidates = [
-        os.environ.get("GODOT_BIN"),
-        os.environ.get("GODOT4_BIN"),
-        "godot",
-        "Godot",
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        resolved = shutil.which(candidate)
-        if resolved:
-            print(f"find_godot: shutil.which({candidate!r}) -> {resolved}")
-            return candidate
-
-    cmd = "where" if platform.system() == "Windows" else "which"
-    for name in ("godot", "Godot"):
-        try:
-            out = subprocess.run(
-                [cmd, name], capture_output=True, text=True, timeout=10, check=False
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-        if out.returncode == 0 and out.stdout.strip():
-            resolved = out.stdout.strip().splitlines()[0]
-            print(f"find_godot: {cmd} {name} -> {resolved}")
-            return resolved
-
-    path = os.environ.get("PATH", "")
-    raise SmokeError(
-        f"godot not on PATH (set GODOT_BIN). Tried {candidates!r} via "
-        f"shutil.which and `{cmd}`. PATH={path!r}"
+            str(project),
+            "--log-file",
+            str(engine_log),
+        ],
+        env=environment,
+        stdout=output,
+        stderr=subprocess.STDOUT,
     )
+    return process, output
 
 
-def find_plugin_version() -> str:
-    cfg = ROOT / "plugin" / "addons" / "godot_ai" / "plugin.cfg"
-    for line in cfg.read_text().splitlines():
-        if line.startswith("version="):
-            return line.split("=", 1)[1].strip().strip('"')
-    raise SmokeError(f"could not find version= in {cfg}")
+def wait_for_log(path: Path, marker: str, process: subprocess.Popen, timeout: float) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise SmokeError(f"process exited before {marker!r} ({process.returncode})")
+        if path.exists():
+            for line in path.read_text(errors="replace").splitlines():
+                if marker in line:
+                    return line
+        time.sleep(0.25)
+    raise SmokeError(f"never saw {marker!r} in {path}")
 
 
-def terminate_proc(proc: subprocess.Popen | None, label: str) -> None:
-    """SIGTERM (or terminate on Windows) then escalate to kill on timeout.
+class _OccupantHandler(BaseHTTPRequestHandler):
+    http_capability = ""
+    instance = ""
+    stale = False
 
-    Resilient to the child exiting between our `poll()` and the signal: that
-    race makes `send_signal`/`terminate`/`kill` raise `ProcessLookupError`
-    (a subclass of OSError), which — since this runs from a `finally` block —
-    would turn an otherwise-passing smoke into a failure. Reap after `kill()`
-    too, so the child doesn't linger as a zombie."""
-    if proc is None or proc.poll() is not None:
-        return
-    print(f"terminating {label} pid={proc.pid}")
-    try:
-        if platform.system() == "Windows":
-            proc.terminate()
-        else:
-            proc.send_signal(signal.SIGTERM)
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        try:
-            proc.kill()
-            proc.wait(timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    except OSError:
-        # Already exited between poll() and the signal — nothing to reap.
+    def log_message(self, *_args) -> None:
         pass
 
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        if not self.stale or self.path != "/godot-ai/status":
+            self.send_response(404)
+            self.end_headers()
+            return
+        if self.headers.get("Authorization") != f"Bearer {self.http_capability}":
+            self.send_response(401)
+            self.end_headers()
+            return
+        body = json.dumps(
+            {
+                "name": "godot-ai",
+                "server_version": STALE_VERSION,
+                "ws_port": WS_PORT,
+                "instance_id": self.instance,
+            }
+        ).encode()
+        print(PROBE_MARKER, flush=True)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-def dump_failure(
-    err: SmokeError,
-    planted_log: Path,
-    planted_label: str,
-    user_dir: Path,
-    editor_log: Path,
+
+def serve_occupant(
+    stale: bool,
+    http_capability: str,
+    instance: str,
+    http_port: int,
+    ws_port: int,
 ) -> None:
-    """Shared on-failure diagnostics for both modes."""
-    print(f"FAIL: {err}", file=sys.stderr)
-    print(f"===== {planted_label} stdout/stderr ({planted_log}) =====", file=sys.stderr)
-    if planted_log.exists():
-        content = planted_log.read_text(errors="replace")
-        if content.strip():
-            print(content, file=sys.stderr)
+    global HTTP_PORT, WS_PORT
+    HTTP_PORT = http_port
+    WS_PORT = ws_port
+    _OccupantHandler.stale = stale
+    _OccupantHandler.http_capability = http_capability
+    _OccupantHandler.instance = instance
+    server = ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), _OccupantHandler)
+    print(OCCUPANT_READY_MARKER, flush=True)
+    server.serve_forever()
+
+
+def run_occupant_mode(
+    mode: str, godot: str, project: Path, log_dir: Path, timeout: float, capability_dir: Path
+) -> int:
+    stale = mode == "stale"
+    http_capability = secrets.token_urlsafe(32)
+    websocket = secrets.token_hex(32)
+    instance = secrets.token_hex(16)
+    if stale:
+        write_capability_record(http_capability, websocket, instance)
+
+    occupant = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            ("import runpy;m=runpy.run_path(%r);m['serve_occupant'](%r,%r,%r,%r,%r)")
+            % (__file__, stale, http_capability, instance, HTTP_PORT, WS_PORT),
+        ],
+        stdout=(log_dir / f"{mode}-occupant.log").open("wb"),
+        stderr=subprocess.STDOUT,
+    )
+    editor = None
+    editor_output = None
+    try:
+        occupant_log = log_dir / f"{mode}-occupant.log"
+        wait_for_log(occupant_log, OCCUPANT_READY_MARKER, occupant, timeout)
+        editor_log = log_dir / f"godot-{mode}-smoke.log"
+        editor, editor_output = start_editor(
+            godot, project, editor_log, editor_environment(capability_dir)
+        )
+        if stale:
+            wait_for_log(occupant_log, PROBE_MARKER, occupant, timeout)
         else:
-            print("(empty — listener produced no output before terminating)", file=sys.stderr)
-    else:
-        print("(listener log not created)", file=sys.stderr)
-    print(f"===== user data dir state ({user_dir}) =====", file=sys.stderr)
-    if user_dir.exists():
-        for entry in sorted(user_dir.iterdir()):
-            marker = "[pidfile]" if entry.name == "godot_ai_server.pid" else ""
-            print(f"  {entry.name} {marker}", file=sys.stderr)
-            if entry.name == "godot_ai_server.pid":
-                try:
-                    print(f"    contents: {entry.read_text().strip()!r}", file=sys.stderr)
-                except OSError as oe:
-                    print(f"    read error: {oe}", file=sys.stderr)
-    else:
-        print("  (user dir does not exist)", file=sys.stderr)
-    print("===== MCP-tagged log lines =====", file=sys.stderr)
-    if editor_log.exists():
-        for line in editor_log.read_text(errors="replace").splitlines():
-            if "MCP " in line or "godot_ai" in line or "godot-ai" in line:
-                print(f"  {line}", file=sys.stderr)
-        print("===== editor log (last 200 lines) =====", file=sys.stderr)
-        tail = editor_log.read_text(errors="replace").splitlines()[-200:]
-        print("\n".join(tail), file=sys.stderr)
-
-
-def run_stale_smoke(
-    godot: str,
-    plugin_version: str,
-    user_dir: Path,
-    pidfile: Path,
-    log_dir: Path,
-    timeout: float,
-) -> int:
-    editor_log = log_dir / "godot-stale-smoke.log"
-    sim_log = log_dir / "stale-sim.log"
-
-    sim: subprocess.Popen | None = None
-    godot_proc: subprocess.Popen | None = None
-    workdir = Path(tempfile.mkdtemp(prefix="stale-sim-"))
-    try:
-        write_sim(workdir)
-        env = os.environ.copy()
-        env["PYTHONPATH"] = str(workdir) + os.pathsep + env.get("PYTHONPATH", "")
-        sim_cmd = [
-            sys.executable, "-m", "godot_ai",
-            "--transport", "streamable-http",
-            "--port", str(PORT),
-            "--ws-port", str(WS_PORT),
-            "--pid-file", str(pidfile),
-            "--fake-version", STALE_VERSION,
-        ]
-        print(f"starting stale sim: {' '.join(sim_cmd)}")
-        sim_log_fh = sim_log.open("wb")
-        sim = subprocess.Popen(sim_cmd, env=env, stdout=sim_log_fh, stderr=subprocess.STDOUT)
-        sim_pid = sim.pid
-        print(f"sim pid={sim_pid}, sim log={sim_log}")
-
-        sim_status = wait_for_status(STALE_VERSION, timeout_s=30.0, sim=sim)
-        print(f"sim status confirmed: {sim_status}")
-
-        editor_log.write_text("")
-        log_fh = editor_log.open("ab")
-        try:
-            godot_env = os.environ.copy()
-            godot_env["GODOT_AI_ALLOW_HEADLESS"] = "1"
-            godot_cmd = [godot, "--headless", "--path", str(TEST_PROJECT), "--editor"]
-            print(f"launching godot: {' '.join(godot_cmd)}")
-            godot_proc = subprocess.Popen(godot_cmd, env=godot_env, stdout=log_fh, stderr=log_fh)
-
-            proof_needle = "MCP | strong proof:"
-            kill_needle = "MCP | killed pids"
-            log_timeout = max(timeout, LOG_LINES_TIMEOUT)
-            print(f"waiting up to {log_timeout}s for kill+respawn log lines...")
-            matched = wait_for_log_lines(editor_log, [proof_needle, kill_needle], log_timeout)
-            print(f"saw: {matched[proof_needle]!r}")
-            print(f"saw: {matched[kill_needle]!r}")
-
-            proof_line = matched[proof_needle]
-            if not any(name in proof_line for name in EXPECTED_PROOF_NAMES):
-                raise SmokeError(
-                    f"proof line did not name a strong-proof tier: {proof_line!r}; "
-                    f"expected one of {EXPECTED_PROOF_NAMES}"
-                )
-
-            print(f"verifying respawned server reports plugin version {plugin_version} "
-                  f"(timeout {FRESH_STATUS_TIMEOUT}s)...")
-            fresh = wait_for_status(plugin_version, timeout_s=FRESH_STATUS_TIMEOUT)
-            print(f"fresh server status: {fresh}")
-
-            # Give the plugin's kill a moment to land + reap. The plugin's
-            # `_kill_processes_and_windows_spawn_children` returns once the
-            # signal is sent; the sim process may still be in flight here.
-            for _ in range(20):
-                if not child_is_alive(sim):
-                    break
-                time.sleep(0.25)
-            if child_is_alive(sim):
-                raise SmokeError(f"sim pid {sim_pid} is still alive after kill+respawn")
-            print(f"sim pid {sim_pid} is gone (exit={sim.returncode}), as expected")
-        finally:
-            log_fh.close()
-
-        print("PASS: stale-server kill+respawn smoke")
+            time.sleep(min(8.0, timeout))
+        if editor.poll() is not None:
+            raise SmokeError(f"editor exited during {mode} diagnosis")
+        if occupant.poll() is not None:
+            raise SmokeError(f"{mode} occupant was killed without explicit authorization")
+        print(f"PASS: {mode} occupant detected and left running")
         return 0
-    except SmokeError as e:
-        dump_failure(e, sim_log, "stale sim", user_dir, editor_log)
-        return 1
     finally:
-        terminate_proc(godot_proc, "godot")
-        terminate_proc(sim, "sim")
-        shutil.rmtree(workdir, ignore_errors=True)
-        # Clear pidfile that may have been left by the respawned server, so
-        # adjacent CI steps see a clean state.
-        if pidfile.exists():
-            pidfile.unlink()
+        terminate(editor)
+        terminate(occupant)
+        if editor_output is not None:
+            editor_output.close()
 
 
-def run_foreign_smoke(
+async def reload_and_probe(http_capability: str) -> tuple[dict, dict]:
+    transport = StreamableHttpTransport(
+        f"http://127.0.0.1:{HTTP_PORT}/mcp",
+        headers={"Authorization": f"Bearer {http_capability}"},
+    )
+    async with Client(transport, timeout=30, init_timeout=30) as client:
+        deadline = time.monotonic() + 60
+        while True:
+            sessions = await client.call_tool("session_manage", {"op": "list"})
+            payload = sessions.structured_content or sessions.data or {}
+            if int(payload.get("count", 0)) > 0:
+                break
+            if time.monotonic() >= deadline:
+                raise SmokeError("editor never registered with external server")
+            await asyncio.sleep(0.5)
+        reload_result = await client.call_tool("editor_reload_plugin", {})
+        state_result = await client.call_tool("editor_state", {})
+        return (
+            reload_result.structured_content or reload_result.data or {},
+            state_result.structured_content or state_result.data or {},
+        )
+
+
+def run_compatible_reload(
     godot: str,
-    plugin_version: str,
-    user_dir: Path,
-    pidfile: Path,
+    project: Path,
     log_dir: Path,
-    timeout: float,
+    capability_dir: Path,
+    version: str,
 ) -> int:
-    editor_log = log_dir / "godot-foreign-smoke.log"
-    foreign_log = log_dir / "foreign-sim.log"
-
-    foreign: subprocess.Popen | None = None
-    godot_proc: subprocess.Popen | None = None
-    workdir = Path(tempfile.mkdtemp(prefix="foreign-sim-"))
-    try:
-        listener_py = workdir / "foreign_listener.py"
-        # Explicit UTF-8 — Path.write_text defaults to locale encoding (cp1252
-        # on Windows), which would mangle non-ASCII chars in the docstring.
-        listener_py.write_text(FOREIGN_SOURCE, encoding="utf-8")
-        foreign_cmd = [sys.executable, str(listener_py), "--port", str(PORT)]
-        print(f"starting foreign listener: {' '.join(foreign_cmd)}")
-        foreign_log_fh = foreign_log.open("wb")
-        foreign = subprocess.Popen(foreign_cmd, stdout=foreign_log_fh, stderr=subprocess.STDOUT)
-        foreign_pid = foreign.pid
-        print(f"foreign pid={foreign_pid}, foreign log={foreign_log}")
-
-        wait_for_listener(STATUS_URL, timeout_s=30.0, proc=foreign)
-        print(f"foreign listener confirmed bound on :{PORT} (404s on /godot-ai/status)")
-
-        editor_log.write_text("")
-        log_fh = editor_log.open("ab")
-        try:
-            godot_env = os.environ.copy()
-            godot_env["GODOT_AI_ALLOW_HEADLESS"] = "1"
-            godot_cmd = [godot, "--headless", "--path", str(TEST_PROJECT), "--editor"]
-            print(f"launching godot: {' '.join(godot_cmd)}")
-            godot_proc = subprocess.Popen(godot_cmd, env=godot_env, stdout=log_fh, stderr=log_fh)
-
-            # `MCP | proof: (none)` is emitted only by _set_incompatible_server
-            # and only when can_recover_incompatible == false — i.e. terminal,
-            # non-recoverable INCOMPATIBLE. The suggested-free-port line is the
-            # foreign-occupant diagnosis (the #607/#608 crash-body hint).
-            proof_none_needle = "MCP | proof: (none)"
-            suggest_needle = "suggested free port"
-            log_timeout = max(timeout, LOG_LINES_TIMEOUT)
-            print(f"waiting up to {log_timeout}s for the non-recoverable INCOMPATIBLE diagnosis...")
-            matched = wait_for_log_lines(
-                editor_log, [proof_none_needle, suggest_needle], log_timeout
-            )
-            print(f"saw: {matched[proof_none_needle]!r}")
-            print(f"saw: {matched[suggest_needle]!r}")
-
-            # The diagnosis must name a real alternate port — not the occupied
-            # one, not a parse-failure sentinel.
-            suggested = parse_suggested_port(matched[suggest_needle])
-            if suggested <= 0 or suggested == PORT or suggested > 65535:
-                raise SmokeError(
-                    f"diagnosis named an invalid suggested free port "
-                    f"{suggested!r} (occupied port is {PORT}): "
-                    f"{matched[suggest_needle]!r}"
-                )
-            print(f"diagnosis suggested free port {suggested}, as expected")
-
-            # The plugin must NOT try to reclaim a port it can't prove it owns.
-            # Watch for a (forbidden) kill / strong-proof line across a grace
-            # window, and confirm the listener keeps holding the port.
-            forbidden = ("MCP | killed pids", "MCP | strong proof:")
-            print(f"watching {KILL_GUARD_WINDOW:.0f}s for a (forbidden) kill attempt...")
-            deadline = time.monotonic() + KILL_GUARD_WINDOW
-            while time.monotonic() < deadline:
-                text = editor_log.read_text(errors="replace")
-                hit = next((n for n in forbidden if n in text), None)
-                if hit is not None:
-                    raise SmokeError(
-                        f"plugin tried to reclaim a foreign port — saw {hit!r} "
-                        f"in the editor log; foreign occupants must never be killed"
-                    )
-                if not child_is_alive(foreign):
-                    raise SmokeError(
-                        f"foreign listener pid {foreign_pid} died (exit "
-                        f"{foreign.returncode}); the plugin must leave a foreign "
-                        f"occupant running"
-                    )
-                time.sleep(0.5)
-
-            if not child_is_alive(foreign):
-                raise SmokeError(
-                    f"foreign listener pid {foreign_pid} is not alive at end of guard window"
-                )
-            print(f"foreign listener pid {foreign_pid} still alive; no kill attempted, as expected")
-        finally:
-            log_fh.close()
-
-        print("PASS: foreign-occupant non-recoverable INCOMPATIBLE smoke")
-        return 0
-    except SmokeError as e:
-        dump_failure(e, foreign_log, "foreign listener", user_dir, editor_log)
-        return 1
-    finally:
-        terminate_proc(godot_proc, "godot")
-        terminate_proc(foreign, "foreign listener")
-        shutil.rmtree(workdir, ignore_errors=True)
-        # A clean foreign run writes no pidfile, but clear any leftover so
-        # adjacent CI steps see a clean state.
-        if pidfile.exists():
-            pidfile.unlink()
-
-
-def run_stale_compatible_reload_smoke(
-    godot: str,
-    plugin_version: str,
-    user_dir: Path,
-    pidfile: Path,
-    log_dir: Path,
-    timeout: float,
-) -> int:
-    """Regression for #759/#764's settings-record × reload ownership wedge."""
-    editor_log = log_dir / "godot-stale-compatible-reload-smoke.log"
-    external_log = log_dir / "stale-compatible-external-server.log"
-
-    external: subprocess.Popen | None = None
-    godot_proc: subprocess.Popen | None = None
-    external_log_fh = None
-    record_planted = False
-    try:
-        env = os.environ.copy()
-        env.setdefault("GODOT_AI_DISABLE_TELEMETRY", "true")
-        external_cmd = [
+    http_capability = secrets.token_urlsafe(32)
+    websocket = secrets.token_hex(32)
+    environment = editor_environment(capability_dir)
+    environment["GODOT_AI_HTTP_CAPABILITY"] = http_capability
+    environment["GODOT_AI_WS_TOKEN"] = websocket
+    server_log = (log_dir / "stale-compatible-external-server.log").open("wb")
+    server = subprocess.Popen(
+        [
             sys.executable,
             "-m",
             "godot_ai",
             "--transport",
             "streamable-http",
             "--port",
-            str(PORT),
+            str(HTTP_PORT),
             "--ws-port",
             str(WS_PORT),
-        ]
-        print(f"starting current external server: {' '.join(external_cmd)}")
-        external_log_fh = external_log.open("wb")
-        external = subprocess.Popen(
-            external_cmd,
-            env=env,
-            stdout=external_log_fh,
-            stderr=subprocess.STDOUT,
+        ],
+        env=environment,
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
+    )
+    editor = None
+    editor_output = None
+    try:
+        wait_for_status(http_capability, version, server)
+        editor, editor_output = start_editor(
+            godot,
+            project,
+            log_dir / "godot-stale-compatible-reload-smoke.log",
+            environment,
         )
-        print(f"external server pid={external.pid}, log={external_log}")
-
-        status = wait_for_status(plugin_version, timeout_s=30.0, sim=external)
-        print(f"current external status confirmed: {status}")
-
-        # Use a PID that verifiably existed and exited, avoiding magic PID
-        # assumptions across Windows/macOS/Linux. Starting it after the external
-        # server also prevents it from naming that already-running process.
-        dead_marker = subprocess.Popen([sys.executable, "-c", "pass"])
-        stale_pid = dead_marker.pid
-        dead_marker.wait(timeout=30)
-        write_managed_record(godot, stale_pid, plugin_version, WS_PORT)
-        record_planted = True
-
-        editor_log.write_text("", encoding="utf-8")
-        log_fh = editor_log.open("ab")
-        try:
-            godot_env = os.environ.copy()
-            godot_env["GODOT_AI_ALLOW_HEADLESS"] = "1"
-            godot_env.setdefault("GODOT_AI_DISABLE_TELEMETRY", "true")
-            godot_cmd = [godot, "--headless", "--path", str(TEST_PROJECT), "--editor"]
-            print(f"launching godot with stale matching record: {' '.join(godot_cmd)}")
-            godot_proc = subprocess.Popen(
-                godot_cmd,
-                env=godot_env,
-                stdout=log_fh,
-                stderr=log_fh,
-            )
-
-            adoption_needle = "MCP | adopted external server"
-            connected_needle = "MCP | connected to server"
-            matched = wait_for_log_lines(
-                editor_log,
-                [adoption_needle, connected_needle],
-                max(timeout, LOG_LINES_TIMEOUT),
-            )
-            print(f"saw: {matched[adoption_needle]!r}")
-            print(f"saw: {matched[connected_needle]!r}")
-
-            reload_result, state_result = asyncio.run(reload_and_probe_external_server())
-            print(f"reload result: {reload_result}")
-            print(
-                "replacement editor state: "
-                f"Godot {state_result.get('godot_version', '?')}, "
-                f"project={state_result.get('project_name', '?')}"
-            )
-
-            old_id = str(reload_result.get("old_session_id", ""))
-            new_id = str(reload_result.get("new_session_id", ""))
-            if reload_result.get("status") != "reloaded" or not old_id or not new_id:
-                raise SmokeError(
-                    "external reload did not return the complete reloaded shape: "
-                    f"{reload_result}"
-                )
-            if old_id == new_id:
-                raise SmokeError(f"reload reused the old session id: {old_id}")
-            if not state_result.get("godot_version"):
-                raise SmokeError(
-                    f"replacement editor_state is missing godot_version: {state_result}"
-                )
-
-            if not child_is_alive(external):
-                raise SmokeError(
-                    f"external server pid {external.pid} died during adoption/reload "
-                    f"(exit {external.returncode})"
-                )
-            surviving = wait_for_status(
-                plugin_version,
-                timeout_s=FRESH_STATUS_TIMEOUT,
-                sim=external,
-            )
-            print(f"external server survived reload with status: {surviving}")
-
-            text = editor_log.read_text(errors="replace")
-            forbidden = (
-                "MCP | adopted managed server",
-                "MCP | killed pids",
-                "MCP | stopped server",
-            )
-            hit = next((needle for needle in forbidden if needle in text), None)
-            if hit is not None:
-                raise SmokeError(
-                    f"compatible external server crossed the ownership boundary; "
-                    f"saw forbidden log line containing {hit!r}"
-                )
-        finally:
-            log_fh.close()
-
-        print("PASS: stale-compatible external reload smoke")
+        reload_result, state = asyncio.run(reload_and_probe(http_capability))
+        if reload_result.get("status") != "reloaded":
+            raise SmokeError(f"reload failed: {reload_result}")
+        if not state.get("godot_version"):
+            raise SmokeError(f"replacement editor did not answer: {state}")
+        if server.poll() is not None:
+            raise SmokeError("adopted external server was killed during reload")
+        wait_for_status(http_capability, version, server)
+        print("PASS: capability-pair external adoption survived plugin reload")
         return 0
-    except Exception as e:
-        err = e if isinstance(e, SmokeError) else SmokeError(str(e))
-        dump_failure(err, external_log, "external server", user_dir, editor_log)
-        return 1
     finally:
-        terminate_proc(godot_proc, "godot")
-        terminate_proc(external, "external server")
-        if external_log_fh is not None:
-            external_log_fh.close()
-        if record_planted:
-            try:
-                write_managed_record(godot, 0, "", 0)
-            except SmokeError as cleanup_error:
-                print(f"WARN: failed to clear managed record: {cleanup_error}", file=sys.stderr)
-        if pidfile.exists():
-            pidfile.unlink()
+        terminate(editor)
+        terminate(server)
+        if editor_output is not None:
+            editor_output.close()
+        server_log.close()
 
 
 def main() -> int:
-    global TEST_PROJECT, PORT, WS_PORT, STATUS_URL, MCP_URL
-
-    # Keep CLI help ASCII-only: Windows' default cp1252 console encoding cannot
-    # print the Unicode arrows/dashes in the detailed module docstring.
-    ap = argparse.ArgumentParser(
-        description="Live smoke tests for godot-ai server ownership and reload handling."
-    )
-    ap.add_argument(
+    global HTTP_PORT, WS_PORT
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
         "--mode",
         choices=("stale", "foreign", "stale-compatible-reload"),
         default="stale",
-        help="stale: recoverable godot-ai occupant (kill+respawn). "
-             "foreign: non-godot-ai occupant (non-recoverable INCOMPATIBLE, no kill). "
-             "stale-compatible-reload: matching-version dead record plus a live "
-             "external server (reload must preserve it).",
     )
-    ap.add_argument("--log-dir", default=".", help="Where to write the editor + listener logs")
-    ap.add_argument("--timeout", type=float, default=45.0)
-    ap.add_argument(
-        "--http-port",
-        type=int,
-        default=PORT,
-        help="HTTP port used by the planted server/listener (default: 8000)",
-    )
-    ap.add_argument(
-        "--ws-port",
-        type=int,
-        default=WS_PORT,
-        help="WebSocket port used by godot-ai modes (default: 9500)",
-    )
-    ap.add_argument(
-        "--project",
-        default=str(TEST_PROJECT),
-        help="Godot project whose enabled plugin is exercised",
-    )
-    args = ap.parse_args()
-
-    PORT = args.http_port
+    parser.add_argument("--log-dir", default=".")
+    parser.add_argument("--timeout", type=float, default=90.0)
+    parser.add_argument("--http-port", type=int, default=HTTP_PORT)
+    parser.add_argument("--ws-port", type=int, default=WS_PORT)
+    parser.add_argument("--project", default=str(DEFAULT_PROJECT))
+    args = parser.parse_args()
+    HTTP_PORT = args.http_port
     WS_PORT = args.ws_port
-    TEST_PROJECT = Path(args.project).resolve()
-    STATUS_URL = f"http://127.0.0.1:{PORT}/godot-ai/status"
-    MCP_URL = f"http://127.0.0.1:{PORT}/mcp"
 
     log_dir = Path(args.log_dir).resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
-
+    wait_for_free_ports()
     godot = find_godot()
-    plugin_version = find_plugin_version()
+    project = Path(args.project).resolve()
 
-    godot_ai_path = shutil.which("godot-ai") or "(not on PATH)"
-    print(f"mode={args.mode}")
-    print(f"godot={godot}")
-    print(f"godot-ai={godot_ai_path}")
-    print(f"plugin version={plugin_version}")
-
-    print("discovering Godot user data dir...")
-    user_dir = discover_user_dir(godot)
-    print(f"user data dir={user_dir}")
-    user_dir.mkdir(parents=True, exist_ok=True)
-    pidfile = user_dir / "godot_ai_server.pid"
-    print(f"pidfile={pidfile}")
-
-    # Pre-clean: a stale pidfile / managed record from a prior run would route
-    # the plugin through a different proof tier than the one we're targeting.
-    # For the foreign mode this is essential — a leftover pidfile would hand
-    # the plugin false ownership proof over a port it does not actually own.
-    if pidfile.exists():
-        pidfile.unlink()
-
-    # Pre-plant drain: back-to-back runs (stale then foreign) can otherwise
-    # cross-contaminate via the previous run's server reap window (#671).
-    drain_leftover_servers()
-
-    if args.mode == "foreign":
-        return run_foreign_smoke(godot, plugin_version, user_dir, pidfile, log_dir, args.timeout)
-    if args.mode == "stale-compatible-reload":
-        return run_stale_compatible_reload_smoke(
-            godot,
-            plugin_version,
-            user_dir,
-            pidfile,
-            log_dir,
-            args.timeout,
+    temporary_capability_dir = None
+    if os.name != "nt":
+        temporary_capability_dir = tempfile.TemporaryDirectory(
+            prefix="godot-ai-v4-capabilities-",
+            dir=secure_capability_temp_parent(),
         )
-    return run_stale_smoke(godot, plugin_version, user_dir, pidfile, log_dir, args.timeout)
+        # The plugin snapshots this explicit path on the main thread before
+        # lifecycle workers start; no worker needs to re-read HOME/getenv.
+        os.environ["GODOT_AI_CAPABILITY_DIR"] = temporary_capability_dir.name
+    capability_dir = capability_directory()
+    existing_record = capability_path().read_bytes() if capability_path().exists() else None
+    try:
+        if args.mode == "stale-compatible-reload":
+            return run_compatible_reload(godot, project, log_dir, capability_dir, plugin_version())
+        return run_occupant_mode(args.mode, godot, project, log_dir, args.timeout, capability_dir)
+    except Exception as exc:  # smoke runner: always print artifact pointers
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        path = capability_path()
+        if existing_record is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(existing_record)
+        if temporary_capability_dir is not None:
+            temporary_capability_dir.cleanup()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

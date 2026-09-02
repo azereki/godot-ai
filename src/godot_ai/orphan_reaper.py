@@ -99,14 +99,11 @@ def idle_grace_from_env() -> float:
     return _grace_from_env(IDLE_GRACE_ENV)
 
 
-def should_arm_idle_exit(owner_pid: int | None) -> bool:
+def should_arm_idle_exit(_owner_pid: int | None = None) -> bool:
     """Whether the idle self-terminate backstop (#498) should run.
 
-    Arms only for plugin-spawned servers: either the explicit
-    ``GODOT_AI_PLUGIN_SPAWNED`` marker is present (set by server_lifecycle.gd on
-    every platform, including Windows where owner-PID is skipped — that's the
-    #497 coverage), or an owner pid was plumbed through (older plugin builds
-    that predate the marker). Never arms for:
+    Arms only for plugin-spawned servers carrying the explicit
+    ``GODOT_AI_PLUGIN_SPAWNED`` marker. Never arms for:
 
     - manual dev servers / CI (neither marker nor owner pid in the env);
     - ``--reload`` dev runs (detected via the reload runner's
@@ -121,7 +118,7 @@ def should_arm_idle_exit(owner_pid: int | None) -> bool:
         return False
     if os.environ.get(DEV_TRANSPORT_ENV, "").strip():
         return False
-    return _env_truthy(PLUGIN_SPAWNED_ENV) or bool(owner_pid and owner_pid > 0)
+    return _env_truthy(PLUGIN_SPAWNED_ENV)
 
 
 def should_arm_attach_idle_exit() -> bool:

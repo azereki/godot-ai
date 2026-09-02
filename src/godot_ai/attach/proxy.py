@@ -7,6 +7,7 @@ import contextvars
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 import anyio
@@ -22,6 +23,7 @@ from godot_ai.attach.ensure import AttachStartupError, BackendStatus
 from godot_ai.fastmcp_compat import ToolResult
 from godot_ai.middleware.godot_command_error import GodotCommandErrorToolResult
 from godot_ai.protocol.errors import ErrorCode
+from godot_ai.transport.capability import validate_capability
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 5.0
 DEFAULT_WRITE_TIMEOUT_SECONDS = 30.0
@@ -33,6 +35,7 @@ DEFAULT_MONITOR_FAILURE_THRESHOLD = 3
 
 EnsureReady = Callable[[], Awaitable[BackendStatus]]
 ObserveBackend = Callable[[], Awaitable[BackendStatus | None]]
+CapabilityProvider = Callable[[], str]
 
 
 class _BackendChanged(RuntimeError):
@@ -177,6 +180,7 @@ class AttachProxyProvider(ProxyProvider):
 
 
 def _http_client_factory(
+    capability_provider: CapabilityProvider,
     headers: dict[str, str] | None = None,
     auth: httpx.Auth | None = None,
     follow_redirects: bool = True,
@@ -196,8 +200,12 @@ def _http_client_factory(
         write=DEFAULT_WRITE_TIMEOUT_SECONDS,
         pool=DEFAULT_POOL_TIMEOUT_SECONDS,
     )
+    request_headers = {
+        key: value for key, value in (headers or {}).items() if key.lower() != "authorization"
+    }
+    request_headers["Authorization"] = f"Bearer {validate_capability(capability_provider())}"
     return httpx.AsyncClient(
-        headers=headers,
+        headers=request_headers,
         auth=auth,
         follow_redirects=follow_redirects,
         timeout=timeout,
@@ -525,13 +533,14 @@ def create_attach_proxy(
     mcp_url: str,
     ensure_ready: EnsureReady,
     observe_backend: ObserveBackend,
+    capability_provider: CapabilityProvider,
 ) -> FastMCP[Any]:
     """Create a stdio-facing proxy using fresh downstream sessions per request."""
 
     def backend_client() -> Client[Any]:
         transport = StreamableHttpTransport(
             mcp_url,
-            httpx_client_factory=_http_client_factory,
+            httpx_client_factory=partial(_http_client_factory, capability_provider),
         )
         # A new disconnected client and transport per provider operation keeps
         # the bridge sessionless. MCP request deadlines are disabled; the HTTP

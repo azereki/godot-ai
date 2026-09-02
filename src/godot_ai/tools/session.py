@@ -56,8 +56,8 @@ def register_session_tools(
         an error listing the candidates.
 
         Args:
-            session_id: An exact session id (``<project-slug>@<4hex>``, e.g.
-                ``my_game@a3f2``, from ``session_manage`` with op="list")
+            session_id: An exact session id (``<project-slug>@<16hex>``, e.g.
+                ``my_game@7f9c3a10d8e426b1``, from ``session_manage`` with op="list")
                 OR a substring hint like a project folder name
                 ("test_project", "my_game").
         """

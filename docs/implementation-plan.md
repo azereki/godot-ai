@@ -1,6 +1,9 @@
 # Godot AI — Working Plan
 
-*Updated 2026-05-06 (audit-v1 PRs #298–#315 + audit-v2 PRs #369–#390 landed on `beta`. Audit-v1: scene-path ancestry guard, update/config data-loss safeguards, lifecycle reliability, characterization tests, plugin.gd extraction, state-model cleanup, UpdateManager extraction, Runtime Protocol deletion, narrowed meta-tool JSON coercion, self-update preload-alias hardening, locked FastMCP middleware order. Audit-v2: origin allowlist (DNS-rebinding guard), path-traversal guards on `script_*` / `filesystem_*` writes, errno.EADDRINUSE portability, `SessionRegistry` RLock removal, Pydantic-validated WS event payloads, sole-survivor auto-failover, 30s filesystem_changed watchdog during update reload, FAILED_MIXED self-update visibility via `mixed_state`, 32/tick packet-drain cap, error-code vocabulary enrichment (NODE_NOT_FOUND / PROPERTY_NOT_ON_CLASS / VALUE_OUT_OF_RANGE / MISSING_REQUIRED_PARAM cut INVALID_PARAMS sites 471 → 97), resolve-or-error helper extraction, resource-form lint for meta-tool reads, LogViewer + PortPickerPanel extraction from `mcp_dock.gd`. Smoke pass on `72b35d7`: 47 GDScript suites + 903 Python tests green.)*
+*Updated 2026-08-31 for the v4 architecture simplification. V4 requires Godot
+4.7+ within the 4.x line, uses one authenticated attach path and one editor-session table, and
+replaces overlay self-update with signed exact-tree transactions. Marketplace
+listings remain on v3 while the v4 publication qualification gate is closed.*
 
 This is the current working plan for Godot AI. It focuses on active and upcoming work only.
 
@@ -14,6 +17,13 @@ Adjacent reference docs:
 ---
 
 ## Status Snapshot
+
+- [~] V4 ownership architecture and the core update reducer are implemented:
+  one lifecycle episode, one editor connection table, root-owned client/update
+  seams, signed exact-tree transactions, and the durable M6 startup gate. The
+  complete uniquely addressable Phase-6 external failpoint surface, process
+  matrix, exact-candidate qualification, independent attestation, and
+  publication remain open release work.
 
 - [x] Phase 1 read surface shipped
 - [x] Phase 2 safe write surface shipped
@@ -65,7 +75,7 @@ Adjacent reference docs:
 - [x] clear session selection semantics in tools and UI — `session_activate` accepts substring hints (project folder name / path / session_id) in addition to exact UUID, with ambiguous-match and no-match paths that list candidates
 - [x] enough session metadata to distinguish multiple editors safely — added `name` (project basename), `editor_pid`, and `last_seen` heartbeat to every session; surfaced in `session_list`
 - [x] per-call session targeting — every Godot-talking tool accepts an optional `session_id`; bound at the `DirectRuntime` layer so `require_writable` and handlers see the pinned session. Lets two AI clients share one server without stomping each other's active.
-- [x] human-readable session IDs — `<project-slug>@<4hex>` (e.g. `godot-ai@a3f2`) instead of 32-char random hex. Agents can recognize/remember the target without calling `session_list` first.
+- [x] human-readable session IDs — `<project-slug>@<16hex>` with a cryptographic 64-bit suffix. Agents can recognize the target while simultaneous same-project editors avoid birthday collisions.
 
 **Why this matters:** Real use will quickly involve multiple projects, multiple editor windows, or multiple test sessions. The session model needs to stop being “good enough for one editor.”
 
@@ -76,7 +86,8 @@ Adjacent reference docs:
 - [x] batch execution is shipped with a clear contract
 - [x] multi-instance routing works in practice
 - [x] `script.patch` decision is made (shipped: anchor-based replace)
-- [x] test coverage and smoke coverage increase where the new runtime loop needs it (903 Python + 1225 GDScript across 47 suites)
+- [x] test and smoke coverage increased where the runtime loop needs it; live
+  collection, not a point-in-time count in this plan, is authoritative
 
 ---
 
@@ -84,13 +95,33 @@ Adjacent reference docs:
 
 See [Packaging & Distribution](packaging-distribution.md) for full detail. The short version:
 
-- [x] clean install docs for Claude Code, Claude Desktop, Codex, and Antigravity (README + dock auto-configure with manual fallback for every registered client — `_registry.gd::_CLIENT_SCRIPT_PATHS` is the authoritative list — including Cursor, Cline, Roo Code, Kilo, OpenCode, Zed, Windsurf, VS Code/Insiders, Trae, Kiro, Gemini CLI, Cherry Studio, Qwen Code, Kimi Code, Pi Agent, DeepSeek Harness)
-- [x] PyPI / `uvx` path works reliably — automated via `bump-and-release.yml`; live on PyPI as `godot-ai`; `uvx --from godot-ai~=VERSION godot-ai` is the canonical user-install command. Claude Desktop and Codex use the client-owned `godot-ai attach` bridge; other clients remain URL-mode until their command shapes are verified. Stale-index retries (`--refresh`) and cache priming on self-update prevent flaky first-run failures.
+- [x] clean attach-configuration docs for every registered client —
+  `_registry.gd::_CLIENT_SCRIPT_PATHS` is the authoritative list. V4 does not
+  advertise Cherry Studio because it has no verified stdio/dynamic-capability
+  configuration surface.
+- [x] one client path: every supported client launches the authenticated
+  `godot-ai attach` stdio bridge. Exact-version `uvx`, development-venv, and
+  matching system-install launch tiers are resolved fail-closed; Dock Configure
+  prewarms the `uvx` tier while MCP mutation keeps its mutation-only contract.
+  Bare persistent HTTP URLs are invalid in v4.
 - [ ] desktop binary path is real, not aspirational
-- [x] plugin is downloadable from the Godot AssetLib — live as [asset/5050](https://godotengine.org/asset-library/asset/5050) and on the new [Godot Asset Store](https://store.godotengine.org/asset/dlight/godot-ai/); release ZIP workflow ships `godot-ai-plugin.zip` via GitHub Releases; dock self-update banner offers one-click upgrades that survive without an editor restart (`update_reload_runner.gd` handoff). Local self-update smoke (`script/local-self-update-smoke`) is the regression gate.
-- [x] CI covers Python tests, Godot-side tests, and release-smoke install paths (3 OS × 2 Python + 3 OS Godot @ 4.7.0 + a Linux Godot 4.5 canary + release-smoke). Linux CI uses `chickensoft-games/setup-godot` on `ubuntu-latest`. GDScript parse validation (`ci-check-gdscript`) runs before tests. Step timeouts prevent hangs. The 4.5 canary catches the parse-cascade class of regression on the documented-minimum engine; future newer-engine-only tests can skip via `McpTestSuite.skip_on_godot_lt(...)`.
-- [x] bump-and-release workflow — `gh workflow run bump-and-release.yml -f bump=patch/minor/major` bumps versions, commits, tags, and triggers release build
-- [ ] compatibility guidance is published and maintained — README advertises "Godot 4.5+"; the 4.5 floor is CI-guarded by a Linux canary and the updater gates older editors with last-supported-version guidance.
+- [~] v3 plugin builds remain available from the Godot Asset Library and Godot
+  Asset Store. V4 is a signed GitHub exact-tree release with three bound
+  assets (plugin ZIP, canonical inventory, detached signature); publication is
+  deliberately disabled until immutable multi-platform qualification evidence
+  exists.
+- [x] CI covers Python 3.11, 3.12, 3.13, and 3.14 on all three operating
+  systems, Godot 4.7 on all three, and separate Linux inert-refusal checks on
+  Godot 4.5/4.6. Retained historical evidence source-classified all 104 tags
+  into 24 behavior classes and ran 29 selected macOS/Godot 4.7 runtime rows;
+  it is deliberately not recurring cross-platform qualification.
+- [x] signed v4 build/verify/install tooling and transactional v4 self-update
+  exist. `python script/local-self-update-smoke` is the mandatory interactive
+  regression gate; no automatic bump-and-publish workflow remains.
+- [x] compatibility guidance states the Godot 4.7 floor and the manual,
+  no-overlay v3→v4 migration boundary.
+- [ ] immutable Linux, macOS, and Windows release qualification is complete
+  and the manual publication gate can be opened
 - [ ] a new user can get from zero to working in under 10 minutes
 
 Release is not just packaging. It is install flow, docs, smoke coverage, and support burden reduction.
@@ -107,7 +138,7 @@ Two pressures shape the published tool surface: tool-search-aware clients want d
 - [x] document which tools should stay non-deferred (the 4 always-loaded core: `editor_state`, `scene_get_hierarchy`, `node_get_properties`, `session_activate`) and mark the rest `defer_loading: true` in the server's MCP advertisement where the protocol permits
 - [x] add a short "available tool categories" blurb to the server's MCP server instructions so clients using tool search have a map of what to search for
 - [x] verify the published surface still works for clients that do not use tool search (no tool should require a specific discovery path)
-- [x] **Collapse 118 MCP tools to ~39 via `<domain>_manage` rollups (PR #203):** each domain exposes one rolled-up tool that takes `op="<verb>"` + a `params` dict, alongside the highest-traffic verbs that stay as named tools. Schema-aware clients still see every op via the dynamic `Literal[...]` enum built by `register_manage_tool` in `src/godot_ai/tools/_meta_tool.py`. Total surface: 4 core + ~15 named verbs + ~20 rollups = ~39 tools.
+- [x] **Collapse 118 MCP tools via `<domain>_manage` rollups (PR #203):** each domain exposes one rolled-up tool that takes `op="<verb>"` + a `params` dict, alongside the highest-traffic verbs that stay named. Schema-aware clients still see every op via the dynamic `Literal[...]` enum built by `register_manage_tool` in `src/godot_ai/tools/_meta_tool.py`; the generated tool inventory is authoritative.
 - [x] **Per-deploy tool exclusion (PR #170/#177):** `--exclude-domains audio,particle,...` CLI flag and `EditorSettings`-backed dock UI drop entire domains for tool-capped clients while keeping the core 4 alive. `tool_catalog.gd` mirrors `domains.py` so the dock can render checkboxes without round-tripping to a running server; CI keeps them in sync via `tests/unit/test_tool_domains.py`.
 - [x] **Resource-form reads (`godot://...`):** read-only URIs mirror the cheap reads (`godot://node/{path}/properties`, `godot://script/{path}`, `godot://materials`, etc.) so they don't count against the tool cap. Tool form remains for `session_id`-pinned reads.
 

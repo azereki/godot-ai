@@ -91,6 +91,16 @@ class DirectRuntime:
             return self._registry.get(pinned)
         return None
 
+    def get_session(self, session_id: str) -> Session | None:
+        """Return an immutable snapshot for one editor connection."""
+
+        return self._registry.get(session_id)
+
+    def record_session_readiness(self, session_id: str, value: object) -> bool:
+        """Apply an authoritative readiness observation by intent."""
+
+        return self._registry.record_readiness(session_id, value)
+
     @property
     def active_session_id(self) -> str | None:
         return self._pin_active_session_id()

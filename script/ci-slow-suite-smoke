@@ -30,7 +30,8 @@ SUITE_NAME="mcp_slow_smoke"
 EXPECTED_TESTS=25
 
 SERVER_URL="$MCP_SERVER_URL"
-HEADERS=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
+ci_load_http_auth
+HEADERS=("${HTTP_AUTH_HEADERS[@]}" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
 
 cleanup() {
   rm -f "$FIXTURE_DST" "$FIXTURE_DST.uid"

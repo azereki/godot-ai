@@ -32,15 +32,20 @@ GAME_SCREENSHOT_TIMEOUT_SEC = 35.0
 ## before the plugin tears down our own process. Tests override this
 ## to 0 so they don't wait. See `editor_reload_plugin` below.
 PLUGIN_MANAGED_RELOAD_DELAY_SEC = 0.5
-PLUGIN_RELOAD_RECONNECT_TIMEOUT_SEC = 15.0
+PLUGIN_RELOAD_RECONNECT_TIMEOUT_SEC = 90.0
 
-## Strong references to in-flight `_dispatch_reload_async` tasks. The
+## One strong in-flight `_dispatch_reload_async` task per old editor session. The
 ## event loop only holds weak references to tasks created via
 ## `create_task`, so without this set a GC cycle landing during the
 ## post-ack delay could collect the task and silently skip the WS
-## reload command — leaving the caller with a "reload_initiated" ack
-## but no actual reload. A done-callback removes the task on exit.
-_pending_reload_tasks: set[asyncio.Task] = set()
+## reload command. Keying by session also makes repeated authenticated reload
+## calls single-flight, bounding detached work by the editor-session cap.
+_pending_reload_tasks: dict[str, asyncio.Task] = {}
+
+
+def _retire_reload_task(old_id: str, task: asyncio.Task) -> None:
+    if _pending_reload_tasks.get(old_id) is task:
+        _pending_reload_tasks.pop(old_id, None)
 
 
 async def editor_state(runtime: DirectRuntime) -> dict:
@@ -238,18 +243,7 @@ async def logs_read(
         ## source still receive the historical {lines: [str], ...}
         ## payload, so existing dashboards and tests don't break.
         result = await runtime.send_command("get_logs", {"count": 500, "source": "plugin"})
-        ## The plugin response can be either the legacy `{lines: [str]}`
-        ## (older plugin versions) or the new structured shape
-        ## `{lines: [{source, level, text}], ...}`. Normalize to legacy
-        ## strings here so the public Python API doesn't shift under
-        ## existing callers.
-        raw_lines = result.get("lines", [])
-        flat: list[str] = []
-        for entry in raw_lines:
-            if isinstance(entry, dict):
-                flat.append(str(entry.get("text", "")))
-            else:
-                flat.append(str(entry))
+        flat = [str(entry.get("text", "")) for entry in result.get("lines", [])]
         response = paginate(flat, offset, count, key="lines")
         _forward_error_watermark_stamp(result, response)
         return response
@@ -272,28 +266,6 @@ async def logs_read(
         params,
     )
     run_id = result.get("run_id", "")
-    if since_run_id and run_id and run_id != since_run_id:
-        ## The plugin echoes the requested run id back as `run_id` when it
-        ## honors since_run_id, so a mismatch means an older plugin ignored
-        ## the param and served the current run. Return the empty stale
-        ## shape rather than mislabeling current-run lines as the old run.
-        stale = {
-            "source": source,
-            "lines": [],
-            "total_count": 0,
-            "returned_count": 0,
-            "offset": 0,
-            "limit": count,
-            "has_more": False,
-            "run_id": run_id,
-            "is_running": result.get("is_running", False),
-            "dropped_count": result.get("dropped_count", 0),
-            "stale_run_id": True,
-        }
-        if "current_run_id" in result:
-            stale["current_run_id"] = result["current_run_id"]
-        _forward_error_watermark_stamp(result, stale)
-        return stale
     lines = result.get("lines", [])
     total = int(result.get("total_count", len(lines)))
     response = {
@@ -367,9 +339,11 @@ async def editor_reload_plugin(runtime: DirectRuntime) -> dict:
         ## command from a background task. `new_session_id` is dropped
         ## from this shape because it lives in the *next* server's
         ## registry, which this process can never see.
-        task = asyncio.create_task(_dispatch_reload_async(runtime, old_id))
-        _pending_reload_tasks.add(task)
-        task.add_done_callback(_pending_reload_tasks.discard)
+        task = _pending_reload_tasks.get(old_id)
+        if task is None or task.done():
+            task = asyncio.create_task(_dispatch_reload_async(runtime, old_id))
+            _pending_reload_tasks[old_id] = task
+            task.add_done_callback(lambda completed: _retire_reload_task(old_id, completed))
         return {
             "status": "reload_initiated",
             "transport_will_drop": True,
@@ -457,7 +431,9 @@ async def selection_resource_data(runtime: DirectRuntime) -> dict:
 
 
 async def logs_resource_data(runtime: DirectRuntime) -> dict:
-    return await runtime.send_command("get_logs", {"count": 100})
+    result = await runtime.send_command("get_logs", {"count": 100})
+    result["lines"] = [str(entry.get("text", "")) for entry in result.get("lines", [])]
+    return result
 
 
 async def game_eval(runtime: DirectRuntime, code: str) -> dict:

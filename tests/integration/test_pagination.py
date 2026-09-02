@@ -28,7 +28,7 @@ class TestSceneHierarchyRoundTrip:
     async def test_full_result_from_godot(self, harness):
         """Verify Godot returns full results that Python-side pagination can slice."""
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         nodes = _make_nodes(5)
 
         async def mock_handler():
@@ -49,7 +49,7 @@ class TestSceneHierarchyRoundTrip:
 class TestNodeFindRoundTrip:
     async def test_find_nodes_returns_full_set(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         nodes = _make_nodes(15)
 
         async def mock_handler():
@@ -68,7 +68,7 @@ class TestNodeFindRoundTrip:
 class TestFilesystemSearchRoundTrip:
     async def test_search_returns_all_files(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         files = _make_files(8)
 
         async def mock_handler():
@@ -90,7 +90,7 @@ class TestFilesystemSearchRoundTrip:
 class TestLogsRoundTrip:
     async def test_logs_returns_lines(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
         lines = [f"log line {i}" for i in range(20)]
 
         async def mock_handler():

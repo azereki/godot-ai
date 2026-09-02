@@ -109,6 +109,8 @@ func test_run_kills_subprocess_when_budget_expires() -> void:
 		"sleep 5 with 200ms budget must surface timed_out=true")
 	assert_eq(int(result.get("exit_code", 0)), -1,
 		"timed_out runs must report exit_code=-1 — never a real exit code")
+	assert_true(bool(result.get("termination_failed", false)),
+		"POSIX exact-PID termination cannot prove the launcher had no descendants")
 	assert_true(elapsed_msec < 3000,
 		"Timeout kill must return within ~budget+poll, not wait for sleep to finish (elapsed=%dms)" % elapsed_msec)
 
@@ -135,8 +137,47 @@ func test_run_cancels_subprocess_without_reporting_timeout() -> void:
 	assert_false(bool(result.get("timed_out", false)),
 		"cooperative shutdown is not a wall-clock timeout")
 	assert_eq(int(result.get("exit_code", 0)), -1)
+	assert_true(bool(result.get("termination_failed", false)),
+		"POSIX cancellation cannot prove the launcher had no descendants")
 	assert_true(elapsed_msec < 3000,
 		"Cancellation must kill promptly instead of waiting for the child (elapsed=%dms)" % elapsed_msec)
+
+
+func test_posix_timeout_reports_a_surviving_descendant_as_unproven() -> void:
+	if OS.get_name() == "Windows":
+		skip("POSIX exact-PID descendant behavior does not apply on Windows")
+		return
+	var shell := "/bin/sh"
+	var sleep_exe := "/bin/sleep"
+	if not FileAccess.file_exists(sleep_exe):
+		sleep_exe = "/usr/bin/sleep"
+	if not FileAccess.file_exists(shell) or not FileAccess.file_exists(sleep_exe):
+		skip("No /bin/sh and standalone sleep available for descendant fixture")
+		return
+	var marker_path := ProjectSettings.globalize_path("res://.godot").path_join(
+		"mcp_cli_exec_child_%d_%d.marker" % [OS.get_process_id(), Time.get_ticks_msec()]
+	)
+	var script := '("$2" 1; echo descendant-survived > "$1") </dev/null >/dev/null 2>&1 & wait'
+	var started_msec := Time.get_ticks_msec()
+	var result := McpCliExec.run(
+		shell,
+		["-c", script, "mcp-cli-exec-fixture", marker_path, sleep_exe],
+		500,
+	)
+	var elapsed_msec := Time.get_ticks_msec() - started_msec
+	assert_true(bool(result.get("timed_out", false)))
+	assert_true(bool(result.get("termination_failed", false)),
+		"a dead shell does not prove its background sleep stopped")
+	assert_true(elapsed_msec < 3000,
+		"an inherited descendant must not keep pipe draining blocked (%dms)" % elapsed_msec)
+	var marker_deadline := Time.get_ticks_msec() + 2500
+	while not FileAccess.file_exists(marker_path) and Time.get_ticks_msec() < marker_deadline:
+		OS.delay_msec(25)
+	assert_true(FileAccess.file_exists(marker_path),
+		"the background child must finish after its launcher was killed")
+	if FileAccess.file_exists(marker_path):
+		assert_contains(FileAccess.get_file_as_string(marker_path), "descendant-survived")
+		DirAccess.remove_absolute(marker_path)
 
 
 func test_run_wraps_cmd_files_through_cmd_exe_on_windows() -> void:

@@ -1,1204 +1,224 @@
 @tool
 extends McpTestSuite
 
-## Tests for McpUpdateManager. Pins four contracts:
-##   1. parse_releases_response fixture-in / status-out
-##   2. forced-mode (mode_override == "user") label hint
-##   3. install-in-flight gate (cleared on success / failure paths)
-##   4. handoff to plugin.install_downloaded_update (worker drain + call)
-##
-## End-to-end click-Update is exercised by `script/local-self-update-smoke`.
-
-const McpUpdateManagerScript := preload(
-	"res://addons/godot_ai/utils/update_manager.gd"
-)
-const GodotAiPlugin := preload("res://addons/godot_ai/plugin.gd")
-const McpDockScript := preload("res://addons/godot_ai/mcp_dock.gd")
-
-const TEST_ASSET_NAME := "godot-ai-plugin.zip"
-const TEST_ASSET_URL := "https://github.com/hi-godot/godot-ai/releases/download/v999.0.0/godot-ai-plugin.zip"
+const Manager := preload("res://addons/godot_ai/utils/update_manager.gd")
 
 
 func suite_name() -> String:
 	return "update_manager"
 
 
-# ---- _version_can_self_update (pure / static, #475 gate) ---------------
-
-func test_version_can_self_update_false_below_4_5() -> void:
-	## Godot < 4.5 must not self-update into releases that require the
-	## 4.5 Logger API at parse time.
-	assert_false(McpUpdateManagerScript._version_can_self_update(4, 4),
-		"4.4 must be gated once the plugin requires Godot 4.5+")
-	assert_false(McpUpdateManagerScript._version_can_self_update(4, 3),
-		"4.3 must be gated (in-editor self-update disabled)")
-	assert_false(McpUpdateManagerScript._version_can_self_update(4, 0),
-		"4.0 must be gated")
-	assert_false(McpUpdateManagerScript._version_can_self_update(3, 9),
-		"a hypothetical 3.x must be gated")
+static func _asset(name: String, size: int = 32) -> Dictionary:
+	return {
+		"name": name,
+		"size": size,
+		"browser_download_url": (
+			"https://github.com/hi-godot/godot-ai/releases/download/v4.1.0/" + name
+		),
+	}
 
 
-func test_version_can_self_update_true_at_and_above_4_5() -> void:
-	assert_true(McpUpdateManagerScript._version_can_self_update(4, 5),
-		"4.5 is the first engine that can self-update in place")
-	assert_true(McpUpdateManagerScript._version_can_self_update(4, 6),
-		"4.6 can self-update")
-	assert_true(McpUpdateManagerScript._version_can_self_update(5, 0),
-		"a future 5.0 (minor 0) must not be misclassified by the minor check")
+static func _response(assets: Array, tag: String = "v4.1.0") -> PackedByteArray:
+	return JSON.stringify({"tag_name": tag, "assets": assets}).to_utf8_buffer()
 
 
-func test_manual_update_label_includes_version_and_guidance() -> void:
-	## Shown up-front on < 4.5 so the user understands they need a newer
-	## editor before installing the latest plugin.
-	var with_v := McpUpdateManagerScript._manual_update_label("2.5.7")
-	assert_contains(with_v, "2.5.7", "label must name the available version")
-	assert_contains(with_v, "Godot 4.5+", "label must state the engine requirement")
-	assert_contains(with_v, "last Godot AI version", "label must say updates are gated")
-
-
-func test_manual_update_label_omits_version_when_unknown() -> void:
-	## On the click path the version isn't re-threaded; the label still gives
-	## floor guidance without a stray "v" token.
-	var no_v := McpUpdateManagerScript._manual_update_label("")
-	assert_false(no_v.contains(" v"), "no version token when version is empty")
-	assert_contains(no_v, "Godot 4.5+", "label must still state the engine requirement")
-
-
-# ---- _is_trusted_download_url (pure / static, #523 + #599) ------------
-
-func test_trusted_download_url_accepts_repo_release_assets() -> void:
-	assert_true(
-		McpUpdateManagerScript._is_trusted_download_url(TEST_ASSET_URL),
-		"a normal github.com hi-godot/godot-ai release asset URL must be trusted")
-	assert_true(
-		McpUpdateManagerScript._is_trusted_download_url(TEST_ASSET_URL + ".sha256"),
-		"the .sha256 sidecar on the repo release path must be trusted")
-	assert_true(
-		McpUpdateManagerScript._is_trusted_download_url(
-			"https://objects.githubusercontent.com/github-production-release-asset-2e65be/1234/x.zip"),
-		"the githubusercontent redirect target's release-asset key namespace must be trusted")
-
-
-func test_trusted_download_url_rejects_dot_segment_traversal() -> void:
-	## #599 review: dot-segments pass a raw prefix test but normalize
-	## server-side to a different repo. Encoded variants must fail too.
-	var bad := [
-		"https://github.com/hi-godot/godot-ai/releases/download/../../evil/releases/download/v1/x.zip",
-		"https://github.com/hi-godot/godot-ai/releases/download/v1/..%2f..%2fevil.zip",
-		"https://github.com/hi-godot/godot-ai/releases/download/%2e%2e/evil/x.zip",
-		"https://github.com/hi-godot/godot-ai/releases/download/v1/x%5c..%5cevil.zip",
+static func _valid_assets() -> Array:
+	return [
+		_asset(Manager.ASSET_NAME, 4096),
+		_asset(Manager.MANIFEST_NAME, 1024),
+		_asset(Manager.SIGNATURE_NAME, 512),
+		_asset(Manager.LEGACY_ASSET_NAME, 8192),
+		_asset(Manager.LEGACY_CHECKSUM_NAME, 88),
+		_asset(Manager.LEGACY_SIGNATURE_NAME, 512),
 	]
-	for url in bad:
-		assert_false(McpUpdateManager._is_trusted_download_url(url),
-			"dot-segment/encoded traversal must be rejected: %s" % url)
 
 
-func test_trusted_download_url_rejects_wrong_repo_on_trusted_host() -> void:
-	## #599: a trusted GitHub host alone is not enough — the URL must be a
-	## hi-godot/godot-ai release asset. A tampered API response pointing at
-	## another repo's release (attacker-controlled ZIP + matching .sha256 on
-	## the same trusted host) must be refused.
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url(
-			"https://github.com/evil-org/godot-ai/releases/download/v999.0.0/godot-ai-plugin.zip"),
-		"a release asset of another owner on github.com must be rejected")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url(
-			"https://github.com/hi-godot/other-repo/releases/download/v999.0.0/godot-ai-plugin.zip"),
-		"a release asset of another hi-godot repo must be rejected")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url(
-			"https://github.com/evil-org/x/releases/download/v1/godot-ai-plugin.zip.sha256"),
-		"a wrong-repo checksum sidecar URL must be rejected")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url(
-			"https://github.com/hi-godot/godot-ai/archive/refs/heads/main.zip"),
-		"a non-release-asset path on the right repo must be rejected")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url(
-			"https://objects.githubusercontent.com/some-other-namespace/x.zip"),
-		"a non-release-asset object key on the CDN host must be rejected")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url("https://github.com"),
-		"a bare trusted host with no path must be rejected")
+func test_release_parser_accepts_exact_v4_and_migration_asset_set() -> void:
+	var parsed := Manager.parse_releases_response(
+		HTTPRequest.RESULT_SUCCESS, 200, _response(_valid_assets()), "4.0.0"
+	)
+	assert_true(parsed.has_update)
+	assert_eq(parsed.tag, "v4.1.0")
+	assert_eq(parsed.version, "4.1.0")
+	assert_eq(parsed.channel, "stable")
+	assert_eq(parsed.urls.size(), 3)
+	assert_eq(parsed.sizes[Manager.SIGNATURE_NAME], 512)
 
 
-func test_trusted_download_url_accepts_cdn_url_with_signed_query() -> void:
-	## #713: direct CDN asset URLs carry S3-signed query params whose
-	## legitimate %2F tokens (in X-Amz-Credential) previously tripped the
-	## encoded-slash needle scan, making every CDN prefix unreachable. The
-	## needle scan must cover only the path proper.
-	assert_true(
-		McpUpdateManagerScript._is_trusted_download_url(
-			"https://objects.githubusercontent.com/github-production-release-asset-2e65be/1234/x.zip"
-			+ "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
-			+ "&X-Amz-Credential=AKIA%2F20260713%2Fus-east-1%2Fs3%2Faws4_request"
-			+ "&X-Amz-Signature=deadbeef"),
-		"a CDN release-asset URL with a signed query string must be trusted")
-	assert_true(
-		McpUpdateManagerScript._is_trusted_download_url(
-			TEST_ASSET_URL + "?foo=..%2f.."),
-		"encoded slashes in the query (not the path) must not trip the scan")
+func test_release_parser_rejects_missing_duplicate_and_unknown_assets() -> void:
+	var cases := [
+		_valid_assets().slice(0, 5),
+		[
+			_valid_assets()[0], _valid_assets()[0], _valid_assets()[2],
+			_valid_assets()[3], _valid_assets()[4], _valid_assets()[5],
+		],
+		[
+			_valid_assets()[0], _valid_assets()[1], _valid_assets()[2],
+			_valid_assets()[3], _valid_assets()[4], _asset("surprise.bin", 512),
+		],
+	]
+	for assets in cases:
+		var parsed := Manager.parse_releases_response(
+			HTTPRequest.RESULT_SUCCESS, 200, _response(assets), "4.0.0"
+		)
+		assert_false(parsed.has_update, "non-exact release asset set must fail closed")
 
 
-func test_trusted_download_url_still_rejects_bad_path_despite_query() -> void:
-	## Splitting the query off must not open a path-side hole: dot-segments
-	## and encoded slashes IN THE PATH stay rejected with a query present.
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url(
-			"https://github.com/hi-godot/godot-ai/releases/download/../../evil/x.zip?sig=ok"),
-		"path traversal must stay rejected when a query string is present")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url(
-			"https://github.com/hi-godot/godot-ai/releases/download/v1/..%2fevil.zip?sig=ok"),
-		"encoded slash in the path must stay rejected when a query is present")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url(
-			"https://github.com/evil-org/godot-ai/releases/download/v1/x.zip?sig=ok"),
-		"wrong-repo path must stay rejected when a query is present")
+func test_release_parser_rejects_bad_size_url_status_and_tag() -> void:
+	var bad_size := _valid_assets()
+	bad_size[2] = _asset(Manager.SIGNATURE_NAME, 511)
+	var bad_url := _valid_assets()
+	bad_url[0] = _asset(Manager.ASSET_NAME, 4096)
+	bad_url[0].browser_download_url = (
+		"https://github.com/attacker/godot-ai/releases/download/v4.1.0/" + Manager.ASSET_NAME
+	)
+	for parsed in [
+		Manager.parse_releases_response(HTTPRequest.RESULT_SUCCESS, 200, _response(bad_size), "4.0.0"),
+		Manager.parse_releases_response(HTTPRequest.RESULT_SUCCESS, 200, _response(bad_url), "4.0.0"),
+		Manager.parse_releases_response(HTTPRequest.RESULT_CANT_CONNECT, 200, _response(_valid_assets()), "4.0.0"),
+		Manager.parse_releases_response(HTTPRequest.RESULT_SUCCESS, 500, _response(_valid_assets()), "4.0.0"),
+		Manager.parse_releases_response(HTTPRequest.RESULT_SUCCESS, 200, _response(_valid_assets(), "v5.0.0"), "4.0.0"),
+	]:
+		assert_false(parsed.has_update)
 
 
-func test_trusted_download_url_rejects_untrusted_and_insecure() -> void:
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url(
-			"http://github.com/hi-godot/godot-ai/releases/download/v1/godot-ai-plugin.zip"),
-		"plain http must be rejected even on a github host")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url("https://example.invalid/payload.zip"),
-		"a non-github host must be rejected")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url("https://github.com.evil.com/x.zip"),
-		"a look-alike host suffix must be rejected")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url("https://github.com@evil.com/x.zip"),
-		"userinfo spoofing (host is after the last @) must be rejected")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url("https://github.com\\@evil.com/x.zip"),
-		"a backslash before userinfo syntax must be rejected")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url("https://github.com\\evil.com/x.zip"),
-		"a backslash in the apparent authority must be rejected")
-	assert_false(
-		McpUpdateManagerScript._is_trusted_download_url(""),
-		"an empty URL must be rejected")
+func test_version_order_accepts_only_stable_v4_releases() -> void:
+	assert_true(Manager._is_newer("4.1.0", "4.0.99"))
+	assert_false(Manager._is_newer("4.1.0", "4.1.0"))
+	assert_false(Manager._is_newer("4.1.0rc1", "4.0.0"))
+	assert_false(Manager._is_newer("4.1", "4.0.0"))
+	assert_false(Manager._is_newer("5.0.0", "4.0.0"))
 
 
-# ---- _parse_sha256_digest (pure / static, #523) ----------------------
-
-func test_parse_sha256_digest_accepts_sha256sum_line() -> void:
-	## `sha256sum godot-ai-plugin.zip` emits "<hex>  <name>"; only the digest
-	## is used.
-	var hex := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	var parsed := McpUpdateManagerScript._parse_sha256_digest(hex + "  godot-ai-plugin.zip\n")
-	assert_eq(parsed, hex, "must extract the digest from a sha256sum line")
+func test_release_parser_rejects_oversized_metadata_before_decoding() -> void:
+	var oversized := PackedByteArray()
+	oversized.resize(Manager.MAX_RELEASE_METADATA_BYTES + 1)
+	assert_false(Manager.parse_releases_response(
+		HTTPRequest.RESULT_SUCCESS, 200, oversized, "4.0.0"
+	).has_update)
 
 
-func test_parse_sha256_digest_accepts_bare_and_uppercase_digest() -> void:
-	var hex := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	assert_eq(McpUpdateManagerScript._parse_sha256_digest(hex), hex,
-		"a bare digest line must be accepted")
-	assert_eq(McpUpdateManagerScript._parse_sha256_digest(hex.to_upper()), hex,
-		"an uppercase digest must be normalized to lowercase")
+func test_download_url_parser_rejects_spoofing_and_path_traversal() -> void:
+	var valid := (
+		"https://github.com/hi-godot/godot-ai/releases/download/v4.1.0/" + Manager.ASSET_NAME
+	)
+	assert_true(Manager._is_trusted_download_url(valid))
+	assert_true(Manager._is_trusted_download_url(valid.replace("github.com", "github.com:443")))
+	assert_true(Manager._is_trusted_download_url(valid + "?signed=%2Fcredential"))
+	assert_true(Manager._is_trusted_download_url(
+		"https://release-assets.githubusercontent.com/github-production-release-asset-1/x?sig=y"
+	))
+	for url in [
+		"http://github.com/hi-godot/godot-ai/releases/download/v4.1.0/x",
+		"https://github.com.evil.invalid/hi-godot/godot-ai/releases/download/v4.1.0/x",
+		"https://github.com@evil.invalid/hi-godot/godot-ai/releases/download/v4.1.0/x",
+		"https://attacker@github.com/hi-godot/godot-ai/releases/download/v4.1.0/x",
+		"https://GitHub.com/hi-godot/godot-ai/releases/download/v4.1.0/x",
+		"https://github.com:80/hi-godot/godot-ai/releases/download/v4.1.0/x",
+		"https://github.com:evil/hi-godot/godot-ai/releases/download/v4.1.0/x",
+		"https://github.com:443:443/hi-godot/godot-ai/releases/download/v4.1.0/x",
+		"https://github.com/hi-godot/godot-ai/releases/download/v4.1.0/x#fragment",
+		"https://github.com/hi-godot/godot-ai/releases/download/v4.1.0/x\nignored",
+		"https://github.com/hi-godot/godot-ai/releases/download/../../evil/x",
+		"https://github.com/hi-godot/godot-ai/releases/download/%2e%2e/evil/x",
+	]:
+		assert_false(Manager._is_trusted_download_url(url), url)
 
 
-func test_parse_sha256_digest_accepts_tab_and_newline_separators() -> void:
-	var hex := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	assert_eq(McpUpdateManagerScript._parse_sha256_digest(hex + "\tgodot-ai-plugin.zip"), hex,
-		"a tab-separated checksum sidecar must be accepted")
-	assert_eq(McpUpdateManagerScript._parse_sha256_digest(hex + "\ngodot-ai-plugin.zip"), hex,
-		"a newline-separated checksum sidecar must be accepted")
-
-
-func test_parse_sha256_digest_rejects_malformed() -> void:
-	assert_eq(McpUpdateManagerScript._parse_sha256_digest(""), "",
-		"empty content must be rejected")
-	assert_eq(McpUpdateManagerScript._parse_sha256_digest("deadbeef"), "",
-		"a too-short digest must be rejected")
+func test_redirect_parser_requires_one_trusted_absolute_location() -> void:
+	var trusted := (
+		"https://release-assets.githubusercontent.com/github-production-release-asset-1/x?sig=y"
+	)
+	assert_eq(Manager._redirect_url(PackedStringArray(["Location: " + trusted])), trusted)
+	assert_eq(Manager._redirect_url(PackedStringArray(["location: " + trusted])), trusted)
 	assert_eq(
-		McpUpdateManagerScript._parse_sha256_digest(
-			"z3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+		Manager._redirect_url(PackedStringArray(["Location: " + trusted, "Location: " + trusted])),
 		"",
-		"a non-hex character must be rejected")
-
-
-func test_parse_sha256_digest_matches_fileaccess_hash() -> void:
-	## End-to-end: the digest the plugin parses from a sha256sum line must
-	## equal what FileAccess.get_sha256 produces for the same bytes — the
-	## exact comparison _on_checksum_completed makes before extracting.
-	var path := "user://_test_checksum_target.bin"
-	var f := FileAccess.open(path, FileAccess.WRITE)
-	assert_true(f != null, "seed file must open for write")
-	f.store_string("godot-ai self-update integrity test payload")
-	f.close()
-
-	var real := FileAccess.get_sha256(path).to_lower()
-	var sidecar_line := "%s  godot-ai-plugin.zip\n" % real
-	var parsed := McpUpdateManagerScript._parse_sha256_digest(sidecar_line)
-	DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
-
-	assert_eq(parsed, real,
-		"parsed sidecar digest must match FileAccess.get_sha256 (the verify compare)")
-
-
-# ---- download-failure staged-zip cleanup (#713) -------------------------
-
-func test_download_failure_drops_staged_zip() -> void:
-	## HTTPRequest's download_file mode writes whatever bytes arrived (an
-	## error page, a truncated body) to UPDATE_TEMP_ZIP even on failure.
-	## The failure branch must drop them — same guarantee _fail_verification
-	## states — so no later step can pick up a half-downloaded archive.
-	var global_dir := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_DIR)
-	var global_zip := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_ZIP)
-	DirAccess.make_dir_recursive_absolute(global_dir)
-	var f := FileAccess.open(global_zip, FileAccess.WRITE)
-	assert_true(f != null, "Seed staged zip must open for write")
-	f.store_string("partial download bytes")
-	f.close()
-
-	var manager = McpUpdateManagerScript.new()
-	var states: Array[Dictionary] = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		states.append(state)
 	)
+	assert_false(Manager._is_trusted_download_url("/relative/location"))
 
-	manager._on_download_completed(HTTPRequest.RESULT_CANT_CONNECT, 0, [], PackedByteArray())
 
-	var zip_still_staged := FileAccess.file_exists(global_zip)
+func test_preflight_refusal_occurs_before_download_setup() -> void:
+	var manager := Manager.new()
+	manager._release = {
+		"urls": {},
+		"sizes": {},
+		"channel": "stable",
+		"tag": "v4.1.0",
+		"version": "4.1.0",
+	}
+	manager.start_install({"ok": false})
+	assert_true(manager._queue.is_empty())
+	assert_true(manager._asset_request == null)
 	manager.free()
-	DirAccess.remove_absolute(global_zip)
-	DirAccess.remove_absolute(global_dir)
-
-	assert_false(zip_still_staged,
-		"a failed download must not leave partial bytes staged at UPDATE_TEMP_ZIP")
-	assert_eq(states.size(), 1,
-		"a failed download must emit exactly one failure state")
-	var state: Dictionary = states[0]
-	assert_contains(String(state.get("button_text", "")), "Download failed",
-		"a failed download must paint the download-failed button")
-	assert_eq(bool(state.get("button_disabled", true)), false,
-		"a failed download must leave the button enabled for retry")
 
 
-# ---- _verify_then_install mandatory verification (#599) ----------------
-
-func test_verify_refuses_missing_checksum_sidecar() -> void:
-	## Verification is mandatory: a release published without a `.sha256`
-	## sidecar (mistake or tamper) must refuse to install — the old
-	## verify-if-present bypass silently downgraded to an unverified install.
-	var global_dir := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_DIR)
-	var global_zip := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_ZIP)
-	DirAccess.make_dir_recursive_absolute(global_dir)
-	var f := FileAccess.open(global_zip, FileAccess.WRITE)
-	assert_true(f != null, "Seed staged zip must open for write")
-	f.store_string("staged update payload")
-	f.close()
-
-	var manager = McpUpdateManagerScript.new()
-	manager._latest_checksum_url = ""
-	var states: Array[Dictionary] = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		states.append(state)
-	)
-
-	manager._verify_then_install()
-
-	var zip_still_staged := FileAccess.file_exists(global_zip)
+func test_install_candidate_requires_a_release_and_no_retained_download_root() -> void:
+	var manager := Manager.new()
+	assert_false(manager.has_install_candidate())
+	manager._release = {"has_update": true}
+	assert_true(manager.has_install_candidate())
+	manager._download_root = "/private/update-download"
+	assert_false(manager.has_install_candidate())
+	manager._download_root = ""
 	manager.free()
-	DirAccess.remove_absolute(global_zip)
-	DirAccess.remove_absolute(global_dir)
-
-	assert_false(zip_still_staged,
-		"a missing checksum sidecar must drop the staged ZIP, not install it")
-	assert_eq(states.size(), 1,
-		"a missing checksum sidecar must emit exactly one failure state")
-	var state: Dictionary = states[0]
-	assert_contains(String(state.get("button_text", "")), "Verification failed",
-		"a missing checksum sidecar must paint the verification-failed button")
-	assert_eq(bool(state.get("button_disabled", true)), false,
-		"a missing checksum sidecar must leave the button enabled for retry")
 
 
-func test_verify_refuses_wrong_repo_checksum_url() -> void:
-	## A checksum sidecar URL on a trusted GitHub host but pointing at a
-	## different repo's release is a tamper signal — the verify step must
-	## refuse (and drop the staged ZIP) rather than fetch an attacker-
-	## published digest that would trivially match an attacker ZIP.
-	var global_dir := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_DIR)
-	var global_zip := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_ZIP)
-	DirAccess.make_dir_recursive_absolute(global_dir)
-	var f := FileAccess.open(global_zip, FileAccess.WRITE)
-	assert_true(f != null, "Seed staged zip must open for write")
-	f.store_string("staged update payload")
-	f.close()
-
-	var manager = McpUpdateManagerScript.new()
-	manager._latest_checksum_url = (
-		"https://github.com/evil-org/godot-ai/releases/download/v999.0.0/"
-		+ "godot-ai-plugin.zip.sha256"
-	)
-	var states: Array[Dictionary] = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		states.append(state)
-	)
-
-	manager._verify_then_install()
-
-	var zip_still_staged := FileAccess.file_exists(global_zip)
+func test_install_rejects_a_non_actor_download_root() -> void:
+	var manager := Manager.new()
+	manager._release = {
+		"urls": {},
+		"sizes": {},
+		"channel": "stable",
+		"tag": "v4.1.0",
+		"version": "4.1.0",
+	}
+	manager.start_install({"ok": true, "download_root": "relative/path"})
+	assert_true(manager._queue.is_empty())
+	assert_eq(manager._download_root, "")
+	assert_true(manager._asset_request == null)
 	manager.free()
-	DirAccess.remove_absolute(global_zip)
-	DirAccess.remove_absolute(global_dir)
-
-	assert_false(zip_still_staged,
-		"wrong-repo checksum URL must drop the staged ZIP before install")
-	assert_eq(states.size(), 1,
-		"wrong-repo checksum URL must emit exactly one failure state")
-	var state: Dictionary = states[0]
-	assert_contains(String(state.get("button_text", "")), "Verification failed",
-		"wrong-repo checksum URL must paint the verification-failed button")
-	assert_eq(bool(state.get("button_disabled", true)), false,
-		"verification failure must leave the button enabled for retry")
 
 
-func test_checksum_match_on_repo_release_proceeds_to_install() -> void:
-	## Happy path (legacy pre-signing release: no signature URL armed, so
-	## the checksum verdict alone gates the install — #687): staged ZIP
-	## whose FileAccess.get_sha256 matches the digest in the (trusted,
-	## repo-scoped) sidecar body must proceed to install — the manager
-	## paints "Installing..." and does NOT delete the staged ZIP (only
-	## _fail_verification does that).
-	var global_dir := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_DIR)
-	var global_zip := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_ZIP)
-	DirAccess.make_dir_recursive_absolute(global_dir)
-	var f := FileAccess.open(global_zip, FileAccess.WRITE)
-	assert_true(f != null, "Seed staged zip must open for write")
-	f.store_string("staged update payload for checksum match")
-	f.close()
-	var digest := FileAccess.get_sha256(global_zip).to_lower()
-	var sidecar_body := ("%s  godot-ai-plugin.zip\n" % digest).to_utf8_buffer()
-
-	var manager = McpUpdateManagerScript.new()
-	manager._latest_checksum_url = TEST_ASSET_URL + ".sha256"
-	assert_true(
-		McpUpdateManagerScript._is_trusted_download_url(manager._latest_checksum_url),
-		"Seed: the repo-scoped sidecar URL must pass the trust guard")
-	var states: Array[Dictionary] = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		states.append(state)
-	)
-
-	## Drive the verify completion directly; _install_zip runs via
-	## call_deferred, which never fires for a manager freed within the test,
-	## so assert on the synchronous evidence of the install handoff.
-	manager._on_checksum_completed(HTTPRequest.RESULT_SUCCESS, 200, [], sidecar_body)
-
-	var zip_still_staged := FileAccess.file_exists(global_zip)
-	manager.free()
-	DirAccess.remove_absolute(global_zip)
-	DirAccess.remove_absolute(global_dir)
-
-	assert_true(zip_still_staged,
-		"a matching digest must keep the staged ZIP for the install step")
-	assert_eq(states.size(), 1,
-		"a matching digest must emit exactly one state before install")
-	var state: Dictionary = states[0]
-	assert_eq(String(state.get("button_text", "")), "Installing...",
-		"a matching digest must advance the pipeline to Installing...")
-
-
-# ---- Release-signature verification (#687) ------------------------------
-
-func _sha256_of(bytes: PackedByteArray) -> PackedByteArray:
-	var ctx := HashingContext.new()
-	ctx.start(HashingContext.HASH_SHA256)
-	ctx.update(bytes)
-	return ctx.finish()
-
-
-func test_verify_sidecar_signature_accepts_valid_signature() -> void:
-	## Round-trip with a throwaway keypair: sign SHA-256(sidecar) the way
-	## release.yml's `openssl dgst -sha256 -sign` does (PKCS#1 v1.5), then
-	## verify through the exact helper `_on_signature_completed` calls.
-	var crypto := Crypto.new()
-	var key := crypto.generate_rsa(2048)
-	var pub_pem := key.save_to_string(true)
-	var sidecar := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  godot-ai-plugin.zip\n".to_utf8_buffer()
-	var signature := crypto.sign(HashingContext.HASH_SHA256, _sha256_of(sidecar), key)
-
-	assert_true(
-		McpUpdateManagerScript._verify_sidecar_signature(pub_pem, sidecar, signature),
-		"a signature produced over the sidecar's SHA-256 must verify")
-
-
-func test_verify_sidecar_signature_rejects_tampered_and_missing() -> void:
-	var crypto := Crypto.new()
-	var key := crypto.generate_rsa(2048)
-	var pub_pem := key.save_to_string(true)
-	var sidecar := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  godot-ai-plugin.zip\n".to_utf8_buffer()
-	var signature := crypto.sign(HashingContext.HASH_SHA256, _sha256_of(sidecar), key)
-
-	var tampered := sidecar.duplicate()
-	tampered[0] = tampered[0] ^ 0xFF
-	assert_false(
-		McpUpdateManagerScript._verify_sidecar_signature(pub_pem, tampered, signature),
-		"a signature must not verify over different sidecar bytes")
-
-	var other_key := crypto.generate_rsa(2048)
-	var forged := crypto.sign(HashingContext.HASH_SHA256, _sha256_of(sidecar), other_key)
-	assert_false(
-		McpUpdateManagerScript._verify_sidecar_signature(pub_pem, sidecar, forged),
-		"a signature from a different private key must not verify")
-
-	assert_false(
-		McpUpdateManagerScript._verify_sidecar_signature(pub_pem, sidecar, PackedByteArray()),
-		"an empty signature must not verify")
-	assert_false(
-		McpUpdateManagerScript._verify_sidecar_signature(pub_pem, PackedByteArray(), signature),
-		"empty sidecar bytes must not verify")
-	assert_false(
-		McpUpdateManagerScript._verify_sidecar_signature("not a pem", sidecar, signature),
-		"a malformed public key must fail closed, not crash or pass")
-
-
-func test_embedded_public_key_loads_as_rsa_public_key() -> void:
-	## The const must stay a loadable public-only PEM — a paste error here
-	## would brick signature verification for every user on the next release.
-	var key := CryptoKey.new()
+func test_download_path_accepts_only_the_exact_release_asset_set() -> void:
+	var manager := Manager.new()
+	manager._download_root = "/private/update-download"
 	assert_eq(
-		key.load_from_string(McpUpdateManagerScript.RELEASE_SIGNING_PUBLIC_KEY_PEM, true), OK,
-		"RELEASE_SIGNING_PUBLIC_KEY_PEM must load as a public key")
-	assert_true(key.is_public_only(),
-		"the embedded key must be public-only — never ship private material")
-
-
-func test_signature_required_gates_on_signing_era() -> void:
-	## Below the first signed release: legacy checksum-only path allowed.
-	## At/above it (every future release): a missing signature is a
-	## strip-attack signal and must hard-fail. Unknown fails closed.
-	assert_false(McpUpdateManagerScript._signature_required("2.9.2"),
-		"pre-signing releases must keep installing via the legacy path")
-	assert_false(McpUpdateManagerScript._signature_required("1.0.0"),
-		"old releases must keep installing via the legacy path")
-	assert_true(McpUpdateManagerScript._signature_required(
-		McpUpdateManagerScript.SIGNING_REQUIRED_FROM_VERSION),
-		"the first signing-era version must require a signature")
-	assert_true(McpUpdateManagerScript._signature_required("999.0.0"),
-		"future releases must require a signature")
-	assert_true(McpUpdateManagerScript._signature_required(""),
-		"an unknown remote version must fail closed")
-
-
-func test_verify_refuses_unsigned_signing_era_release() -> void:
-	## A release inside the signing era whose .sig asset is absent must be
-	## treated as stripped/tampered — hard fail, staged ZIP dropped. This is
-	## what stops an attacker who can rewrite release assets from simply
-	## deleting the signature to skip verification.
-	var global_dir := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_DIR)
-	var global_zip := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_ZIP)
-	DirAccess.make_dir_recursive_absolute(global_dir)
-	var f := FileAccess.open(global_zip, FileAccess.WRITE)
-	assert_true(f != null, "Seed staged zip must open for write")
-	f.store_string("staged update payload")
-	f.close()
-
-	var manager = McpUpdateManagerScript.new()
-	manager._latest_checksum_url = TEST_ASSET_URL + ".sha256"
-	manager._latest_signature_url = ""
-	manager._latest_remote_version = "999.0.0"
-	var states: Array[Dictionary] = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		states.append(state)
+		manager._download_path(Manager.ASSET_NAME),
+		"/private/update-download/" + Manager.ASSET_NAME,
 	)
-
-	manager._verify_then_install()
-
-	var zip_still_staged := FileAccess.file_exists(global_zip)
-	manager.free()
-	DirAccess.remove_absolute(global_zip)
-	DirAccess.remove_absolute(global_dir)
-
-	assert_false(zip_still_staged,
-		"an unsigned signing-era release must drop the staged ZIP")
-	assert_eq(states.size(), 1,
-		"an unsigned signing-era release must emit exactly one failure state")
-	assert_contains(String(states[0].get("button_text", "")), "Verification failed",
-		"an unsigned signing-era release must paint the verification-failed button")
-
-
-func test_verify_refuses_wrong_repo_signature_url() -> void:
-	## A signature URL pointing at another repo's release asset is a tamper
-	## signal — refuse before fetching it.
-	var global_dir := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_DIR)
-	var global_zip := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_ZIP)
-	DirAccess.make_dir_recursive_absolute(global_dir)
-	var f := FileAccess.open(global_zip, FileAccess.WRITE)
-	assert_true(f != null, "Seed staged zip must open for write")
-	f.store_string("staged update payload")
-	f.close()
-
-	var manager = McpUpdateManagerScript.new()
-	manager._latest_checksum_url = TEST_ASSET_URL + ".sha256"
-	manager._latest_signature_url = (
-		"https://github.com/evil-org/godot-ai/releases/download/v999.0.0/"
-		+ "godot-ai-plugin.zip.sha256.sig"
-	)
-	manager._latest_remote_version = "999.0.0"
-	var states: Array[Dictionary] = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		states.append(state)
-	)
-
-	manager._verify_then_install()
-
-	var zip_still_staged := FileAccess.file_exists(global_zip)
-	manager.free()
-	DirAccess.remove_absolute(global_zip)
-	DirAccess.remove_absolute(global_dir)
-
-	assert_false(zip_still_staged,
-		"a wrong-repo signature URL must drop the staged ZIP")
-	assert_eq(states.size(), 1,
-		"a wrong-repo signature URL must emit exactly one failure state")
-	assert_contains(String(states[0].get("button_text", "")), "Verification failed",
-		"a wrong-repo signature URL must paint the verification-failed button")
-
-
-func test_bad_signature_bytes_fail_verification_and_drop_zip() -> void:
-	## Drive the signature-completion callback with bytes that cannot verify
-	## against the embedded release key — the hard-fail path an attacker
-	## hits after regenerating the sidecar for a tampered zip.
-	var global_dir := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_DIR)
-	var global_zip := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_ZIP)
-	DirAccess.make_dir_recursive_absolute(global_dir)
-	var f := FileAccess.open(global_zip, FileAccess.WRITE)
-	assert_true(f != null, "Seed staged zip must open for write")
-	f.store_string("staged update payload")
-	f.close()
-
-	var manager = McpUpdateManagerScript.new()
-	manager._latest_signature_url = TEST_ASSET_URL + ".sha256.sig"
-	manager._pending_sidecar_body = "digest  godot-ai-plugin.zip\n".to_utf8_buffer()
-	manager._pending_expected_digest = "0000000000000000000000000000000000000000000000000000000000000000"
-	var states: Array[Dictionary] = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		states.append(state)
-	)
-
-	manager._on_signature_completed(
-		HTTPRequest.RESULT_SUCCESS, 200, [], "not a real signature".to_utf8_buffer()
-	)
-
-	var zip_still_staged := FileAccess.file_exists(global_zip)
-	var pending_cleared: bool = manager._pending_sidecar_body.is_empty()
-	manager.free()
-	DirAccess.remove_absolute(global_zip)
-	DirAccess.remove_absolute(global_dir)
-
-	assert_false(zip_still_staged,
-		"a non-verifying signature must drop the staged ZIP, not install it")
-	assert_true(pending_cleared,
-		"failure must clear the held sidecar bytes")
-	assert_eq(states.size(), 1,
-		"a non-verifying signature must emit exactly one failure state")
-	assert_contains(String(states[0].get("button_text", "")), "Verification failed",
-		"a non-verifying signature must paint the verification-failed button")
-
-
-# ---- parse_releases_response (pure / static) ---------------------------
-
-func _make_body(json_str: String) -> PackedByteArray:
-	return json_str.to_utf8_buffer()
-
-
-func _make_release_payload(tag: String) -> String:
-	return JSON.stringify({
-		"tag_name": tag,
-		"assets": [{
-			"name": TEST_ASSET_NAME,
-			"browser_download_url": TEST_ASSET_URL,
-		}]
-	})
-
-
-func test_parse_releases_response_no_update_when_remote_equals_local() -> void:
-	## Remote == local should leave `has_update` false so the dock keeps
-	## the banner hidden. Otherwise we'd re-offer "update" to the same
-	## version on every focus-in.
-	var local := McpClientConfigurator.get_plugin_version()
-	var body := _make_body(_make_release_payload("v" + local))
-	var result := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_SUCCESS, 200, body
-	)
-	assert_false(bool(result.get("has_update", true)),
-		"Equal remote/local versions must not flag an update")
-
-
-func test_parse_releases_response_yes_update_when_remote_newer() -> void:
-	## A bumped major guarantees newer than whatever the plugin ships at.
-	var body := _make_body(_make_release_payload("v999.0.0"))
-	var result := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_SUCCESS, 200, body
-	)
-	assert_true(bool(result.get("has_update", false)),
-		"Remote version > local must flag an update")
-	assert_eq(String(result.get("version", "")), "999.0.0",
-		"Returned version must strip the leading 'v' from the tag")
-	assert_eq(String(result.get("download_url", "")), TEST_ASSET_URL,
-		"Asset URL must be the matching godot-ai-plugin.zip download")
-	assert_contains(String(result.get("label_text", "")), "Update available",
-		"Label text must lead with 'Update available' for the dock to render")
-	assert_contains(String(result.get("label_text", "")), "999.0.0",
-		"Label text must include the version")
-
-
-func test_parse_releases_response_handles_http_failure() -> void:
-	## Non-200 (rate limit, offline, etc.) must surface `has_update: false`
-	## without throwing. The dock leaves the banner hidden on failure.
-	var body := _make_body("")
-	var failed := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_CANT_CONNECT, 0, body
-	)
-	assert_false(bool(failed.get("has_update", true)),
-		"Connect failure must not flag an update")
-	var rate_limited := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_SUCCESS, 403, body
-	)
-	assert_false(bool(rate_limited.get("has_update", true)),
-		"Rate-limited 403 must not flag an update")
-
-
-func test_parse_releases_response_handles_malformed_json() -> void:
-	## A 200 with a non-JSON body must leave `has_update: false`. JSON
-	## parsing failures used to fall through to a NPE in the dock.
-	var body := _make_body("not actually json")
-	var result := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_SUCCESS, 200, body
-	)
-	assert_false(bool(result.get("has_update", true)),
-		"Malformed JSON must not flag an update")
-
-
-func test_parse_releases_response_captures_checksum_asset_url() -> void:
-	## The release ships a `godot-ai-plugin.zip.sha256` sidecar; its URL must
-	## be surfaced so the installer can verify integrity before extract (#523).
-	var checksum_url := TEST_ASSET_URL + ".sha256"
-	var body := _make_body(JSON.stringify({
-		"tag_name": "v999.0.0",
-		"assets": [
-			{"name": TEST_ASSET_NAME, "browser_download_url": TEST_ASSET_URL},
-			{"name": TEST_ASSET_NAME + ".sha256", "browser_download_url": checksum_url},
-		],
-	}))
-	var result := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_SUCCESS, 200, body
-	)
-	assert_eq(String(result.get("download_url", "")), TEST_ASSET_URL,
-		"zip asset URL must still resolve when a checksum sidecar is present")
-	assert_eq(String(result.get("checksum_url", "")), checksum_url,
-		"the .sha256 sidecar URL must be captured")
-
-
-func test_parse_releases_response_captures_signature_asset_url() -> void:
-	## Signing-era releases ship a `.sha256.sig` third asset (#687); its URL
-	## must surface so the installer can verify provenance before extract.
-	var checksum_url := TEST_ASSET_URL + ".sha256"
-	var signature_url := TEST_ASSET_URL + ".sha256.sig"
-	var body := _make_body(JSON.stringify({
-		"tag_name": "v999.0.0",
-		"assets": [
-			{"name": TEST_ASSET_NAME, "browser_download_url": TEST_ASSET_URL},
-			{"name": TEST_ASSET_NAME + ".sha256", "browser_download_url": checksum_url},
-			{"name": TEST_ASSET_NAME + ".sha256.sig", "browser_download_url": signature_url},
-		],
-	}))
-	var result := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_SUCCESS, 200, body
-	)
-	assert_eq(String(result.get("checksum_url", "")), checksum_url,
-		"the .sha256 sidecar URL must still be captured alongside the signature")
-	assert_eq(String(result.get("signature_url", "")), signature_url,
-		"the .sha256.sig signature URL must be captured")
-
-
-func test_parse_releases_response_signature_empty_when_absent() -> void:
-	## Pre-signing releases have no .sig asset — signature_url must stay
-	## empty; `_verify_then_install` decides legacy-vs-refuse from the
-	## remote version (#687).
-	var body := _make_body(_make_release_payload("v999.0.0"))
-	var result := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_SUCCESS, 200, body
-	)
-	assert_eq(String(result.get("signature_url", "")), "",
-		"no signature asset must yield an empty signature_url")
-
-
-func test_checksum_completed_with_signature_armed_defers_install() -> void:
-	## With a signature URL armed, a checksum download completing must NOT
-	## advance to Installing... — the digest is untrusted until the
-	## signature verdict. (In-tree, _fetch_signature would fire the HTTP
-	## request; out-of-tree it fails closed. Either way: no install.)
-	var manager = McpUpdateManagerScript.new()
-	manager._latest_signature_url = TEST_ASSET_URL + ".sha256.sig"
-	var digest := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-	var states: Array[Dictionary] = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		states.append(state)
-	)
-
-	manager._on_checksum_completed(
-		HTTPRequest.RESULT_SUCCESS, 200, [],
-		("%s  godot-ai-plugin.zip\n" % digest).to_utf8_buffer()
-	)
-
-	var reached_install := false
-	for state in states:
-		if String(state.get("button_text", "")) == "Installing...":
-			reached_install = true
-	manager.free()
-
-	assert_false(reached_install,
-		"a signed release must never reach Installing... before the signature verdict")
-
-
-func test_parse_releases_response_checksum_empty_when_absent() -> void:
-	## A release without a sidecar must leave checksum_url empty — that's the
-	## signal `_verify_then_install` uses to REFUSE the install (#599).
-	var body := _make_body(_make_release_payload("v999.0.0"))
-	var result := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_SUCCESS, 200, body
-	)
-	assert_eq(String(result.get("checksum_url", "")), "",
-		"no sidecar asset must yield an empty checksum_url")
-
-
-func test_parse_releases_response_missing_asset_returns_empty_url() -> void:
-	## Some manual tag pushes ship without a `godot-ai-plugin.zip` asset.
-	## The dock then falls back to opening the release page (the manager
-	## checks `download_url.is_empty()` in `start_install`).
-	var body := _make_body(JSON.stringify({
-		"tag_name": "v999.0.0",
-		"assets": [{
-			"name": "some-other-asset.tar.gz",
-			"browser_download_url": "https://example.invalid/other.tar.gz",
-		}]
-	}))
-	var result := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_SUCCESS, 200, body
-	)
-	assert_true(bool(result.get("has_update", false)),
-		"Newer version still flags an update even when the asset is missing")
-	assert_eq(String(result.get("download_url", "")), "",
-		"Missing godot-ai-plugin.zip asset must surface an empty download URL")
-
-
-# ---- forced-mode label hint --------------------------------------------
-
-func _force_mode_override(value: String) -> void:
-	var es := EditorInterface.get_editor_settings()
-	if es == null:
-		return
-	es.set_setting(McpClientConfigurator.MODE_OVERRIDE_SETTING, value)
-
-
-func _restore_mode_override(prior_value: String) -> void:
-	var es := EditorInterface.get_editor_settings()
-	if es == null:
-		return
-	es.set_setting(McpClientConfigurator.MODE_OVERRIDE_SETTING, prior_value)
-
-
-func _read_mode_override() -> String:
-	var es := EditorInterface.get_editor_settings()
-	if es == null or not es.has_setting(McpClientConfigurator.MODE_OVERRIDE_SETTING):
-		return ""
-	return str(es.get_setting(McpClientConfigurator.MODE_OVERRIDE_SETTING))
-
-
-func test_label_includes_forced_hint_when_user_mode_override_active() -> void:
-	## Mode-override resolution lives on `McpClientConfigurator`. The
-	## manager mirrors the dock's old behaviour: when `mode_override()`
-	## returns "user" the label gets a " (forced)" suffix so testers
-	## driving `GODOT_AI_MODE=user` from a dev tree don't forget the
-	## banner is only painting because of the override.
-	var prior := _read_mode_override()
-	_force_mode_override("user")
-	var body := _make_body(_make_release_payload("v999.0.0"))
-	var result := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_SUCCESS, 200, body
-	)
-	_restore_mode_override(prior)
-
-	assert_true(bool(result.get("forced", false)),
-		"forced flag must be true when mode_override == 'user'")
-	assert_contains(String(result.get("label_text", "")), "(forced)",
-		"Label text must carry the forced hint when mode_override == 'user'")
-
-
-func test_label_skips_forced_hint_in_auto_mode() -> void:
-	## In Auto mode (no override active) the label must not carry the
-	## forced hint — that's reserved for the dropdown / env-var
-	## "Force user" path so the dock label doesn't lie about how the
-	## banner was reached.
-	var prior := _read_mode_override()
-	_force_mode_override("")
-	var body := _make_body(_make_release_payload("v999.0.0"))
-	var result := McpUpdateManagerScript.parse_releases_response(
-		HTTPRequest.RESULT_SUCCESS, 200, body
-	)
-	_restore_mode_override(prior)
-
-	## In Auto mode + dev checkout, mode_override() == "". `forced` mirrors
-	## that. (The .venv-proximity heuristic doesn't enter the parse path —
-	## it's only consulted by `is_dev_checkout()` upstream of `check_for_updates`.)
-	assert_false(bool(result.get("forced", true)),
-		"forced flag must be false when no override is active")
-	assert_false(String(result.get("label_text", "")).contains("(forced)"),
-			"Label text must not carry the forced hint in Auto mode")
-
-
-# ---- install-in-flight gate --------------------------------------------
-
-func test_install_in_flight_default_false() -> void:
-	var manager = McpUpdateManagerScript.new()
-	assert_false(manager.is_install_in_flight(),
-		"A fresh manager must default to is_install_in_flight() == false")
+	assert_eq(manager._download_path("../escape"), "")
 	manager.free()
 
 
-# ---- Godot floor update gate -------------------------------------------
-
-class _NoSelfUpdateManager extends McpUpdateManagerScript:
-	func _can_self_update() -> bool:
-		return false
-
-
-func test_update_check_below_floor_does_not_arm_download() -> void:
-	## A 4.4 editor must not cache the latest ZIP URL or emit the normal
-	## update offer. Otherwise one click can install the 4.5+-only release.
-	var manager = _NoSelfUpdateManager.new()
-	var body := _make_body(_make_release_payload("v999.0.0"))
-	var states: Array[Dictionary] = []
-	var update_results: Array[Dictionary] = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		states.append(state)
+func test_failed_refresh_clears_a_previous_install_candidate() -> void:
+	var manager := Manager.new()
+	manager._release = {"has_update": true, "tag": "v4.1.0"}
+	manager._on_check_completed(
+		HTTPRequest.RESULT_CANT_CONNECT, 0, PackedStringArray(), PackedByteArray()
 	)
+	assert_true(manager._release.is_empty())
+	manager.free()
+
+
+func test_release_candidate_does_not_alias_emitted_view_model() -> void:
+	var manager := Manager.new()
+	var emissions: Array[Dictionary] = []
 	manager.update_check_completed.connect(func(result: Dictionary) -> void:
-		update_results.append(result)
+		emissions.append(result)
 	)
-
-	manager._on_update_check_completed(HTTPRequest.RESULT_SUCCESS, 200, [], body)
-
-	assert_eq(update_results.size(), 0,
-		"below-floor update checks must not emit the normal update offer")
-	assert_eq(manager._latest_download_url, "",
-		"below-floor update checks must not arm the ZIP download URL")
-	assert_eq(manager._latest_checksum_url, "",
-		"below-floor update checks must not arm the checksum URL")
-	assert_eq(states.size(), 1,
-		"below-floor update checks must emit one guidance banner state")
-	var state: Dictionary = states[0]
-	assert_eq(String(state.get("button_text", "")), "Upgrade Godot",
-		"below-floor banner must make the required action clear")
-	assert_eq(bool(state.get("button_disabled", false)), true,
-		"below-floor update button must be disabled")
-	assert_eq(bool(state.get("banner_visible", false)), true,
-		"below-floor guidance must keep the banner visible")
-	assert_contains(String(state.get("label_text", "")), "Godot 4.5+",
-		"below-floor guidance must state the new engine floor")
-	manager.free()
-
-
-func test_start_install_below_floor_only_repaints_guidance() -> void:
-	## If a stale UI path calls start_install anyway, keep it inside the
-	## guidance state rather than opening the browser or entering install.
-	var manager = _NoSelfUpdateManager.new()
-	var states: Array[Dictionary] = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		states.append(state)
+	manager._on_check_completed(
+		HTTPRequest.RESULT_SUCCESS,
+		200,
+		PackedStringArray(),
+		_response(_valid_assets()),
 	)
-
-	manager.start_install()
-
-	assert_eq(states.size(), 1,
-		"below-floor start_install must emit guidance exactly once")
-	var state: Dictionary = states[0]
-	assert_eq(String(state.get("button_text", "")), "Upgrade Godot",
-		"below-floor click path must keep the action as Godot upgrade")
-	assert_eq(bool(state.get("button_disabled", false)), true,
-		"below-floor click path must keep the button disabled")
-	assert_contains(String(state.get("label_text", "")), "Godot 4.5+",
-		"below-floor click path must restate the engine requirement")
+	assert_true(bool(manager._release.get("has_update", false)))
+	assert_eq(emissions.size(), 1)
+	var emitted := emissions[0]
+	var original_url := str(manager._release.urls[Manager.ASSET_NAME])
+	emitted["tag"] = "mutated"
+	emitted.urls[Manager.ASSET_NAME] = "https://attacker.invalid/payload"
+	assert_eq(str(manager._release.tag), "v4.1.0")
+	assert_eq(str(manager._release.urls[Manager.ASSET_NAME]), original_url)
 	manager.free()
-
-
-# ---- handoff to plugin.install_downloaded_update -----------------------
-
-class _RecordingPlugin extends GodotAiPlugin:
-	var install_calls: Array = []
-	var prepare_calls: int = 0
-
-	func install_downloaded_update(zip_path: String, temp_dir: String, source_dock) -> void:
-		install_calls.append({
-			"zip_path": zip_path,
-			"temp_dir": temp_dir,
-			"source_dock": source_dock,
-		})
-		# Don't call into the real install flow — that would reload the plugin
-		# mid-test. Just record the args; the unit asserts on those.
-
-	func prepare_for_update_reload() -> void:
-		prepare_calls += 1
-
-
-class _DrainRecordingDock extends Node:
-	var refresh_drain_calls: int = 0
-	var action_drain_calls: int = 0
-
-	func _drain_client_status_refresh_workers() -> void:
-		refresh_drain_calls += 1
-
-	func _drain_client_action_workers() -> void:
-		action_drain_calls += 1
-
-
-class _NoRunnerPlugin extends Node:
-	pass
-
-
-func test_install_zip_drains_dock_workers_and_hands_off_to_plugin() -> void:
-	## In a 4.5+ editor with a runner-capable plugin, the manager must:
-	##   1. Set _install_in_flight = true so dock spawn paths gate.
-	##   2. Drain the dock's two worker pools (refresh + action) BEFORE
-	##      handing off to the plugin — otherwise a worker mid-call into
-	##      a script the runner is about to overwrite SIGABRTs in
-	##      GDScriptFunction::call.
-	##   3. Call plugin.install_downloaded_update with the manager's temp
-	##      paths + the dock as the source_dock argument (the plugin uses
-	##      that to detach the visible dock before extracting).
-	## Skip on older Godot — the runner path is gated on minor >= 4.
-	## Symlink check is independent of the mode override and aborts the
-	## install before the drain runs. In a dev checkout
-	## `test_project/addons/godot_ai` is a symlink, so this test is
-	## meaningless there. Skip rather than assert the no-op path — that's
-	## already covered by `test_install_zip_aborts_on_symlinked_addons_dir`.
-	if McpClientConfigurator.addons_dir_is_symlink():
-		skip("Skipping handoff test in a symlinked dev checkout")
-		return
-
-	var plugin := _RecordingPlugin.new()
-	var dock := _DrainRecordingDock.new()
-	var manager = McpUpdateManagerScript.new()
-	manager.setup(plugin, dock)
-	manager._install_zip()
-
-	var refresh_calls := dock.refresh_drain_calls
-	var action_calls := dock.action_drain_calls
-	var install_calls := plugin.install_calls.duplicate()
-	var was_in_flight := manager.is_install_in_flight()
-
-	manager.free()
-	dock.free()
-	plugin.free()
-
-	assert_true(was_in_flight,
-		"_install_zip must set is_install_in_flight() before draining")
-	assert_eq(refresh_calls, 1,
-		"refresh-worker drain must run once before plugin handoff")
-	assert_eq(action_calls, 1,
-		"action-worker drain must run once before plugin handoff")
-	assert_eq(install_calls.size(), 1,
-		"plugin.install_downloaded_update must be called exactly once")
-	var args: Dictionary = install_calls[0]
-	assert_eq(String(args.get("zip_path", "")),
-		McpUpdateManagerScript.UPDATE_TEMP_ZIP,
-		"Manager's UPDATE_TEMP_ZIP path must match plugin handoff arg")
-	assert_eq(String(args.get("temp_dir", "")),
-		McpUpdateManagerScript.UPDATE_TEMP_DIR,
-		"Manager's UPDATE_TEMP_DIR path must match plugin handoff arg")
-	assert_true(args.get("source_dock") == dock,
-		"Plugin must receive the dock reference so it can detach the docked control")
-
-
-func test_install_zip_missing_runner_cleans_staged_update_artifacts() -> void:
-	## If an old/invalid plugin object reaches the install path without the
-	## reload runner method, the manager must not leave the downloaded ZIP or
-	## temp dir behind for a later click to reuse accidentally.
-	if McpClientConfigurator.addons_dir_is_symlink():
-		skip("Skipping missing-runner cleanup test in a symlinked dev checkout")
-		return
-
-	var global_dir := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_DIR)
-	var global_zip := ProjectSettings.globalize_path(McpUpdateManagerScript.UPDATE_TEMP_ZIP)
-	DirAccess.make_dir_recursive_absolute(global_dir)
-	var f := FileAccess.open(global_zip, FileAccess.WRITE)
-	assert_true(f != null, "Seed update zip must open for write")
-	f.store_string("staged update payload")
-	f.close()
-	assert_true(FileAccess.file_exists(global_zip),
-		"Seed update zip must exist before _install_zip")
-
-	var plugin := _NoRunnerPlugin.new()
-	var dock := _DrainRecordingDock.new()
-	var manager = McpUpdateManagerScript.new()
-	manager.setup(plugin, dock)
-	var captured_states: Array = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		captured_states.append(state)
-	)
-
-	manager._install_zip()
-
-	var was_in_flight := manager.is_install_in_flight()
-	var refresh_calls := dock.refresh_drain_calls
-	var action_calls := dock.action_drain_calls
-
-	manager.free()
-	dock.free()
-	plugin.free()
-
-	assert_false(was_in_flight,
-		"missing-runner path must clear is_install_in_flight")
-	assert_eq(refresh_calls, 1,
-		"missing-runner path still drains refresh workers before deciding")
-	assert_eq(action_calls, 1,
-		"missing-runner path still drains action workers before deciding")
-	assert_false(FileAccess.file_exists(global_zip),
-		"missing-runner path must delete the staged update ZIP")
-	assert_false(DirAccess.dir_exists_absolute(global_dir),
-		"missing-runner path must remove the empty update temp dir")
-	assert_eq(captured_states.size(), 1,
-		"missing-runner path must emit one install_state_changed event")
-	var state: Dictionary = captured_states[0]
-	assert_eq(String(state.get("button_text", "")), "Reload runner missing",
-		"missing-runner path must report the reload-runner failure")
-	assert_eq(bool(state.get("button_disabled", true)), false,
-		"missing-runner path must leave the update button enabled for retry")
-
-
-func test_install_zip_aborts_on_symlinked_addons_dir() -> void:
-	## addons_dir_is_symlink is the data-safety guard that prevents the
-	## extract from clobbering canonical `plugin/` source through a
-	## symlinked `test_project/addons/godot_ai`. The check is independent
-	## of the mode override — even forced-user mode bails here.
-	if not McpClientConfigurator.addons_dir_is_symlink():
-		skip("Skipping symlink-bail test in a non-dev install")
-		return
-
-	var plugin := _RecordingPlugin.new()
-	var dock := _DrainRecordingDock.new()
-	var manager = McpUpdateManagerScript.new()
-	manager.setup(plugin, dock)
-
-	## Use an Array (reference type) to capture signal payloads — GDScript
-	## lambdas can mutate the array via `.append()`, but a `var =` rebind
-	## inside the lambda doesn't propagate to the outer Dictionary.
-	var captured_states: Array = []
-	manager.install_state_changed.connect(func(state: Dictionary) -> void:
-		captured_states.append(state)
-	)
-	manager._install_zip()
-
-	var was_in_flight := manager.is_install_in_flight()
-	var refresh_calls := dock.refresh_drain_calls
-	var install_calls := plugin.install_calls.size()
-
-	manager.free()
-	dock.free()
-	plugin.free()
-
-	assert_false(was_in_flight,
-		"Symlink bail must NOT flip is_install_in_flight() — that gate is for the actual install window only")
-	assert_eq(refresh_calls, 0,
-		"Symlink bail must NOT drain dock workers — nothing's about to overwrite scripts")
-	assert_eq(install_calls, 0,
-		"Symlink bail must NOT call plugin.install_downloaded_update")
-	assert_eq(captured_states.size(), 1,
-		"Manager must emit exactly one install_state_changed event on the symlink-bail path")
-	var captured_state: Dictionary = captured_states[0]
-	assert_eq(bool(captured_state.get("banner_visible", true)), false,
-		"Symlink bail must hide the banner — the user can't act on it from a dev tree")
-	assert_eq(String(captured_state.get("button_text", "")), "Dev checkout — update via git",
-		"Symlink bail must paint the dev-checkout fallback button text")
-	assert_eq(bool(captured_state.get("button_disabled", false)), true,
-		"Symlink bail must disable the Update button so the user can't retry")
-
-
-func test_clear_pending_download_resets_to_no_url_state() -> void:
-	## Mode-override flips reach into the manager via clear_pending_download
-	## so a fresh check paints over a clean banner. Without the reset, a
-	## dropdown flip from "Force user" → "Auto" in a dev tree would leave
-	## a stale download URL armed.
-	var manager = McpUpdateManagerScript.new()
-	manager._latest_download_url = TEST_ASSET_URL
-	assert_eq(manager._latest_download_url, TEST_ASSET_URL,
-		"Seed: manager must hold the download URL we just set")
-	manager.clear_pending_download()
-	assert_eq(manager._latest_download_url, "",
-		"clear_pending_download must drop the cached URL")
-	manager.free()
-
-
-# ---- mode-override resolution: precedence -----------------------------
-
-func test_mode_override_dropdown_wins_over_env() -> void:
-	## The dock dropdown writes to EditorSettings; that wins over the env
-	## var so a UI flip takes effect immediately without relaunching. The
-	## .venv-proximity heuristic only runs when neither knob is set.
-	## This is the contract the dock relies on — manager just reads
-	## `McpClientConfigurator.mode_override()`, but the precedence is part
-	## of the seam shape.
-	var prior := _read_mode_override()
-	_force_mode_override("user")
-	## Even if GODOT_AI_MODE=dev is set in the environment, the dropdown
-	## value should win. We don't actually mutate env from a test (CI
-	## inherits its own env), so just confirm dropdown=user resolves to
-	## "user" regardless of the surrounding env.
-	var resolved := McpClientConfigurator.mode_override()
-	_restore_mode_override(prior)
-	assert_eq(resolved, "user",
-		"Dropdown override must resolve to 'user' regardless of env")
-
-
-## ----- install gate on the package pre-warm (#896) -----
-
-func test_install_proceeds_immediately_when_no_prewarm_is_running() -> void:
-	## The gate must be completely inert on the normal path — no pre-warm
-	## started (no uvx tier, unusable pin), or one that already finished.
-	var mgr := McpUpdateManager.new()
-	mgr._prewarm_pid = -1
-	assert_true(mgr._wait_for_prewarm_before_install(),
-		"install must not be delayed when no pre-warm is running")
-
-	## A PID that is not alive must also fall straight through.
-	mgr._prewarm_pid = 999999999
-	assert_true(mgr._wait_for_prewarm_before_install(),
-		"a finished pre-warm must not delay install")
-	assert_eq(mgr._prewarm_pid, -1, "a settled pre-warm must clear its pid")
-	mgr.free()
-
-
-func test_install_gate_gives_up_rather_than_stranding_the_update() -> void:
-	## #896: waiting is an optimisation, not a precondition. A wedged pre-warm
-	## must never strand a self-update — past the budget the install proceeds
-	## and the (now longer) startup watch covers a cold spawn.
-	var mgr := McpUpdateManager.new()
-	## OS.get_process_id() is this editor: reliably alive, so the gate sees a
-	## live pre-warm without spawning anything.
-	mgr._prewarm_pid = OS.get_process_id()
-	mgr._prewarm_wait_started_ms = (
-		Time.get_ticks_msec() - McpUpdateManager.PREWARM_WAIT_BUDGET_MS - 1
-	)
-	assert_true(mgr._wait_for_prewarm_before_install(),
-		"an over-budget wait must let the install proceed")
-	assert_eq(mgr._prewarm_pid, -1, "giving up must clear the pid so it is not re-waited")
-	mgr.free()
-
-
-func test_install_gate_budget_covers_a_cold_package_build() -> void:
-	## Too short a budget defeats the point: the install would resume while the
-	## environment is still downloading, which is the case #896 is about.
-	assert_true(McpUpdateManager.PREWARM_WAIT_BUDGET_MS >= 180 * 1000,
-		"the wait must cover a cold ~67-package environment build")
-	## The poll must not be sub-second: pid_alive shells out to tasklist on
-	## Windows from the main thread, so a tight poll stalls the editor.
-	assert_true(McpUpdateManager.PREWARM_POLL_SECONDS >= 1.0,
-		"polling faster than 1s would make the editor sluggish on Windows")

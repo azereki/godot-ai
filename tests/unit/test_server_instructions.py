@@ -21,8 +21,9 @@ import re
 
 import pytest
 
-from godot_ai.server import build_instructions, create_server
+from godot_ai.server import build_instructions
 from godot_ai.tools._meta_tool import MANAGE_TOOL_HANDLERS
+from tests.conftest import create_test_server as create_server
 
 ## Frozen copy of the intentional no-exclusion instructions. Update this only
 ## when capability guidance changes deliberately; accidental drift must fail

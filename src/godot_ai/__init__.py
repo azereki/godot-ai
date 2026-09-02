@@ -107,6 +107,9 @@ def preflight_check_port(port: int, *, label: str, setting: str, host: str = "12
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    from godot_ai.runtime_dependencies import verify_runtime_dependencies
+
+    verify_runtime_dependencies()
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     if effective_argv[:1] == ["attach"]:
         from godot_ai.attach.main import main as attach_main
@@ -212,6 +215,33 @@ def main(argv: Sequence[str] | None = None) -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
+    ## v4 has one stdio architecture: the client-owned attach bridge talks to
+    ## the shared authenticated HTTP backend. It never constructs an in-process
+    ## WebSocket server with an unpublishable HTTP identity.
+    if args.transport == "stdio":
+        if args.reload:
+            parser.error("--reload requires an HTTP transport")
+        if allow_host_networks:
+            parser.error("--allow-host requires an HTTP transport")
+        if args.owner_pid is not None:
+            parser.error("--owner-pid requires an HTTP transport")
+        if args.pid_file is not None:
+            parser.error("--pid-file requires an HTTP transport")
+        from godot_ai.attach.main import main as attach_main
+
+        attach_args = ["--port", str(args.port), "--ws-port", str(args.ws_port)]
+        if exclude_domains:
+            attach_args.extend(("--exclude-domains", ",".join(sorted(exclude_domains))))
+        attach_main(attach_args)
+        return
+
+    from godot_ai.transport.capability import launch_capabilities_from_env
+
+    try:
+        capabilities = launch_capabilities_from_env()
+    except ValueError as exc:
+        parser.error(str(exc))
+
     ## Widen the HTTP bind off loopback only when an allowlist is named. The
     ## DNS-rebinding guard still gates every request by the CIDR(s); binding
     ## off loopback without the guard would be the footgun this flag avoids.
@@ -222,10 +252,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     ## #647: fail fast — with a recognizable message and exit code — when a
     ## foreign process holds a port we need, instead of uvicorn's opaque bind
-    ## error (HTTP) or the half-alive warn-and-continue (WS). Scoped to the
-    ## HTTP transports, i.e. the plugin-managed / dev-server spawn paths;
-    ## stdio keeps the existing tolerate-WS-conflict behavior so a stdio
-    ## client can still use non-Godot tools next to a running editor server.
+    ## error (HTTP) or a half-ready HTTP process without its editor bridge.
     if args.transport in ("sse", "streamable-http"):
         http_host = (
             bind_host_for_networks(allow_host_networks) if allow_host_networks else "127.0.0.1"
@@ -258,12 +285,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             ws_port=args.ws_port,
             exclude_domains=exclude_domains,
             allow_host_networks=allow_host_networks,
+            capabilities=capabilities,
         )
         return
 
     from godot_ai.server import create_server
 
     server = create_server(
+        capabilities=capabilities,
+        http_port=args.port,
         ws_port=args.ws_port,
         exclude_domains=exclude_domains,
         owner_pid=owner_pid,
@@ -272,13 +302,15 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     transport_kwargs = {}
     if args.transport in ("sse", "streamable-http"):
-        from godot_ai.asgi import http_access_log_enabled
+        from godot_ai.asgi import hardened_uvicorn_config, http_access_log_enabled
 
         transport_kwargs["port"] = args.port
         ## Per-request access-log lines are opt-in (GODOT_AI_HTTP_ACCESS_LOG);
         ## see the rationale on HTTP_ACCESS_LOG_ENV in asgi.py. FastMCP still
         ## sets uvicorn's log_level itself — this dict carries neither
         ## `log_level` nor `log_config`, which would suppress that default.
-        transport_kwargs["uvicorn_config"] = {"access_log": http_access_log_enabled()}
+        transport_kwargs["uvicorn_config"] = hardened_uvicorn_config(
+            access_log=http_access_log_enabled()
+        )
 
     server.run(transport=args.transport, **transport_kwargs)

@@ -231,8 +231,6 @@ func test_tracked_allocations_are_freed_after_each_test() -> void:
 
 
 func test_expected_script_error_does_not_fail_test() -> void:
-	if skip_on_godot_lt("4.5", "Logger subclass only exists on Godot 4.5+"):
-		return
 	var runner := McpTestRunner.new()
 	expect_script_error_containing("Parse Error: Expected conditional expression after \"if\".")
 	var result := runner.run_suites([_ExpectedScriptErrorSuite.new()])

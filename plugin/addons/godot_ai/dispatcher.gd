@@ -89,16 +89,36 @@ func unregister(command_name: String, handler_key: String) -> void:
 	_lazy_handler_cache.erase(handler_key)
 	_lazy_handler_specs.erase(handler_key)
 
+## Synchronously realize handler-owned work before any add-on script can be
+## replaced. A handler that cannot prove quiescence keeps the dispatcher live
+## and makes the caller fail closed.
+func quiesce_for_script_swap() -> Dictionary:
+	for handler_key in _lazy_handler_cache:
+		var instance: Variant = _lazy_handler_cache[handler_key]
+		if not is_instance_valid(instance) or not instance.has_method("quiesce_for_script_swap"):
+			return {
+				"ok": false,
+				"error": "Command handler '%s' cannot prove quiescence for script replacement." % handler_key,
+			}
+		var result: Variant = instance.call("quiesce_for_script_swap")
+		if not result is Dictionary or not bool(result.get("ok", false)):
+			return {
+				"ok": false,
+				"error": "Command handler '%s' could not quiesce for script replacement: %s" % [
+					handler_key, result,
+				],
+			}
+	return {"ok": true}
+
+
 ## Drop registered handlers, queued commands, and the log buffer ref so
 ## plugin.gd can release RefCounted handlers before Godot reloads their
-## class_name scripts (issue #46). After clear(), the dispatcher is inert.
-func clear() -> void:
-	## Stop lazy handlers before releasing the cache. Handler-owned polling
-	## coroutines retain any in-flight worker and deferred-response connection
-	## across frames, then join only after the worker is no longer alive.
-	for instance in _lazy_handler_cache.values():
-		if is_instance_valid(instance) and instance.has_method("prepare_for_teardown"):
-			instance.call("prepare_for_teardown")
+## class_name scripts (issue #46). After a successful clear(), the dispatcher
+## is inert. A failed quiesce leaves every reference intact.
+func clear() -> Dictionary:
+	var quiesced := quiesce_for_script_swap()
+	if not bool(quiesced.get("ok", false)):
+		return quiesced
 	_handlers.clear()
 	## Release lazily-constructed handler instances (and the ctor args that
 	## reference plugin-lifetime objects) at the same teardown point where
@@ -113,6 +133,7 @@ func clear() -> void:
 	_log_buffer = null
 	_surfaced_error_tracker = null
 	pause_target = null
+	return {"ok": true}
 ## Drop queued-but-unexecuted commands. Called by the connection on
 ## disconnect (#712): commands queued by the previous connection must not
 ## execute under the next one — the requester is gone, its in-flight

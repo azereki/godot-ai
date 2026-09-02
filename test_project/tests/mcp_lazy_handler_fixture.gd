@@ -28,5 +28,6 @@ func malformed(_params: Dictionary) -> Dictionary:
 	return {}
 
 
-func prepare_for_teardown() -> void:
+func quiesce_for_script_swap() -> Dictionary:
 	teardown_calls += 1
+	return {"ok": true}

@@ -62,9 +62,7 @@ class TestCustomToolsWsEvents:
     async def test_empty_tools_list_clears_session(self, harness):
         plugin = await harness.connect_plugin(session_id="s-ct-2")
         try:
-            await plugin.send_event(
-                "custom_tools_changed", {"tools": [_tool_payload("t1")]}
-            )
+            await plugin.send_event("custom_tools_changed", {"tools": [_tool_payload("t1")]})
             await asyncio.sleep(0.05)
             assert harness.server._custom_tool_service.get_tool("t1") is not None
             ## Empty snapshot = "I have no tools now", not "ignore this".
@@ -90,9 +88,7 @@ class TestCustomToolsWsEvents:
 
     async def test_disconnect_drops_session_tools(self, harness):
         plugin = await harness.connect_plugin(session_id="s-ct-4")
-        await plugin.send_event(
-            "custom_tools_changed", {"tools": [_tool_payload("only-here")]}
-        )
+        await plugin.send_event("custom_tools_changed", {"tools": [_tool_payload("only-here")]})
         await asyncio.sleep(0.05)
         assert harness.server._custom_tool_service.get_tool("only-here") is not None
         await plugin.close()
@@ -103,16 +99,10 @@ class TestCustomToolsWsEvents:
         p1 = await harness.connect_plugin(session_id="s-ct-5a")
         p2 = await harness.connect_plugin(session_id="s-ct-5b")
         try:
-            await p1.send_event(
-                "custom_tools_changed", {"tools": [_tool_payload("from-a")]}
-            )
-            await p2.send_event(
-                "custom_tools_changed", {"tools": [_tool_payload("from-b")]}
-            )
+            await p1.send_event("custom_tools_changed", {"tools": [_tool_payload("from-a")]})
+            await p2.send_event("custom_tools_changed", {"tools": [_tool_payload("from-b")]})
             await asyncio.sleep(0.05)
-            names = {
-                t.name for t in harness.server._custom_tool_service.get_tools()
-            }
+            names = {t.name for t in harness.server._custom_tool_service.get_tools()}
             assert names == {"from-a", "from-b"}
         finally:
             await p1.close()
@@ -124,12 +114,8 @@ class TestCustomToolsWsEvents:
         p1 = await harness.connect_plugin(session_id="s-ct-5c")
         p2 = await harness.connect_plugin(session_id="s-ct-5d")
         try:
-            await p1.send_event(
-                "custom_tools_changed", {"tools": [_tool_payload("from-c")]}
-            )
-            await p2.send_event(
-                "custom_tools_changed", {"tools": [_tool_payload("from-d")]}
-            )
+            await p1.send_event("custom_tools_changed", {"tools": [_tool_payload("from-c")]})
+            await p2.send_event("custom_tools_changed", {"tools": [_tool_payload("from-d")]})
             await asyncio.sleep(0.05)
             svc = harness.server._custom_tool_service
             assert {t.name for t in svc.get_tools(session_id="s-ct-5c")} == {"from-c"}
@@ -176,9 +162,7 @@ class TestCustomManageEndToEnd:
             },
         )
         await asyncio.sleep(0.1)  # let the WS event land in the catalog
-        result = await client.call_tool(
-            "custom_manage", {"op": "list", "params": {}}
-        )
+        result = await client.call_tool("custom_manage", {"op": "list", "params": {}})
         data = result.structured_content
         assert data["tool_count"] == 1
         tool = data["tools"][0]
@@ -191,9 +175,7 @@ class TestCustomManageEndToEnd:
 
     async def test_custom_manage_empty_when_no_tools_pushed(self, mcp_stack):
         client, plugin = mcp_stack
-        result = await client.call_tool(
-            "custom_manage", {"op": "list", "params": {}}
-        )
+        result = await client.call_tool("custom_manage", {"op": "list", "params": {}})
         data = result.structured_content
         assert data["tool_count"] == 0
         assert data["tools"] == []
@@ -206,9 +188,7 @@ class TestCustomToolsResource:
         import json as _json
 
         client, plugin = mcp_stack
-        await plugin.send_event(
-            "custom_tools_changed", {"tools": [_tool_payload("res_tool")]}
-        )
+        await plugin.send_event("custom_tools_changed", {"tools": [_tool_payload("res_tool")]})
         await asyncio.sleep(0.1)
         contents = await client.read_resource("godot://custom-tools")
         payload = _json.loads(contents[0].text)
@@ -219,18 +199,14 @@ class TestCustomToolsResource:
 class TestDisconnectBroadcastFailure:
     """A stalled/broken MCP transport must not break editor disconnect cleanup."""
 
-    async def test_disconnect_cleanup_survives_broadcast_failure(
-        self, harness, monkeypatch
-    ):
+    async def test_disconnect_cleanup_survives_broadcast_failure(self, harness, monkeypatch):
         svc = harness.server._custom_tool_service
 
         async def _boom():
             raise RuntimeError("transport torn down")
 
         plugin = await harness.connect_plugin(session_id="s-ct-fail")
-        await plugin.send_event(
-            "custom_tools_changed", {"tools": [_tool_payload("doomed")]}
-        )
+        await plugin.send_event("custom_tools_changed", {"tools": [_tool_payload("doomed")]})
         await asyncio.sleep(0.05)
         assert svc.get_tool("doomed") is not None
         ## monkeypatch, not direct assignment: the service is a process
@@ -243,55 +219,6 @@ class TestDisconnectBroadcastFailure:
         assert svc.get_tool("doomed") is None
         probe = await harness.connect_plugin(session_id="s-ct-after")
         await probe.close()
-
-
-class TestCustomToolsTokenGate:
-    """On a token-configured launch, only token-authenticated sessions may
-    mutate the agent-visible custom-tool catalog (#690 / #820 review)."""
-
-    async def _tokened_harness(self):
-        import asyncio as _asyncio
-
-        from godot_ai.sessions.registry import SessionRegistry
-        from godot_ai.transport.websocket import GodotWebSocketServer
-        from tests.conftest import ServerHarness, allocate_free_port
-
-        registry = SessionRegistry()
-        port = allocate_free_port()
-        server = GodotWebSocketServer(registry, port=port, auth_token="s3cret")
-        task = _asyncio.create_task(server.start())
-        await _asyncio.sleep(0.1)
-        return ServerHarness(registry=registry, server=server, port=port, _task=task), task
-
-    async def test_tokened_launch_gates_catalog_by_handshake_token(self):
-        h, task = await self._tokened_harness()
-        try:
-            svc = h.server._custom_tool_service
-            ## Tokenless handshake still connects (compat) but its catalog
-            ## push is dropped.
-            anon = await h.connect_plugin(session_id="s-anon")
-            await anon.send_event(
-                "custom_tools_changed", {"tools": [_tool_payload("smuggled")]}
-            )
-            await asyncio.sleep(0.05)
-            assert svc.get_tool("smuggled", session_id="s-anon") is None
-            await anon.close()
-            ## A session that proved the token may publish.
-            authed = await h.connect_plugin(session_id="s-auth", auth_token="s3cret")
-            await authed.send_event(
-                "custom_tools_changed", {"tools": [_tool_payload("legit")]}
-            )
-            await asyncio.sleep(0.05)
-            assert svc.get_tool("legit", session_id="s-auth") is not None
-            await authed.close()
-        finally:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, OSError) as exc:
-                ## Intentional suppression — but log it so a failed server
-                ## shutdown is visible in test output (coding guidelines).
-                print(f"tokened-harness teardown: {exc!r}")
 
 
 class TestPromotedToolsEndToEnd:
@@ -328,9 +255,7 @@ class TestPromotedToolsEndToEnd:
             command = await plugin.recv_command()
             assert command["command"] == "custom_tool:gdunit_run"
             assert command["params"]["suite"] == "smoke"
-            await plugin.send_response(
-                command["request_id"], {"passed": 3}, readiness="ready"
-            )
+            await plugin.send_response(command["request_id"], {"passed": 3}, readiness="ready")
 
         answer = asyncio.ensure_future(_answer())
         result = await client.call_tool("custom_gdunit_run", {"suite": "smoke"})
@@ -338,9 +263,7 @@ class TestPromotedToolsEndToEnd:
         ## GodotClient.send returns the response DATA (envelope unwrapped).
         assert result.structured_content["passed"] == 3
 
-    async def test_disabled_promotion_is_hidden_and_stale_call_is_specific(
-        self, mcp_stack
-    ):
+    async def test_disabled_promotion_is_hidden_and_stale_call_is_specific(self, mcp_stack):
         client, plugin = mcp_stack
         await plugin.send_event(
             "custom_tools_changed", {"tools": [_tool_payload("temp", promoted=True)]}
@@ -356,9 +279,7 @@ class TestPromotedToolsEndToEnd:
         )
         await asyncio.sleep(0.1)
         assert not any(t.name == "custom_temp" for t in await client.list_tools())
-        stale = await client.call_tool(
-            "custom_temp", {"msg": "stale"}, raise_on_error=False
-        )
+        stale = await client.call_tool("custom_temp", {"msg": "stale"}, raise_on_error=False)
         assert stale.is_error
         assert stale.structured_content["error"]["code"] == "CUSTOM_TOOL_DISABLED"
 

@@ -124,6 +124,64 @@ def _select_session(payload: dict[str, Any], *, expected_project: str, explicit_
     return session_id
 
 
+def _project_for_session(payload: dict[str, Any], *, session_id: str) -> str:
+    """Return the project bound to exactly one selected session."""
+
+    if not session_id:
+        raise ValueError("session_id must be non-empty")
+    sessions = _sessions(payload)
+    matches = [session for session in sessions if session.get("session_id") == session_id]
+    if len(matches) != 1:
+        print(
+            f"ERROR: selected Godot session {session_id!r} is not exactly one live session.",
+            file=sys.stderr,
+        )
+        _print_sessions(sessions)
+        raise SystemExit(1)
+    project_path = matches[0].get("project_path")
+    if not isinstance(project_path, str) or not project_path:
+        raise ValueError(f"selected session {session_id!r} has no valid project_path")
+    return project_path
+
+
+def _select_replacement_session(
+    payload: dict[str, Any], *, expected_project: str, old_session_id: str
+) -> str | None:
+    """Select one fresh session for the same project, or report not-ready."""
+
+    if not expected_project:
+        raise ValueError("expected_project must be non-empty")
+    if not old_session_id:
+        raise ValueError("old_session_id must be non-empty")
+
+    sessions = _sessions(payload)
+    expected_normalized = _normalized_project_path(expected_project)
+    matches: list[str] = []
+    for session in sessions:
+        session_id = session.get("session_id")
+        project_path = session.get("project_path")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("connected session is missing a non-empty session_id")
+        if not isinstance(project_path, str) or not project_path:
+            raise ValueError(
+                f"connected session {session_id!r} is missing a non-empty project_path"
+            )
+        if session_id == old_session_id:
+            continue
+        if _normalized_project_path(project_path) == expected_normalized:
+            matches.append(session_id)
+
+    if len(matches) > 1:
+        print(
+            f"ERROR: {len(matches)} fresh Godot sessions belong to the expected project; "
+            "refusing to guess which reload replacement to drive.",
+            file=sys.stderr,
+        )
+        _print_sessions(sessions)
+        raise SystemExit(1)
+    return matches[0] if matches else None
+
+
 def _pin_args(payload: dict[str, Any], *, session_id: str) -> dict[str, Any]:
     existing = payload.get("session_id")
     if existing not in (None, "", session_id):
@@ -143,6 +201,14 @@ def _build_parser() -> argparse.ArgumentParser:
     select.add_argument("--expected-project", required=True)
     select.add_argument("--pin", default="")
 
+    project = subparsers.add_parser("project-for-session")
+    project.add_argument("--session-id", required=True)
+
+    replacement = subparsers.add_parser("select-replacement")
+    replacement.add_argument("--expected-project", required=True)
+    replacement.add_argument("--old-session-id", required=True)
+    replacement.add_argument("--diagnose", action="store_true")
+
     pin_args = subparsers.add_parser("pin-args")
     pin_args.add_argument("--session-id", required=True)
     return parser
@@ -160,6 +226,24 @@ def main() -> int:
                     explicit_pin=args.pin,
                 )
             )
+        elif args.command == "project-for-session":
+            print(_project_for_session(payload, session_id=args.session_id))
+        elif args.command == "select-replacement":
+            replacement = _select_replacement_session(
+                payload,
+                expected_project=args.expected_project,
+                old_session_id=args.old_session_id,
+            )
+            if replacement is None:
+                if args.diagnose:
+                    print(
+                        "ERROR: no fresh Godot session for the expected project "
+                        "appeared before the reload deadline.",
+                        file=sys.stderr,
+                    )
+                    _print_sessions(_sessions(payload))
+                return 2
+            print(replacement)
         else:
             print(json.dumps(_pin_args(payload, session_id=args.session_id), separators=(",", ":")))
     except ValueError as exc:

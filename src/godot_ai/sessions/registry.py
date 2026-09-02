@@ -1,15 +1,18 @@
-"""Session registry — tracks connected Godot editor instances."""
+"""Authoritative table of connected Godot editor instances."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from functools import cached_property
+from types import MappingProxyType
+from typing import Any, Literal
 
 from godot_ai import __version__ as _SERVER_VERSION
+from godot_ai.protocol.envelope import KNOWN_READINESS, WS_PROTOCOL_VERSION
 from godot_ai.telemetry import (
     MilestoneType,
     RecordType,
@@ -19,13 +22,16 @@ from godot_ai.telemetry import (
 
 logger = logging.getLogger(__name__)
 
-## Handshake fields ride into telemetry verbatim otherwise — any local
-## process can connect (see AGENTS.md WS trust boundary) and stuff
-## arbitrary text into godot_version/plugin_version/etc. Mirror the
-## version-token shape the rest of telemetry expects; anything else is
-## replaced wholesale rather than truncated so the collector can count
-## the anomaly without storing attacker-controlled text.
+## Authenticated peer metadata is still untrusted telemetry input. Replace
+## malformed values wholesale so the collector can count the anomaly without
+## retaining attacker-controlled text.
 _VERSION_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+()-]{0,63}$")
+
+## Watermark components whose baseline resets each game run. The server may
+## never observe their zero between stop/start, so on an advanced run_seq the
+## current value is counted in full rather than diffed against a stale baseline.
+_PER_RUN_WATERMARK_KEYS = frozenset({"game_error_warn", "game_warn"})
+_WARN_WATERMARK_KEYS = frozenset({"editor_ring_warn", "game_warn"})
 
 
 def _safe_version_token(value: str) -> str:
@@ -34,50 +40,39 @@ def _safe_version_token(value: str) -> str:
     return "invalid"
 
 
-@dataclass
+def _frozen_int_map(value: Mapping[str, int]) -> Mapping[str, int]:
+    """Own one immutable copy, then reuse it across dataclass replacements."""
+
+    return value if isinstance(value, MappingProxyType) else MappingProxyType(dict(value))
+
+
+@dataclass(frozen=True, slots=True)
 class Session:
-    """A connected Godot editor session."""
+    """Immutable public snapshot; the table replaces it on each transition."""
 
     session_id: str
     godot_version: str
     project_path: str
     plugin_version: str
-    protocol_version: int = 1
+    protocol_version: int = WS_PROTOCOL_VERSION
     current_scene: str = ""
     play_state: str = "stopped"
     readiness: str = "ready"
-    error_watermark: dict[str, int] = field(default_factory=dict)
+    error_watermark: Mapping[str, int] = field(default_factory=dict)
     pending_new_errors: int = 0
-    ## Warnings ride a channel parallel to pending_new_errors: the plugin's
-    ## warn-level buffer counters accumulate here as a separate delta, consumed
-    ## once into `new_warnings_since_last_call` on the next surfaceable success
-    ## response. Kept distinct from errors so a warning-only run is reported
-    ## (it previously read as "clean" — the error-only watermark filter dropped
-    ## every warning).
     pending_new_warnings: int = 0
     editor_pid: int = 0
-    ## Which launcher tier the plugin resolved the Python server from —
-    ## "dev_venv" | "uvx" | "system" | "unknown". Lets agents notice when a
-    ## plugin-level update left an older server running, or when a stray
-    ## dev `.venv` is silently overriding the published install. Older
-    ## plugins omit this in the handshake; default is "unknown".
     server_launch_mode: str = "unknown"
-    ## True when the handshake carried the auth token matching this launch's
-    ## GODOT_AI_WS_TOKEN (#690). Tokenless handshakes are still accepted for
-    ## compat, but stay False here so token-configured launches can restrict
-    ## agent-facing surfaces (e.g. the custom-tool catalog) to sessions that
-    ## actually proved the secret.
-    token_authenticated: bool = False
     connected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_seen: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    @cached_property
-    def name(self) -> str:
-        """Short human-readable name derived from project_path.
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "error_watermark", _frozen_int_map(self.error_watermark))
 
-        E.g. '/Users/x/Documents/godot-ai/test_project/' -> 'test_project'.
-        Falls back to the first 8 chars of session_id if the path is empty.
-        """
+    @property
+    def name(self) -> str:
+        """Short human-readable name derived from project_path."""
+
         path = self.project_path.rstrip("/\\")
         if not path:
             return self.session_id[:8]
@@ -86,11 +81,7 @@ class Session:
                 return path.rsplit(sep, 1)[-1]
         return path
 
-    def touch(self) -> None:
-        """Update last_seen to now. Called on every inbound message."""
-        self.last_seen = datetime.now(timezone.utc)
-
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
             "name": self.name,
@@ -109,133 +100,248 @@ class Session:
         }
 
 
+@dataclass
+class _EditorConnection:
+    phase: Literal["pending", "active"]
+    session: Session
+    peer: Any | None
+    pending: dict[str, asyncio.Future[Any]] = field(default_factory=dict)
+
+
+class PendingCommandLimitError(RuntimeError):
+    """A per-peer or aggregate pending-command budget is full."""
+
+    def __init__(
+        self,
+        *,
+        scope: Literal["peer", "aggregate"],
+        count: int,
+        limit: int,
+        session_id: str,
+    ) -> None:
+        self.scope = scope
+        self.count = count
+        self.limit = limit
+        self.session_id = session_id
+        label = "per-peer" if scope == "peer" else "aggregate"
+        owner = f"Session {session_id}" if scope == "peer" else "Editor bridge"
+        super().__init__(f"{owner} has {count} pending commands ({label} limit {limit})")
+
+
 class SessionRegistry:
-    """Tracks all connected Godot editor sessions.
+    """One table owns membership, snapshots, peers, and pending responses."""
 
-    Callers run on the single asyncio event loop driving the WS transport,
-    so state is mutated without locking.
-    """
-
-    def __init__(self):
-        self._sessions: dict[str, Session] = {}
+    def __init__(
+        self,
+        *,
+        max_pending_per_peer: int = 32,
+        max_pending_total: int = 128,
+    ):
+        self._validate_limits(max_pending_per_peer, max_pending_total)
+        self._entries: dict[str, _EditorConnection] = {}
         self._active_session_id: str | None = None
+        self._pending_count = 0
+        self._max_pending_per_peer = int(max_pending_per_peer)
+        self._max_pending_total = int(max_pending_total)
         self._session_waiters: list[
             tuple[asyncio.Future[Session], str | None, frozenset[str], str | None]
         ] = []
 
-    def register(self, session: Session) -> None:
-        to_notify: list[asyncio.Future[Session]] = []
-        self._sessions[session.session_id] = session
-        if self._active_session_id is None:
-            self._active_session_id = session.session_id
-        ## Session registration is on the editor's critical-path WebSocket
-        ## flow; a telemetry regression must not drop an editor session.
-        ## ``record_telemetry`` is contracted to be non-raising, but the
-        ## outer guard belts-and-suspenders the contract — locked in by
-        ## ``test_register_swallows_telemetry_exceptions``.
-        try:
-            record_telemetry(
-                RecordType.GODOT_CONNECTION,
-                {
-                    "event": "connected",
-                    ## Handshake-supplied strings are sanitized for the
-                    ## telemetry payload only; Session fields stay verbatim
-                    ## for MCP clients.
-                    "godot_version": _safe_version_token(session.godot_version),
-                    "plugin_version": _safe_version_token(session.plugin_version),
-                    "protocol_version": _safe_version_token(str(session.protocol_version)),
-                    "server_launch_mode": _safe_version_token(session.server_launch_mode),
-                    "session_count": len(self._sessions),
-                },
-                session_id=session.session_id,
-            )
-            if len(self._sessions) >= 2:
-                record_milestone(MilestoneType.MULTIPLE_SESSIONS)
-        except Exception:  # noqa: BLE001
-            logger.debug("session connect telemetry failed", exc_info=True)
-        remaining = []
-        for future, exclude_id, known_ids, project_path in self._session_waiters:
-            if future.done():
-                continue
-            if not self._matches_wait_criteria(
-                session,
-                exclude_id=exclude_id,
-                known_ids=known_ids,
-                project_path=project_path,
-            ):
-                remaining.append((future, exclude_id, known_ids, project_path))
-                continue
-            to_notify.append(future)
-        self._session_waiters = remaining
+    @staticmethod
+    def _validate_limits(per_peer: int, total: int) -> None:
+        if per_peer <= 0 or total <= 0:
+            raise ValueError("pending-command limits must be positive")
+        if per_peer > total:
+            raise ValueError("per-peer pending-command limit cannot exceed aggregate limit")
 
-        for future in to_notify:
+    def reserve_connection(self, session: Session, peer: Any) -> bool:
+        """Reserve an ID without making it visible or routable."""
+
+        if session.session_id in self._entries:
+            return False
+        self._entries[session.session_id] = _EditorConnection(
+            phase="pending",
+            session=session,
+            peer=peer,
+        )
+        return True
+
+    def publish_connection(self, session_id: str, peer: Any) -> Session:
+        """Publish a matching reservation as an active routable editor."""
+
+        entry = self._entries.get(session_id)
+        if entry is None or entry.phase != "pending" or entry.peer is not peer:
+            raise KeyError(f"No matching pending connection for session {session_id}")
+        entry.phase = "active"
+        self._on_published(entry.session)
+        return entry.session
+
+    def register(self, session: Session) -> None:
+        """Compatibility path for in-process tests without a socket peer."""
+
+        if not self.reserve_connection(session, None):
+            raise KeyError(f"Session {session.session_id} already registered")
+        self.publish_connection(session.session_id, None)
+
+    def remove_connection(
+        self,
+        session_id: str,
+        *,
+        peer: Any | None = None,
+        close_code: int | None = None,
+    ) -> bool:
+        """Atomically remove one matching entry and fail all of its work."""
+
+        entry = self._entries.get(session_id)
+        if entry is None or (peer is not None and entry.peer is not peer):
+            return False
+        self._entries.pop(session_id)
+        self._pending_count -= len(entry.pending)
+        for request_id, future in entry.pending.items():
             if not future.done():
-                future.set_result(session)
+                future.set_exception(
+                    ConnectionError(
+                        f"Session {session_id} disconnected while request "
+                        f"{request_id} was in flight"
+                    )
+                )
+        entry.pending.clear()
+        if entry.phase == "active":
+            self._on_removed(session_id, close_code)
+        return True
 
     def unregister(self, session_id: str, close_code: int | None = None) -> None:
-        ## Active-session promotion policy on disconnect:
-        ## - n>=2 survivors: do NOT auto-promote — picking by insertion order
-        ##   would route the user's commands to whichever editor happened to
-        ##   connect first ("routing by registration order" bug). Caller must
-        ##   session_activate explicitly.
-        ## - n=1 survivor (audit-v2 #8): the only safe single-editor path —
-        ##   promote it with a warning so an agent on the solo-user setup
-        ##   doesn't see opaque "no active session" errors after an editor
-        ##   crash. Ambiguity-by-order can't apply with one survivor.
-        ## - n=0: keep cleared; nothing to promote.
-        self._sessions.pop(session_id, None)
-        try:
-            ## close_code is the normalized WebSocket close code (e.g. 1011
-            ## = keepalive timeout, 1013 = exclusive-run flood). None means
-            ## no close frame was observed (non-WS teardown paths). Included
-            ## even when None so the field is always present downstream.
-            record_telemetry(
-                RecordType.GODOT_CONNECTION,
-                {
-                    "event": "disconnected",
-                    "session_count": len(self._sessions),
-                    "close_code": close_code,
-                },
-                session_id=session_id,
-            )
-        except Exception:  # noqa: BLE001
-            logger.debug("session disconnect telemetry failed", exc_info=True)
-        if self._active_session_id != session_id:
-            return
-        self._active_session_id = None
-        if len(self._sessions) == 1:
-            survivor_id = next(iter(self._sessions))
-            self._active_session_id = survivor_id
-            logger.warning(
-                "Active session %s disconnected; auto-promoting sole survivor %s",
-                session_id[:8],
-                survivor_id[:8],
-            )
-        else:
-            logger.info(
-                "Active session %s disconnected; no active session until next register/activate",
-                session_id[:8],
-            )
+        """Compatibility alias for metadata-only in-process registrations."""
+
+        self.remove_connection(session_id, close_code=close_code)
 
     def get(self, session_id: str) -> Session | None:
-        return self._sessions.get(session_id)
+        entry = self._active_entry(session_id)
+        return entry.session if entry is not None else None
 
     def get_active(self) -> Session | None:
-        if self._active_session_id:
-            return self._sessions.get(self._active_session_id)
-        return None
+        return self.get(self._active_session_id) if self._active_session_id else None
 
     def set_active(self, session_id: str) -> None:
-        if session_id not in self._sessions:
+        if self._active_entry(session_id) is None:
             raise KeyError(f"Session {session_id} not found")
         self._active_session_id = session_id
 
     def list_all(self) -> list[Session]:
-        return list(self._sessions.values())
+        return [entry.session for entry in self._entries.values() if entry.phase == "active"]
 
     @property
     def active_session_id(self) -> str | None:
         return self._active_session_id
+
+    @property
+    def pending_count(self) -> int:
+        return self._pending_count
+
+    def note_peer_activity(self, session_id: str) -> bool:
+        return self._replace_session(
+            session_id,
+            last_seen=datetime.now(timezone.utc),
+        )
+
+    def record_scene_changed(self, session_id: str, current_scene: str) -> bool:
+        return self._replace_session(session_id, current_scene=current_scene)
+
+    def record_play_state_changed(self, session_id: str, play_state: str) -> bool:
+        return self._replace_session(session_id, play_state=play_state)
+
+    def record_readiness(self, session_id: str, readiness: object) -> bool:
+        entry = self._active_entry(session_id)
+        if entry is None or readiness not in KNOWN_READINESS:
+            return False
+        if entry.session.readiness == readiness:
+            return False
+        entry.session = replace(entry.session, readiness=readiness)
+        return True
+
+    def record_error_watermark(self, session_id: str, value: Mapping[str, int]) -> bool:
+        entry = self._active_entry(session_id)
+        if entry is None:
+            return False
+        watermark, new_errors, new_warnings = _fold_error_watermark(entry.session, value)
+        entry.session = replace(
+            entry.session,
+            error_watermark=watermark,
+            pending_new_errors=entry.session.pending_new_errors + new_errors,
+            pending_new_warnings=entry.session.pending_new_warnings + new_warnings,
+        )
+        return True
+
+    def consume_diagnostic_counts(self, session_id: str) -> tuple[int, int]:
+        """Return and atomically clear both diagnostic hint counters."""
+
+        entry = self._active_entry(session_id)
+        if entry is None:
+            return (0, 0)
+        counts = (entry.session.pending_new_errors, entry.session.pending_new_warnings)
+        if counts != (0, 0):
+            entry.session = replace(
+                entry.session,
+                pending_new_errors=0,
+                pending_new_warnings=0,
+            )
+        return counts
+
+    def open_request(
+        self,
+        session_id: str,
+        request_id: str,
+    ) -> tuple[Any, asyncio.Future[Any]]:
+        entry = self._active_entry(session_id)
+        if entry is None or entry.peer is None:
+            raise ConnectionError(f"No connection for session {session_id}")
+        local_count = len(entry.pending)
+        if local_count >= self._max_pending_per_peer:
+            raise PendingCommandLimitError(
+                scope="peer",
+                count=local_count,
+                limit=self._max_pending_per_peer,
+                session_id=session_id,
+            )
+        if self._pending_count >= self._max_pending_total:
+            raise PendingCommandLimitError(
+                scope="aggregate",
+                count=self._pending_count,
+                limit=self._max_pending_total,
+                session_id=session_id,
+            )
+        if request_id in entry.pending:
+            raise RuntimeError(f"Duplicate request id {request_id} for session {session_id}")
+        future = asyncio.get_running_loop().create_future()
+        entry.pending[request_id] = future
+        self._pending_count += 1
+        return entry.peer, future
+
+    def claim_pending_response(
+        self,
+        session_id: str,
+        request_id: str,
+        *,
+        peer: Any,
+    ) -> asyncio.Future[Any] | None:
+        """Claim a response only when its source session owns the request."""
+
+        future = self._pop_request(session_id, request_id, peer=peer)
+        return future if future is not None and not future.done() else None
+
+    def cancel_request(
+        self,
+        session_id: str,
+        request_id: str,
+        *,
+        peer: Any | None = None,
+    ) -> bool:
+        future = self._pop_request(session_id, request_id, peer=peer)
+        if future is None:
+            return False
+        if not future.done():
+            future.cancel()
+        return True
 
     async def wait_for_session(
         self,
@@ -245,14 +351,14 @@ class SessionRegistry:
         known_ids: set[str] | frozenset[str] | None = None,
         project_path: str | None = None,
     ) -> Session:
-        """Block until a new session registers (optionally excluding one ID).
+        """Block until a matching active session is published."""
 
-        If ``known_ids`` is provided, sessions registered after that snapshot but
-        before this waiter is installed are returned synchronously without yielding.
-        Raises TimeoutError if no matching session appears within timeout.
-        """
         loop = asyncio.get_running_loop()
-        known_ids_frozen = frozenset(self._sessions) if known_ids is None else frozenset(known_ids)
+        known_ids_frozen = (
+            frozenset(session.session_id for session in self.list_all())
+            if known_ids is None
+            else frozenset(known_ids)
+        )
         existing = self._find_matching_session(
             exclude_id=exclude_id,
             known_ids=known_ids_frozen,
@@ -268,7 +374,9 @@ class SessionRegistry:
         except asyncio.TimeoutError:
             raise TimeoutError("Timed out waiting for new session") from None
         finally:
-            self._session_waiters = [w for w in self._session_waiters if w is not entry]
+            self._session_waiters = [
+                waiter for waiter in self._session_waiters if waiter is not entry
+            ]
             if not future.done():
                 future.cancel()
 
@@ -279,7 +387,7 @@ class SessionRegistry:
         known_ids: frozenset[str],
         project_path: str | None,
     ) -> Session | None:
-        for session in self._sessions.values():
+        for session in self.list_all():
             if self._matches_wait_criteria(
                 session,
                 exclude_id=exclude_id,
@@ -301,9 +409,139 @@ class SessionRegistry:
             return False
         if session.session_id in known_ids:
             return False
-        if project_path is not None and session.project_path != project_path:
+        return project_path is None or session.project_path == project_path
+
+    def _active_entry(self, session_id: str | None) -> _EditorConnection | None:
+        if session_id is None:
+            return None
+        entry = self._entries.get(session_id)
+        return entry if entry is not None and entry.phase == "active" else None
+
+    def _replace_session(self, session_id: str, **changes: Any) -> bool:
+        entry = self._active_entry(session_id)
+        if entry is None:
             return False
+        entry.session = replace(entry.session, **changes)
         return True
 
+    def _pop_request(
+        self,
+        session_id: str,
+        request_id: str,
+        *,
+        peer: Any | None = None,
+    ) -> asyncio.Future[Any] | None:
+        entry = self._active_entry(session_id)
+        if entry is None or (peer is not None and entry.peer is not peer):
+            return None
+        future = entry.pending.pop(request_id, None)
+        if future is not None:
+            self._pending_count -= 1
+        return future
+
+    def _on_published(self, session: Session) -> None:
+        if self._active_session_id is None:
+            self._active_session_id = session.session_id
+        try:
+            record_telemetry(
+                RecordType.GODOT_CONNECTION,
+                {
+                    "event": "connected",
+                    "godot_version": _safe_version_token(session.godot_version),
+                    "plugin_version": _safe_version_token(session.plugin_version),
+                    "protocol_version": _safe_version_token(str(session.protocol_version)),
+                    "server_launch_mode": _safe_version_token(session.server_launch_mode),
+                    "session_count": len(self),
+                },
+                session_id=session.session_id,
+            )
+            if len(self) >= 2:
+                record_milestone(MilestoneType.MULTIPLE_SESSIONS)
+        except Exception:  # noqa: BLE001
+            logger.debug("session connect telemetry failed", exc_info=True)
+
+        remaining = []
+        for future, exclude_id, known_ids, project_path in self._session_waiters:
+            if future.done():
+                continue
+            if not self._matches_wait_criteria(
+                session,
+                exclude_id=exclude_id,
+                known_ids=known_ids,
+                project_path=project_path,
+            ):
+                remaining.append((future, exclude_id, known_ids, project_path))
+                continue
+            future.set_result(session)
+        self._session_waiters = remaining
+
+    def _on_removed(self, session_id: str, close_code: int | None) -> None:
+        try:
+            record_telemetry(
+                RecordType.GODOT_CONNECTION,
+                {
+                    "event": "disconnected",
+                    "session_count": len(self),
+                    "close_code": close_code,
+                },
+                session_id=session_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("session disconnect telemetry failed", exc_info=True)
+        if self._active_session_id != session_id:
+            return
+        self._active_session_id = None
+        survivors = self.list_all()
+        if len(survivors) == 1:
+            survivor_id = survivors[0].session_id
+            self._active_session_id = survivor_id
+            logger.warning(
+                "Active session %s disconnected; auto-promoting sole survivor %s",
+                session_id[:8],
+                survivor_id[:8],
+            )
+        else:
+            logger.info(
+                "Active session %s disconnected; no active session until next register/activate",
+                session_id[:8],
+            )
+
     def __len__(self) -> int:
-        return len(self._sessions)
+        return sum(entry.phase == "active" for entry in self._entries.values())
+
+
+def _fold_error_watermark(
+    session: Session,
+    value: Mapping[str, int],
+) -> tuple[Mapping[str, int], int, int]:
+    """Return the updated watermark plus newly observed errors and warnings."""
+
+    updates: dict[str, int] = {}
+    deltas: dict[str, int] = {}
+    incoming_run_seq = value.get("run_seq")
+    previous_run_seq = session.error_watermark.get("run_seq", 0)
+    run_advanced = (
+        incoming_run_seq is not None
+        and previous_run_seq > 0
+        and incoming_run_seq > previous_run_seq
+    )
+    for key, current in value.items():
+        updates[key] = current
+        if key == "run_seq":
+            continue
+        previous = session.error_watermark.get(key)
+        if previous is not None:
+            if run_advanced and key in _PER_RUN_WATERMARK_KEYS:
+                deltas[key] = current
+            elif current >= previous:
+                deltas[key] = current - previous
+            else:
+                deltas[key] = current
+        elif run_advanced and key in _PER_RUN_WATERMARK_KEYS:
+            deltas[key] = current
+
+    new_warnings = sum(deltas.pop(key, 0) for key in _WARN_WATERMARK_KEYS)
+    overlap = max(deltas.pop("debugger_promoted", 0), deltas.pop("game_error_warn", 0))
+    merged = dict(session.error_watermark)
+    merged.update(updates)
+    return MappingProxyType(merged), overlap + sum(deltas.values()), new_warnings

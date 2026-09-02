@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from http import HTTPStatus
@@ -11,10 +12,17 @@ from typing import Any
 import fastmcp
 import uvicorn
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from uvicorn.protocols.http.h11_impl import H11Protocol
 
 from godot_ai.protocol.attach import DEV_TRANSPORT_ENV
+from godot_ai.transport.capability import (
+    HTTP_CAPABILITY_ENV,
+    WS_CAPABILITY_ENV,
+    LaunchCapabilities,
+)
 
 DEV_WS_PORT_ENV = "GODOT_AI_DEV_WS_PORT"
+DEV_HTTP_PORT_ENV = "GODOT_AI_DEV_HTTP_PORT"
 DEV_EXCLUDE_DOMAINS_ENV = "GODOT_AI_DEV_EXCLUDE_DOMAINS"
 ## #421: reload runs the app in a uvicorn-supervised subprocess via the
 ## ``create_app`` factory, so --allow-host CIDRs ride through as an env var
@@ -26,10 +34,91 @@ DEV_ALLOW_HOST_ENV = "GODOT_AI_DEV_ALLOW_HOST"
 ## matter in the editor console. Set to 1/true/yes/on to re-enable.
 HTTP_ACCESS_LOG_ENV = "GODOT_AI_HTTP_ACCESS_LOG"
 RELOADABLE_TRANSPORTS = {"sse", "streamable-http"}
+HTTP_SERVER_CONNECTION_LIMIT = 64
+HTTP_SERVER_BACKLOG = 64
+HTTP_SERVER_MAX_INCOMPLETE_EVENT_BYTES = 16 * 1024
+HTTP_SERVER_KEEP_ALIVE_SECONDS = 5
+HTTP_SERVER_HEADER_TIMEOUT_SECONDS = 5.0
 
 
 def http_access_log_enabled() -> bool:
     return os.environ.get(HTTP_ACCESS_LOG_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+class BoundedH11Protocol(H11Protocol):
+    """Bound accepted sockets and the time spent on incomplete headers."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._header_timeout: asyncio.TimerHandle | None = None
+        self._rejected = False
+        self._connection_limit = self.limit_concurrency
+        # Uvicorn checks ``>=`` after adding this protocol to the shared set.
+        if self.limit_concurrency is not None:
+            self.limit_concurrency += 1
+
+    def connection_made(self, transport: asyncio.Transport) -> None:
+        super().connection_made(transport)
+        if self._connection_limit is not None and len(self.connections) > self._connection_limit:
+            self._rejected = True
+            self.connections.discard(self)
+            transport.abort()
+            return
+        self._arm_header_timeout()
+
+    def data_received(self, data: bytes) -> None:
+        if self._rejected:
+            return
+        previous_scope = self.scope
+        super().data_received(data)
+        if self.scope is not previous_scope:
+            self._cancel_header_timeout()
+
+    def on_response_complete(self) -> None:
+        super().on_response_complete()
+        # A pipelined request replaces ``cycle`` with an incomplete response;
+        # otherwise the peer is back to waiting for the next request header.
+        if (
+            not self.transport.is_closing()
+            and self.cycle is not None
+            and self.cycle.response_complete
+        ):
+            self._arm_header_timeout()
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self._cancel_header_timeout()
+        super().connection_lost(exc)
+
+    def _arm_header_timeout(self) -> None:
+        self._cancel_header_timeout()
+        self._header_timeout = self.loop.call_later(
+            HTTP_SERVER_HEADER_TIMEOUT_SECONDS,
+            self._close_incomplete_header,
+        )
+
+    def _cancel_header_timeout(self) -> None:
+        if self._header_timeout is not None:
+            self._header_timeout.cancel()
+            self._header_timeout = None
+
+    def _close_incomplete_header(self) -> None:
+        self._header_timeout = None
+        if self.transport is not None and not self.transport.is_closing():
+            self.transport.close()
+
+
+def hardened_uvicorn_config(*, access_log: bool) -> dict[str, Any]:
+    """Return the one finite accepted-socket/parser policy for HTTP runners."""
+
+    return {
+        "access_log": access_log,
+        "http": BoundedH11Protocol,
+        "limit_concurrency": HTTP_SERVER_CONNECTION_LIMIT,
+        "backlog": HTTP_SERVER_BACKLOG,
+        "timeout_keep_alive": HTTP_SERVER_KEEP_ALIVE_SECONDS,
+        "h11_max_incomplete_event_size": HTTP_SERVER_MAX_INCOMPLETE_EVENT_BYTES,
+    }
+
 
 STALE_MCP_SESSION_MESSAGE = (
     "MCP session expired or was not found; reinitialize the streamable HTTP session"
@@ -167,10 +256,19 @@ def _get_dev_ws_port() -> int:
         raise ValueError(f"Invalid {DEV_WS_PORT_ENV}: {raw}") from exc
 
 
+def _get_dev_http_port() -> int:
+    raw = os.environ.get(DEV_HTTP_PORT_ENV, "8000")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {DEV_HTTP_PORT_ENV}: {raw}") from exc
+
+
 def create_app():
     """Create the FastMCP ASGI app for uvicorn's reload supervisor."""
     from godot_ai.server import create_server
     from godot_ai.tools.domains import parse_exclude_list
+    from godot_ai.transport.capability import launch_capabilities_from_env
     from godot_ai.transport.origin_guard import parse_allow_hosts
 
     exclude_domains = parse_exclude_list(os.environ.get(DEV_EXCLUDE_DOMAINS_ENV, ""))
@@ -178,6 +276,8 @@ def create_app():
         [v for v in os.environ.get(DEV_ALLOW_HOST_ENV, "").split(",") if v]
     )
     server = create_server(
+        capabilities=launch_capabilities_from_env(generate_if_missing=False),
+        http_port=_get_dev_http_port(),
         ws_port=_get_dev_ws_port(),
         exclude_domains=exclude_domains,
         allow_host_networks=allow_host_networks,
@@ -192,16 +292,20 @@ def run_with_reload(
     ws_port: int,
     exclude_domains: set[str] | None = None,
     allow_host_networks: list | None = None,
+    capabilities: LaunchCapabilities,
 ) -> None:
     """Run the HTTP transport through uvicorn's supported reload path."""
     if transport not in RELOADABLE_TRANSPORTS:
         raise ValueError(f"Reload is only supported for HTTP transports, got {transport}")
 
     os.environ[DEV_TRANSPORT_ENV] = transport
+    os.environ[DEV_HTTP_PORT_ENV] = str(port)
     os.environ[DEV_WS_PORT_ENV] = str(ws_port)
     os.environ[DEV_EXCLUDE_DOMAINS_ENV] = ",".join(sorted(exclude_domains or set()))
     ## #421: pass the CIDRs to the factory subprocess as their string forms.
     os.environ[DEV_ALLOW_HOST_ENV] = ",".join(str(net) for net in (allow_host_networks or []))
+    os.environ[HTTP_CAPABILITY_ENV] = capabilities.http
+    os.environ[WS_CAPABILITY_ENV] = capabilities.websocket
 
     ## Bind off loopback only when an allowlist is named; the guard (rebuilt
     ## inside create_app from the same env) still gates every request.
@@ -216,10 +320,10 @@ def run_with_reload(
         host=bind_host,
         port=port,
         log_level=fastmcp.settings.log_level.lower(),
-        access_log=http_access_log_enabled(),
         timeout_graceful_shutdown=2,
         lifespan="on",
         ws="websockets-sansio",
         reload=True,
         reload_dirs=[src_dir],
+        **hardened_uvicorn_config(access_log=http_access_log_enabled()),
     )

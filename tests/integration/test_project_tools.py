@@ -12,7 +12,7 @@ from godot_ai.godot_client.client import GodotClient, GodotCommandError
 class TestProjectSettingsGet:
     async def test_get_project_setting_roundtrip(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -33,7 +33,7 @@ class TestProjectSettingsGet:
 
     async def test_get_project_setting_error_propagates(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -54,7 +54,7 @@ class TestProjectSettingsGet:
 class TestProjectSettingsSet:
     async def test_set_project_setting_roundtrip(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -90,7 +90,7 @@ class TestProjectSettingsSet:
 class TestProjectSetMainScene:
     async def test_set_main_scene_roundtrip(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -117,7 +117,7 @@ class TestProjectSetMainScene:
 
     async def test_set_main_scene_non_scene_error_propagates(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -140,7 +140,7 @@ class TestProjectSetMainScene:
 class TestFilesystemSearch:
     async def test_search_by_name(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -167,7 +167,7 @@ class TestFilesystemSearch:
 
     async def test_search_by_type(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -191,7 +191,7 @@ class TestFilesystemSearch:
 
     async def test_search_by_path(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()
@@ -214,7 +214,7 @@ class TestFilesystemSearch:
 
     async def test_search_missing_filter_error(self, harness):
         plugin = await harness.connect_plugin()
-        client = GodotClient(harness.server, harness.registry)
+        client = GodotClient(harness.server)
 
         async def mock_handler():
             cmd = await plugin.recv_command()

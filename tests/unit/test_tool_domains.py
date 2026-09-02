@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from godot_ai.server import create_server
 from godot_ai.tools.domains import (
     CORE_BEARING_DOMAINS,
     CORE_TOOLS,
@@ -16,6 +15,7 @@ from godot_ai.tools.domains import (
     EXCLUDABLE_DOMAINS,
     parse_exclude_list,
 )
+from tests.conftest import create_test_server as create_server
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SRC_ROOT = _REPO_ROOT / "src" / "godot_ai"
@@ -25,7 +25,7 @@ _SRC_ROOT = _REPO_ROOT / "src" / "godot_ai"
 _CATALOG_GD = _REPO_ROOT / "plugin" / "addons" / "godot_ai" / "tool_catalog.gd"
 _RUNTIME_BOUNDARY_DOCS = [
     _REPO_ROOT / "AGENTS.md",
-    _REPO_ROOT / "CLAUDE.md",
+    _REPO_ROOT / ".claude" / "CLAUDE.md",
     _REPO_ROOT / "docs" / "plugin-architecture.md",
 ]
 

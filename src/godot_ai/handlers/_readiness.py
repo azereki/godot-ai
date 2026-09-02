@@ -65,36 +65,6 @@ _READINESS_SUB_CODE: dict[str, EditorNotReadySubCode] = {
     "playing": EditorNotReadySubCode.EDITOR_PLAYING,
 }
 
-# Every readiness value the plugin can emit. Derived from the blocking-state
-# table plus "ready" / "no_scene" so the canonical list can't drift. Used by
-# handlers that copy a live readiness snapshot (editor_state's response,
-# project_stop's readiness_after) onto session.readiness — guards against
-# the plugin inventing an unknown state and the cache trusting it.
-KNOWN_READINESS: frozenset[str] = frozenset(_READINESS_INFO) | {"ready", "no_scene"}
-
-
-def sync_readiness_for_session(session: Session | None, value: object) -> bool:
-    """Copy an authoritative readiness snapshot onto a specific session.
-
-    Returns True if the cache was updated, False if the session is None,
-    the snapshot wasn't a recognized readiness value (forward-compat: a
-    newer plugin sending an unknown state is ignored, not propagated),
-    or the value already matches the cache (no-op transition).
-
-    Used by the WebSocket transport to heal `Session.readiness` from the
-    `readiness` envelope field stamped on every command response by the
-    plugin's dispatcher — without that, a single dropped `readiness_changed`
-    event would leave the server convinced the editor is still `playing`
-    long after the game has stopped.
-    """
-    if session is None or value not in KNOWN_READINESS:
-        return False
-    if session.readiness == value:
-        return False
-    session.readiness = value  # type: ignore[assignment]
-    return True
-
-
 def sync_readiness_from_snapshot(runtime: "DirectRuntime", value: object) -> bool:
     """Copy an authoritative readiness snapshot onto the active session.
 
@@ -106,14 +76,17 @@ def sync_readiness_from_snapshot(runtime: "DirectRuntime", value: object) -> boo
     the cache for callers that bypass the envelope (in-process tests
     that wire a custom client without going through the WebSocket).
     """
-    return sync_readiness_for_session(runtime.get_active_session(), value)
+    session_id = runtime.active_session_id
+    if session_id is None:
+        return False
+    return runtime.record_session_readiness(session_id, value)
 
 
-async def _probe_readiness(runtime: "DirectRuntime", session: Session) -> bool:
-    """One ``get_editor_state`` round trip that heals ``session.readiness``.
+async def _probe_readiness(runtime: "DirectRuntime", session_id: str) -> bool:
+    """One ``get_editor_state`` round trip that heals cached readiness.
 
     Production replies self-heal the cache via the WebSocket transport's
-    envelope sync; the explicit ``sync_readiness_for_session`` call here
+    envelope sync; the explicit table transition here
     covers in-process tests that wire a custom client and bypass the
     transport. Returns False when the probe itself failed (timeout,
     disconnect, plugin error) — the caller then enforces against the
@@ -128,7 +101,7 @@ async def _probe_readiness(runtime: "DirectRuntime", session: Session) -> bool:
         )
     except Exception:
         return False
-    sync_readiness_for_session(session, result.get("readiness"))
+    runtime.record_session_readiness(session_id, result.get("readiness"))
     return True
 
 
@@ -182,10 +155,13 @@ async def require_writable_async(
     session = runtime.get_active_session()
     if session is None:
         return
+    session_id = session.session_id
     if _READINESS_INFO.get(session.readiness) is None:
         return  # cache says writable — fast path, no probe
 
-    if await _probe_readiness(runtime, session) and session.readiness == "importing":
+    probed = await _probe_readiness(runtime, session_id)
+    session = runtime.get_session(session_id) or session
+    if probed and session.readiness == "importing":
         ## Live-confirmed import in flight — hold instead of bouncing the
         ## write back for the caller to blind-retry. A failed initial
         ## probe skips the hold entirely: waiting can't fix a dead link.
@@ -195,12 +171,13 @@ async def require_writable_async(
             ## when cap isn't an exact multiple of the interval — the last
             ## re-probe then lands exactly at the deadline.
             await sleep(min(_IMPORTING_HOLD_PROBE_INTERVAL_SECONDS, remaining))
-            if not await _probe_readiness(runtime, session):
+            if not await _probe_readiness(runtime, session_id):
                 break
+            session = runtime.get_session(session_id) or session
             if session.readiness != "importing":
                 break
 
-    _enforce_blocking_state(session)
+    _enforce_blocking_state(runtime.get_session(session_id) or session)
 
 
 def _enforce_blocking_state(session: "Session | None") -> None:
@@ -209,9 +186,7 @@ def _enforce_blocking_state(session: "Session | None") -> None:
     info = _READINESS_INFO.get(session.readiness)
     if info is None:
         return
-    ## Lazy import — `godot_client.client` pulls in the WS transport,
-    ## which now imports `sync_readiness_for_session` from this module.
-    ## Hoisting the import to module top would re-establish the cycle.
+    ## Lazy import keeps error construction outside the policy constants.
     from godot_ai.godot_client.client import GodotCommandError
 
     message, retryable, hint = info

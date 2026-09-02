@@ -40,10 +40,11 @@ def _serve_raising(errno_value: int):
         pytest.param(10048, id="Windows"),
     ],
 )
-async def test_start_swallows_address_in_use_per_platform(
+async def test_start_fails_closed_on_address_in_use_per_platform(
     platform_errno: int, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.WARNING)
+    server = _make_server()
     with (
         patch("godot_ai.transport.websocket.errno.EADDRINUSE", platform_errno),
         patch(
@@ -51,9 +52,13 @@ async def test_start_swallows_address_in_use_per_platform(
             _serve_raising(platform_errno),
         ),
     ):
-        await asyncio.wait_for(_make_server().start(), timeout=1.0)
+        with pytest.raises(OSError) as exc_info:
+            await asyncio.wait_for(server.start(), timeout=1.0)
 
+    assert exc_info.value.errno == platform_errno
     assert any("already in use" in r.getMessage() for r in caplog.records)
+    with pytest.raises(RuntimeError, match="listener failed to start"):
+        await server.wait_until_ready()
 
 
 async def test_start_propagates_other_oserrors() -> None:

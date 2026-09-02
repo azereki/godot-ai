@@ -25,14 +25,15 @@ from godot_ai.sessions.registry import Session, SessionRegistry
 class _RecordingWsServer:
     """send_command stub that records calls and returns a canned response."""
 
-    def __init__(self) -> None:
+    def __init__(self, registry: SessionRegistry) -> None:
+        self.registry = registry
         self.calls: list[tuple[str, dict]] = []
 
     async def send_command(self, session_id, command, params=None, timeout=5.0):
         self.calls.append((command, params or {}))
         from godot_ai.protocol.envelope import CommandResponse
 
-        return CommandResponse(request_id="r", status="ok", data={})
+        return CommandResponse(request_id="r", status="ok", data={}, readiness="ready")
 
 
 def _make_client() -> tuple[GodotClient, _RecordingWsServer, EditorBridgeCircuitBreaker]:
@@ -46,9 +47,9 @@ def _make_client() -> tuple[GodotClient, _RecordingWsServer, EditorBridgeCircuit
         )
     )
     registry.set_active("proj@abcd")
-    ws = _RecordingWsServer()
+    ws = _RecordingWsServer(registry)
     breaker = EditorBridgeCircuitBreaker()
-    return GodotClient(ws, registry, circuit_breaker=breaker), ws, breaker
+    return GodotClient(ws, circuit_breaker=breaker), ws, breaker
 
 
 class TestFindNonFiniteFloat:

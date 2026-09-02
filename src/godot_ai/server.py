@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
@@ -66,6 +65,7 @@ from godot_ai.sessions.registry import SessionRegistry
 from godot_ai.telemetry import (
     MilestoneType,
     RecordType,
+    TelemetryConfig,
     install_fastmcp_wraps,
     record_milestone,
     record_telemetry,
@@ -100,7 +100,16 @@ from godot_ai.tools.theme import register_theme_tools
 from godot_ai.tools.tilemap import register_tilemap_tools
 from godot_ai.tools.tileset import register_tileset_tools
 from godot_ai.tools.ui import register_ui_tools
+from godot_ai.transport.capability import (
+    LaunchCapabilities,
+    PortClaimUnavailable,
+    acquire_port_claim,
+    remove_capabilities,
+    validate_launch_capabilities,
+    write_capabilities,
+)
 from godot_ai.transport.origin_guard import IPNetwork, LocalhostOnlyHTTPMiddleware
+from godot_ai.transport.security import BoundedHTTPMiddleware, CapabilityAuthMiddleware
 from godot_ai.transport.websocket import GodotWebSocketServer
 
 logger = logging.getLogger(__name__)
@@ -139,6 +148,8 @@ class GodotAIFastMCP(FastMCP):
         transport = kwargs.get("transport", "http")
         if transport in ("http", "streamable-http"):
             app = StaleMcpSessionDiagnosticMiddleware(app)
+        app = BoundedHTTPMiddleware(app)
+        app = CapabilityAuthMiddleware(app, self._transport_capabilities.http)
         ## Outermost wrap: refuse non-loopback Host/Origin (DNS-rebinding
         ## guard, audit-v2 finding #1). Applied to every HTTP transport
         ## including ``sse`` so ``/godot-ai/status`` and the FastMCP
@@ -394,11 +405,14 @@ def _startup_record_data(
 def create_server(
     ws_port: int = 9500,
     *,
+    capabilities: LaunchCapabilities,
+    http_port: int = 8000,
     exclude_domains: Iterable[str] | None = None,
     owner_pid: int | None = None,
     allow_host_networks: Sequence[IPNetwork] | None = None,
 ) -> FastMCP:
     logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
+    capabilities = validate_launch_capabilities(capabilities.http, capabilities.websocket)
     leases = LeaseRegistry(SERVER_INSTANCE_ID)
 
     # Capture ws_port in the lifespan closure
@@ -424,19 +438,47 @@ def create_server(
         ## (#421): it's the local editor↔server bridge, not a remote surface.
         ## See GodotWebSocketServer.start for the rationale (LAN exposure +
         ## Windows IPv6-only breakage).
-        ## #690: the spawning plugin hands us a per-launch handshake auth
-        ## token via env (same channel as GODOT_AI_OWNER_PID). Absent for
-        ## manually-started dev/CI servers, which then accept tokenless
-        ## handshakes — see GodotWebSocketServer.__init__.
+        ## HTTP and editor transports use distinct per-launch capabilities.
+        ## Neither has a missing-value mode and the raw editor value never
+        ## crosses either socket.
         ws_server = GodotWebSocketServer(
             registry,
             port=ws_port,
-            auth_token=os.environ.get("GODOT_AI_WS_TOKEN") or None,
+            auth_token=capabilities.websocket,
         )
-        client = GodotClient(ws_server, registry)
+        client = GodotClient(ws_server)
+
+        loop = asyncio.get_running_loop()
+        claim_deadline = loop.time() + 10.0
+        while True:
+            try:
+                http_claim = acquire_port_claim(http_port)
+                break
+            except PortClaimUnavailable as exc:
+                if loop.time() >= claim_deadline:
+                    raise RuntimeError(
+                        f"HTTP port {http_port} is already claimed by another godot-ai server"
+                    ) from exc
+                await asyncio.sleep(0.05)
 
         ws_task = asyncio.create_task(ws_server.start())
         logger.info("WebSocket server starting on port %d", ws_server.port)
+        try:
+            await ws_server.wait_until_ready()
+            write_capabilities(
+                http_port,
+                capabilities.http,
+                capabilities.websocket,
+                instance_nonce=SERVER_INSTANCE_ID,
+            )
+        except BaseException:
+            ws_task.cancel()
+            try:
+                await ws_task
+            except (asyncio.CancelledError, OSError):
+                pass
+            http_claim.release()
+            raise
 
         ## When the plugin auto-spawns us it passes --owner-pid. Reap this
         ## detached server if that editor dies without a clean stop_server and
@@ -540,6 +582,10 @@ def create_server(
                 await ws_task
             except (asyncio.CancelledError, OSError):
                 pass
+            try:
+                remove_capabilities(http_port, SERVER_INSTANCE_ID)
+            finally:
+                http_claim.release()
             ## Use ``shutdown_if_initialized`` so an opted-out server
             ## (which never created a collector) doesn't get one
             ## materialized solely to be shut down.
@@ -554,9 +600,11 @@ def create_server(
 
     mcp = GodotAIFastMCP(
         "Godot AI",
+        version=_SERVER_VERSION,
         instructions=build_instructions(exclude),
         lifespan=_lifespan,
     )
+    mcp._transport_capabilities = capabilities
 
     ## #421: stash the --allow-host CIDRs where http_app() reads them when it
     ## installs the rebinding guard middleware. None = loopback-only (default).
@@ -628,7 +676,7 @@ def create_server(
 
     @mcp.custom_route("/godot-ai/status", methods=["GET"], include_in_schema=False)
     async def godot_ai_status(_request: Request) -> JSONResponse:
-        """Small unauthenticated probe used by the editor before reusing a port."""
+        """Small capability-authenticated probe used before reusing a backend."""
         nonlocal catalog_digest
         if catalog_digest is None:
             catalog_digest = await tool_catalog_hash(mcp)
@@ -662,6 +710,10 @@ def create_server(
                 ## ``instance_id`` it belongs to, so it cannot be stale
                 ## relative to that instance.
                 "active_lease_count": leases.active_count(),
+                ## Live env re-read so the dock can show what this process
+                ## will actually send. Advisory only — this route does not
+                ## accept an opt-out mutation (upstream PR #931 / issue #913).
+                "telemetry_enabled": not TelemetryConfig._is_disabled_via_env(),
             }
         )
 
@@ -706,10 +758,8 @@ def create_server(
                 status_code=409,
             )
         if isinstance(exc, LeaseLimitExceeded):
-            ## The routes are loopback-guarded but not authenticated, so an
-            ## unbounded registry is reachable by any local process. Refuse
-            ## past the ceiling instead of growing without limit; a real
-            ## bridge holds one lease and never sees this.
+            ## Refuse past the ceiling instead of growing without limit; a
+            ## real bridge holds one lease and never sees this.
             return JSONResponse(
                 {
                     "error": {

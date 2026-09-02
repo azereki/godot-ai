@@ -27,10 +27,9 @@ class StubConnection:
 ## reached the provider prompt without making a real network call.
 class SpyRouter:
 	extends VisionRoutingScript
-	var captured_prompt := ""
 
-	func _route_worker(_provider: Dictionary, _image_b64: String, prompt: String, _api_key: String, _rid: String) -> void:
-		captured_prompt = prompt
+	func _route_worker(_provider: Dictionary, _image_b64: String, prompt: String, _api_key: String, _rid: String) -> Dictionary:
+		return {"captured_prompt": prompt}
 
 
 func _make_router() -> VisionRoutingScript:
@@ -172,6 +171,63 @@ func test_route_complete_reports_active_provider_in_routed_via() -> void:
 		assert_eq(stub.replies.size(), 1)
 		var data: Dictionary = stub.replies[0]["payload"]["data"]
 		assert_eq(str(data["routed_via"]), "%s:%s" % [provider_id, models[provider_id]])
+
+
+func test_poll_completed_publishes_worker_result_on_main_thread() -> void:
+	var router := _make_router()
+	var stub := StubConnection.new()
+	var rid := "test-poll-result"
+	router._pending[rid] = {
+		"payload": {"data": {"image_base64": "AAAA"}},
+		"data": {"image_base64": "AAAA", "format": "png"},
+		"connection": stub,
+		"provider_id": "groq",
+		"provider": {"label": "Groq", "model": "model"},
+	}
+	var worker := Thread.new()
+	assert_eq(worker.start(func() -> Dictionary:
+		return {
+			"kind": "route",
+			"request_id": rid,
+			"result": {"desc": "polled result", "error": ""},
+		}
+	), OK)
+	router._threads[rid] = worker
+	while worker.is_alive():
+		OS.delay_msec(1)
+	router.poll_completed()
+	assert_eq(stub.replies.size(), 1)
+	assert_eq(
+		stub.replies[0]["payload"]["data"]["vision_description"],
+		"polled result",
+	)
+	assert_true(router._threads.is_empty())
+
+
+func test_shutdown_joins_held_worker_without_deferred_publication() -> void:
+	var router := _make_router()
+	var stub := StubConnection.new()
+	var rid := "test-held-shutdown"
+	router._pending[rid] = {
+		"data": {"image_base64": "AAAA"},
+		"connection": stub,
+	}
+	var worker := Thread.new()
+	assert_eq(worker.start(func() -> Dictionary:
+		OS.delay_msec(100)
+		return {
+			"kind": "route",
+			"request_id": rid,
+			"result": {"desc": "must be discarded", "error": ""},
+		}
+	), OK)
+	router._threads[rid] = worker
+	router.shutdown()
+	assert_false(worker.is_alive(), "shutdown must realize the held worker")
+	assert_true(router._threads.is_empty())
+	assert_true(router._pending.is_empty())
+	await (Engine.get_main_loop() as SceneTree).process_frame
+	assert_true(stub.replies.is_empty(), "no old-script callback may survive shutdown")
 
 
 # ----- providers -----
@@ -409,9 +465,11 @@ func test_game_capture_stashes_and_forwards_user_prompt() -> void:
 	## prompt).
 	var owned := router.route_game_payload(StubConnection.new(), rid, {"data": {"image_base64": "AAAA", "format": "png"}})
 	assert_true(owned)
-	router._join_thread(rid)
-	assert_true(router.captured_prompt.contains("Why is the spider red?"))
-	assert_true(router.captured_prompt.contains("Godot editor"))
+	var worker: Thread = router._threads.get(rid)
+	var outcome: Dictionary = worker.wait_to_finish()
+	router._threads.erase(rid)
+	assert_true(str(outcome.get("captured_prompt", "")).contains("Why is the spider red?"))
+	assert_true(str(outcome.get("captured_prompt", "")).contains("Godot editor"))
 	if had_key:
 		es.set_setting(key_setting, saved_key)
 	elif es.has_setting(key_setting):

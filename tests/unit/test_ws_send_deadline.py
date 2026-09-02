@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from godot_ai.sessions.registry import SessionRegistry
+from godot_ai.sessions.registry import Session, SessionRegistry
 from godot_ai.transport.websocket import GodotWebSocketServer
 
 ## Short command budget, generous backstop. The gap between them is what makes
@@ -50,13 +50,19 @@ class StalledConnection:
 def _server_with_stalled_write(session_id: str) -> tuple[GodotWebSocketServer, StalledConnection]:
     """Construct the server the way ``tests/conftest.py::harness`` does — registry
     plus port — but never call ``start()``: this test is about ``send_command``'s
-    deadline, not about binding a socket. The connection is injected into
-    ``_connections`` directly, the same private-attribute reach that
-    ``test_websocket.py::TestPendingFutureCleanup`` uses to force a send failure.
+    deadline, not about binding a socket. The fake is published through the
+    same one-table membership transition as a real acknowledged peer.
     """
     server = GodotWebSocketServer(SessionRegistry(), port=19998)
     ws = StalledConnection()
-    server._connections[session_id] = ws  # type: ignore[assignment]
+    session = Session(
+        session_id=session_id,
+        godot_version="4.7",
+        project_path="/tmp/test",
+        plugin_version="4.0.0",
+    )
+    assert server.registry.reserve_connection(session, ws)
+    server.registry.publish_connection(session_id, ws)
     return server, ws
 
 
@@ -124,7 +130,7 @@ async def test_stalled_write_timeout_pops_the_pending_entry() -> None:
     )
 
     assert isinstance(exc, TimeoutError), f"expected a bounded TimeoutError, got {exc!r}"
-    assert server._pending == {}, "a write-stall timeout must not leak _pending entries"
+    assert server.registry.pending_count == 0
 
 
 async def test_live_connection_write_stall_is_bounded(harness) -> None:
@@ -134,7 +140,7 @@ async def test_live_connection_write_stall_is_bounded(harness) -> None:
     ## (a raising send there, a never-returning one here).
     session_id = "stalled-live"
     plugin = await harness.connect_plugin(session_id=session_id)
-    ws = harness.server._connections[session_id]
+    ws = harness.registry._entries[session_id].peer
     parked = asyncio.Event()
 
     async def stalling_send(_payload: str) -> None:
@@ -197,7 +203,15 @@ async def test_send_leg_and_response_leg_timeouts_are_distinguishable() -> None:
 
     response_leg_id = "silent-editor"
     server2 = GodotWebSocketServer(SessionRegistry(), port=19997)
-    server2._connections[response_leg_id] = SilentConnection()  # type: ignore[assignment]
+    silent = SilentConnection()
+    session = Session(
+        session_id=response_leg_id,
+        godot_version="4.7",
+        project_path="/tmp/test",
+        plugin_version="4.0.0",
+    )
+    assert server2.registry.reserve_connection(session, silent)
+    server2.registry.publish_connection(response_leg_id, silent)
     resp_exc, _ = await _settle(
         server2.send_command(
             session_id=response_leg_id, command="node_create", timeout=_COMMAND_TIMEOUT_S

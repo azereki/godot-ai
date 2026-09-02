@@ -164,15 +164,10 @@ class _ReprobeSpyDock extends McpDockScript:
 		return true
 
 
-class _ConnectionStub:
-	var is_connected := true
-	var server_version := ""
-
-
 func test_update_status_reprobes_only_on_connect_transition() -> void:
 	var dock := _ReprobeSpyDock.new()
 	dock._build_ui()
-	dock._connection = _ConnectionStub.new()
+	dock.present_transport_snapshot({"connected": true, "server_version": "", "status": {}})
 
 	dock._update_status()
 	assert_eq(dock.reprobe_schedules, 1, "disconnected -> connected must schedule a reprobe")
@@ -180,11 +175,11 @@ func test_update_status_reprobes_only_on_connect_transition() -> void:
 	dock._update_status()
 	assert_eq(dock.reprobe_schedules, 1, "steady connected state must not reprobe")
 
-	dock._connection.is_connected = false
+	dock.present_transport_snapshot({"connected": false, "server_version": "", "status": {}})
 	dock._update_status()
 	assert_eq(dock.reprobe_schedules, 1, "disconnect must not reprobe")
 
-	dock._connection.is_connected = true
+	dock.present_transport_snapshot({"connected": true, "server_version": "", "status": {}})
 	dock._update_status()
 	assert_eq(dock.reprobe_schedules, 2, "reconnect must schedule a reprobe again")
 	dock.free()

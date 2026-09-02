@@ -51,6 +51,10 @@ static func configured_message(client: McpClient, server_url: String) -> String:
 var id: String = ""                              ## stable key, e.g. "cursor"
 var display_name: String = ""                    ## "Cursor"
 var config_type: String = ""                     ## "json" | "toml" | "yaml" | "cli" | "dsh"
+## False when the client's settings format cannot be round-tripped safely by
+## the matching strategy. Status checks remain read-only; Configure and Remove
+## return the existing manual instructions without touching the file.
+var automatic_config_edits: bool = true
 
 # JSON / TOML clients ------------------------------------------------------
 ## {"darwin": "~/...", "windows": "$APPDATA/...", "linux": "$XDG_CONFIG_HOME/..."}
@@ -154,12 +158,6 @@ var entry_initial_fields: Dictionary = {}
 ## reintroducing the descriptor Callable race from #229.
 enum CommandShape { NONE, FLAT, TYPED_FLAT, COMMAND_ARRAY, NESTED_COMMAND }
 var command_shape: CommandShape = CommandShape.NONE
-
-## Whether manual instructions may offer the client's native URL transport as
-## an alternative to its command shape. This is capability metadata, not a
-## consequence of `command_shape`: Codex supports a URL block, while Claude
-## Desktop's local `claude_desktop_config.json` entries are stdio-only.
-var command_supports_url_fallback: bool = false
 
 ## Optional discriminator required by a client's command transport shape
 ## (for example `type = "stdio"`). Empty means command+args are sufficient.

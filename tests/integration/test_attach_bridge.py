@@ -34,7 +34,20 @@ from godot_ai.protocol.attach import (
     DEV_TRANSPORT_ENV,
     PLUGIN_SPAWNED_ENV,
 )
-from tests.conftest import allocate_free_ports
+from godot_ai.transport.capability import (
+    CAPABILITY_DIR_ENV,
+    HTTP_CAPABILITY_ENV,
+    WS_CAPABILITY_ENV,
+    generate_capabilities,
+    read_capabilities,
+)
+from tests.conftest import allocate_free_ports, isolate_capability_directory
+
+
+def _runtime_capability_dir(runtime_dir: Path) -> Path:
+    if os.name == "nt":
+        return runtime_dir / "godot-ai" / "capabilities"
+    return runtime_dir / "capabilities"
 
 
 def _port_open(port: int) -> bool:
@@ -112,6 +125,11 @@ def _bridge_transport(
         part for part in (str(repo_root / "src"), existing_pythonpath) if part
     )
     env["GODOT_AI_RUNTIME_DIR"] = str(runtime_dir)
+    if os.name == "nt":
+        env.pop(CAPABILITY_DIR_ENV, None)
+        env["LOCALAPPDATA"] = str(runtime_dir)
+    else:
+        env[CAPABILITY_DIR_ENV] = str(_runtime_capability_dir(runtime_dir))
     env["GODOT_AI_DISABLE_TELEMETRY"] = "true"
     env[POLL_SECONDS_ENV] = "0.05"
     env[BOOT_GRACE_ENV] = "2"
@@ -132,6 +150,12 @@ def _bridge_transport(
         keep_alive=False,
         log_file=stderr_log,
     )
+
+
+def _http_headers(http_port: int, directory: Path) -> dict[str, str]:
+    record = read_capabilities(http_port, directory)
+    assert record is not None
+    return {"Authorization": f"Bearer {record.http}"}
 
 
 def _terminate_test_process(process: subprocess.Popen[bytes]) -> None:
@@ -194,8 +218,15 @@ async def test_cold_start_discovers_tools_and_explains_how_to_open_editor(
             names = {tool.name for tool in tools}
             assert {"editor_state", "test_run", "session_manage"} <= names
 
-            async with httpx.AsyncClient(timeout=5) as http:
-                status = (await http.get(f"http://127.0.0.1:{http_port}/godot-ai/status")).json()
+            async with httpx.AsyncClient(timeout=5, trust_env=False) as http:
+                status = (
+                    await http.get(
+                        f"http://127.0.0.1:{http_port}/godot-ai/status",
+                        headers=_http_headers(
+                            http_port, _runtime_capability_dir(tmp_path / "runtime")
+                        ),
+                    )
+                ).json()
             assert status["name"] == "godot-ai"
             assert status["owner_type"] == "attach"
             assert status["instance_id"]
@@ -220,9 +251,14 @@ async def test_cold_start_discovers_tools_and_explains_how_to_open_editor(
 
             recovered_tools = await client.list_tools()
             assert {tool.name for tool in recovered_tools} == names
-            async with httpx.AsyncClient(timeout=5) as http:
+            async with httpx.AsyncClient(timeout=5, trust_env=False) as http:
                 recovered_status = (
-                    await http.get(f"http://127.0.0.1:{http_port}/godot-ai/status")
+                    await http.get(
+                        f"http://127.0.0.1:{http_port}/godot-ai/status",
+                        headers=_http_headers(
+                            http_port, _runtime_capability_dir(tmp_path / "runtime")
+                        ),
+                    )
                 ).json()
             assert recovered_status["instance_id"] != first_instance
             backend_pid = await _wait_backend_pid(backend_log)
@@ -323,6 +359,7 @@ mcp.run(transport="streamable-http", host="127.0.0.1", port=int(sys.argv[1]), sh
             f"http://127.0.0.1:{http_port}/mcp",
             ensure_ready,
             ensure_ready,
+            lambda: "t" * 32,
         )
         async with Client(proxy, timeout=60) as client:
             started = time.monotonic()
@@ -431,6 +468,7 @@ mcp.run(transport="streamable-http", host="127.0.0.1", port=int(sys.argv[1]), sh
             f"http://127.0.0.1:{http_port}/mcp",
             ensure_ready,
             ensure_ready,
+            lambda: "t" * 32,
         )
         async with Client(proxy, timeout=20) as client:
             assert "counted_mutation" in {tool.name for tool in await client.list_tools()}
@@ -451,8 +489,12 @@ async def test_loopback_status_lease_and_mcp_ignore_proxy_environment(
 ) -> None:
     http_port, ws_port, bogus_proxy_port = allocate_free_ports(3)
     backend_log = (tmp_path / "loopback-backend.log").open("wb")
+    capability_dir = isolate_capability_directory(monkeypatch, tmp_path / "capability-home")
+    capabilities = generate_capabilities()
     env = dict(os.environ)
     env["GODOT_AI_DISABLE_TELEMETRY"] = "true"
+    env[HTTP_CAPABILITY_ENV] = capabilities.http
+    env[WS_CAPABILITY_ENV] = capabilities.websocket
     process = subprocess.Popen(
         [
             sys.executable,
@@ -482,17 +524,27 @@ async def test_loopback_status_lease_and_mcp_ignore_proxy_environment(
         assert status is not None
         return status
 
+    def http_capability() -> str:
+        record = read_capabilities(http_port, capability_dir)
+        assert record is not None
+        return record.http
+
     try:
         await _wait_port_open(http_port)
         status = await ensure_ready()
 
-        lease = LeaseClient(f"http://127.0.0.1:{http_port}", ensure_ready)
+        lease = LeaseClient(
+            f"http://127.0.0.1:{http_port}",
+            ensure_ready,
+            http_capability,
+        )
         await lease.start(status)
         try:
             proxy = create_attach_proxy(
                 f"http://127.0.0.1:{http_port}/mcp",
                 ensure_ready,
                 ensure_ready,
+                http_capability,
             )
             async with Client(proxy, timeout=20) as client:
                 names = {tool.name for tool in await client.list_tools()}

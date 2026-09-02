@@ -8,14 +8,20 @@ import json
 import pytest
 import websockets
 
+from tests.conftest import (
+    allocate_free_ports,
+    create_test_server,
+    isolate_capability_directory,
+)
+
 
 class TestNoActiveSessionDiagnostics:
-    async def test_tool_error_explains_missing_editor_session(self):
+    async def test_tool_error_explains_missing_editor_session(self, monkeypatch, tmp_path):
         from fastmcp import Client
 
-        from godot_ai.server import create_server
-
-        mcp = create_server(ws_port=19602)
+        http_port, ws_port = allocate_free_ports(2)
+        isolate_capability_directory(monkeypatch, tmp_path)
+        mcp = create_test_server(ws_port=ws_port, http_port=http_port)
         async with Client(mcp) as client:
             result = await client.call_tool("editor_state", {}, raise_on_error=False)
 
@@ -28,12 +34,12 @@ class TestNoActiveSessionDiagnostics:
         assert "session_manage(op='list')" in error["data"]["hint"]
         assert "container localhost is not host localhost" in error["data"]["hint"]
 
-    async def test_tool_error_explains_missing_pinned_session(self):
+    async def test_tool_error_explains_missing_pinned_session(self, monkeypatch, tmp_path):
         from fastmcp import Client
 
-        from godot_ai.server import create_server
-
-        mcp = create_server(ws_port=19603)
+        http_port, ws_port = allocate_free_ports(2)
+        isolate_capability_directory(monkeypatch, tmp_path)
+        mcp = create_test_server(ws_port=ws_port, http_port=http_port)
         async with Client(mcp) as client:
             result = await client.call_tool(
                 "editor_state",
@@ -64,7 +70,17 @@ class TestSceneGetHierarchyTool:
         async def respond():
             cmd = await plugin.recv_command()
             assert cmd["command"] == "get_scene_tree"
-            await plugin.send_response(cmd["request_id"], {"root": "Root", "nodes": nodes})
+            assert cmd["params"] == {"depth": 10, "offset": 1, "limit": 2}
+            await plugin.send_response(
+                cmd["request_id"],
+                {
+                    "nodes": nodes[1:3],
+                    "total_count": 5,
+                    "offset": 1,
+                    "limit": 2,
+                    "has_more": True,
+                },
+            )
 
         task = asyncio.create_task(respond())
         result = await client.call_tool(
@@ -86,7 +102,16 @@ class TestSceneGetHierarchyTool:
 
         async def respond():
             cmd = await plugin.recv_command()
-            await plugin.send_response(cmd["request_id"], {"root": "Root", "nodes": nodes})
+            await plugin.send_response(
+                cmd["request_id"],
+                {
+                    "nodes": nodes,
+                    "total_count": 1,
+                    "offset": 0,
+                    "limit": 100,
+                    "has_more": False,
+                },
+            )
 
         task = asyncio.create_task(respond())
         result = await client.call_tool(
@@ -375,11 +400,12 @@ class TestLogsReadTool:
     async def test_returns_paginated_logs(self, mcp_stack):
         client, plugin = mcp_stack
         lines = [f"line {i}" for i in range(10)]
+        entries = [{"source": "plugin", "level": "info", "text": line} for line in lines]
 
         async def respond():
             cmd = await plugin.recv_command()
             assert cmd["command"] == "get_logs"
-            await plugin.send_response(cmd["request_id"], {"lines": lines})
+            await plugin.send_response(cmd["request_id"], {"lines": entries})
 
         task = asyncio.create_task(respond())
         result = await client.call_tool("logs_read", {"count": 3, "offset": 2})
@@ -441,15 +467,14 @@ class TestLogsReadTool:
                 cmd["request_id"],
                 {
                     "source": "game",
-                    "lines": [
-                        {"source": "game", "level": "info", "text": "x"},
-                    ],
-                    "total_count": 1,
-                    "returned_count": 1,
+                    "lines": [],
+                    "total_count": 0,
+                    "returned_count": 0,
                     "offset": 0,
                     "run_id": "rNEW",
                     "is_running": True,
                     "dropped_count": 0,
+                    "stale_run_id": True,
                 },
             )
 
@@ -1325,16 +1350,9 @@ class TestReloadPluginTool:
             await asyncio.sleep(0.1)
             # Reconnect as a new session
             ws = await websockets.connect(f"ws://127.0.0.1:{ws_port}")
-            handshake = {
-                "type": "handshake",
-                "session_id": "reloaded-session",
-                "godot_version": "4.4.1",
-                "project_path": "/tmp/test_project",
-                "plugin_version": "0.0.1",
-                "protocol_version": 1,
-            }
-            await ws.send(json.dumps(handshake))
-            await asyncio.sleep(0.05)
+            from tests.conftest import perform_v4_handshake
+
+            await perform_v4_handshake(ws, session_id="reloaded-session")
             return ws
 
         task = asyncio.create_task(simulate_reload())
@@ -1638,7 +1656,10 @@ class TestResourceReads:
         async def respond():
             cmd = await plugin.recv_command()
             assert cmd["command"] == "get_logs"
-            await plugin.send_response(cmd["request_id"], {"lines": ["log line 1"]})
+            await plugin.send_response(
+                cmd["request_id"],
+                {"lines": [{"source": "plugin", "level": "info", "text": "log line 1"}]},
+            )
 
         task = asyncio.create_task(respond())
         result = await client.read_resource("godot://logs/recent")
@@ -4114,23 +4135,15 @@ class TestBatchExecuteTool:
 class TestPerCallSessionRouting:
     async def _connect_second_plugin(self, port: int, session_id: str, readiness: str = "ready"):
         """Connect a second mock plugin to the same MCP stack server."""
-        from tests.conftest import MockGodotPlugin, drain_handshake_ack
+        from tests.conftest import MockGodotPlugin, perform_v4_handshake
 
         ws = await websockets.connect(f"ws://127.0.0.1:{port}")
-        handshake = {
-            "type": "handshake",
-            "session_id": session_id,
-            "godot_version": "4.4.1",
-            "project_path": f"/tmp/{session_id}",
-            "plugin_version": "0.0.1",
-            "protocol_version": 1,
-            "readiness": readiness,
-        }
-        await ws.send(json.dumps(handshake))
-        await asyncio.sleep(0.05)
-        ## Drain handshake_ack so respond_* helpers' first recv lands on a
-        ## real command, not the ack. Mandatory (#716) — see conftest.
-        await drain_handshake_ack(ws)
+        await perform_v4_handshake(
+            ws,
+            session_id=session_id,
+            project_path=f"/tmp/{session_id}",
+            readiness=readiness,
+        )
         return MockGodotPlugin(ws=ws, session_id=session_id)
 
     async def test_session_id_routes_to_specific_session(self, mcp_stack, mcp_ws_port):

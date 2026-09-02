@@ -7,8 +7,6 @@ const VisionRoutingScript := preload("res://addons/godot_ai/vision_routing.gd")
 
 ## Handles editor state, selection, log, screenshot, and performance commands.
 
-const UpdateMixedState := preload("res://addons/godot_ai/utils/update_mixed_state.gd")
-
 var _log_buffer: McpLogBuffer
 var _connection: McpConnection
 var _debugger_plugin: McpDebuggerPlugin
@@ -49,14 +47,6 @@ func get_editor_state(_params: Dictionary) -> Dictionary:
 		"helper_live": bool(game_status.get("helper_live", false)),
 		"session_active": bool(game_status.get("session_active", false)),
 	}
-	## Half-installed addon tree from a failed self-update rollback. When
-	## non-empty, the agent / dock paint the operator-facing recovery copy
-	## from `update_mixed_state.gd::diagnose`. Field omitted when the
-	## addons tree is clean so editor_state's normal payload stays small.
-	## See issue #354 / audit-v2 #10.
-	var mixed_state := UpdateMixedState.diagnose()
-	if not mixed_state.is_empty():
-		data["mixed_state"] = mixed_state
 	return {"data": data}
 
 
@@ -223,8 +213,8 @@ func _format_editor_error_summary(entry: Dictionary) -> String:
 func _get_editor_logs(count: int, offset: int, include_details: bool, has_since_cursor: bool = false, since_cursor: int = 0) -> Dictionary:
 	## Editor-process script errors (parse errors, @tool runtime errors,
 	## EditorPlugin errors, push_error/push_warning). Captured by
-	## editor_logger.gd via OS.add_logger and gated on Godot 4.5+; on older
-	## engines the buffer can be null. Godot also sends GDScript reload
+	## editor_logger.gd via OS.add_logger on every v4-supported engine. During
+	## partial initialization the buffer can still be null. Godot also sends GDScript reload
 	## warnings/errors straight to the Debugger dock's Errors tab; those do
 	## not flow through OS.add_logger, so merge the visible tree rows here.
 	if has_since_cursor:

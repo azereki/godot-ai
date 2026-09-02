@@ -1,6 +1,7 @@
 # Godot AI — Plugin Architecture
 
-*Updated 2026-05-08 (document self-update runner/update-manager/plugin boundary and compatibility rules; previous: add `PreserveGodotCommandErrorData` to the middleware list and note registration-order is load-bearing; refresh file-structure tree, server-side modules, session metadata, and handshake JSON to match shipped code; add `<domain>_manage` rollups + resources + middleware to server responsibilities)*
+*Updated 2026-08-31 for the v4 ownership, authenticated transport, and
+transactional-update architecture.*
 
 This document is the architecture reference for the Godot-side plugin and the server-to-plugin interaction model.
 
@@ -18,17 +19,24 @@ Use the related docs for adjacent concerns:
 The core shape is:
 
 ```text
-AI Client → MCP (streamable-http, SSE, stdio) → Python FastMCP server
-                                                 ↓
-                                       WebSocket (default :9500,
-                                       overridable via the
-                                       godot_ai/ws_port EditorSetting
-                                       under Editor Settings > Plugins)
-                                                 ↓
-                                       Godot EditorPlugin
+AI Client -> stdio -> godot-ai attach
+                         |
+                         v
+             authenticated MCP HTTP
+                         |
+                         v
+                Python FastMCP server
+                         |
+                         v
+          authenticated WebSocket (:9500)
+                         |
+                         v
+                Godot EditorPlugin
 ```
 
-Internal companion: `godot_ai/managed_server_ws_port` is an EditorSetting the plugin uses to remember the managed server's resolved port across editor restarts and adoption — not a user knob.
+The HTTP and WebSocket capabilities are independent, per-backend secrets. A
+private capability record bootstraps local attach bridges and editor adoption;
+secrets never appear in public session or Dock snapshots.
 
 The plugin is persistent. It does not spin up per command. That is the foundation for:
 
@@ -46,17 +54,20 @@ The Python server owns orchestration, not editor mutation.
 That includes:
 
 - MCP transport (FastMCP v3 over streamable-http, SSE, or stdio) and tool/resource registration
-- the rolled-up tool surface — ~15 named verbs plus per-domain `<domain>_manage` tools wired by `tools/_meta_tool.py::register_manage_tool`, which builds a dynamic `Literal[...]` op enum so schema-aware clients see every op
+- the rolled-up tool surface — 46 tools comprising 19 named tools and 27 per-domain `<domain>_manage` rollups wired by `tools/_meta_tool.py::register_manage_tool`, which builds a dynamic `Literal[...]` op enum so schema-aware clients see every op
 - read-only `godot://...` MCP resources (sessions, editor state, scenes, nodes, scripts, project, materials, performance, test results) that mirror the cheap reads and don't count against tool-cap budgets
 - per-call session routing — every Godot-talking tool accepts an optional `session_id`, bound at the `DirectRuntime` boundary so `require_writable` and downstream handlers see the pinned session, not the active one
-- middleware that smooths over client quirks and shapes error responses: `PreserveGodotCommandErrorData` (outermost — packages `GodotCommandError` with structured `error.data` so candidate-path / suggestion payloads survive), `StripClientWrapperKwargs` (Cline's `task_progress`), `ParseStringifiedParams` (clients that auto-stringify nested params for `_manage` calls), `HintOpTypoOnManage` (innermost — rewrites Pydantic `literal_error` with a `difflib`-derived "Did you mean" hint). Order is load-bearing and locked by `tests/unit/test_server_middleware_order.py`; rationale lives in the docstring above the `mcp.add_middleware(...)` calls in `server.py`.
-- session registry and active-session resolution, with `<project-slug>@<4hex>` IDs and substring/path matching in `session_activate`
+- middleware that smooths over client quirks and shapes error responses: `PreserveGodotCommandErrorData` (outermost), `StripClientWrapperKwargs`, `ParseStringifiedParams`, `FoldFlatManageParams`, and `HintOpTypoOnManage`, followed by observational `TrackMcpSessions`. The first five positions are load-bearing; the tracker never reshapes requests or responses. The full inventory is locked by `tests/unit/test_server_middleware_order.py`, with rationale above registration in `server.py`.
+- session registry and active-session resolution, with `<project-slug>@<16hex>` IDs and substring/path matching in `session_activate`
 - request validation and structured error mapping (`protocol/errors.py`)
 - job tracking for long-running operations and the deferred-response pattern for replies that flow back over a different channel (game capture)
 - the `--exclude-domains` CLI flag and dock UI knob, so tool-capped clients (Antigravity, etc.) can drop entire domains at server start while keeping the four core tools alive
 - CLI entry points for diagnostics and packaging (`python -m godot_ai`, the dev `--reload` runner via `src/godot_ai/asgi.py`)
 
-The plugin stays thin. Complex orchestration belongs in Python; direct editor work belongs in Godot.
+The plugin keeps editor-local ownership explicit: lifecycle, client mutation,
+and disable/enable coordination remain in Godot, while signed filesystem
+transactions and network-serving behavior live in Python. Policy boundaries
+should be described honestly rather than calling a large owner a thin facade.
 
 ---
 
@@ -69,9 +80,8 @@ plugin/addons/godot_ai/
 ├── connection.gd                ## WebSocket client + send_deferred_response
 ├── dispatcher.gd                ## command routing, frame budget, DEFERRED_RESPONSE sentinel
 ├── mcp_dock.gd                  ## editor dock: status, clients, logs, self-update banner, Tools tab
-├── client_configurator.gd       ## thin facade for client config (configure/remove/status)
+├── client_configurator.gd       ## client policy, mutation dispatch, verification, launch discovery
 ├── tool_catalog.gd              ## mirrors src/godot_ai/tools/domains.py; CI-enforced
-├── update_reload_runner.gd      ## self-update single-pass extract, scan, and re-enable handoff
 ├── handlers/                    ## one file per domain; ~30 handlers
 │   ├── editor_handler.gd        ## screenshot, logs, monitors, reload_plugin, quit_editor
 │   ├── scene_handler.gd, node_handler.gd, script_handler.gd
@@ -84,7 +94,7 @@ plugin/addons/godot_ai/
 │   ├── physics_shape_handler.gd, control_draw_recipe_handler.gd
 │   ├── *_values.gd / *_presets.gd  ## per-domain enum coercion + preset libraries
 │   └── _param_validators.gd, _property_errors.gd  ## shared utilities (Mcp* class_name)
-├── clients/                     ## descriptor + strategy system for 19 IDE configs
+├── clients/                     ## descriptor + strategy system for 23 IDE configs
 │   ├── _base.gd, _registry.gd
 │   ├── _json_strategy.gd, _toml_strategy.gd, _cli_strategy.gd
 │   ├── _atomic_write.gd, _cli_finder.gd, _cli_exec.gd
@@ -106,7 +116,15 @@ plugin/addons/godot_ai/
     ├── log_buffer.gd, editor_log_buffer.gd, game_log_buffer.gd, structured_log_ring.gd
     ├── log_backtrace.gd
     ├── resource_io.gd           ## shared resource load/save logic
-    ├── mcp_spawn_state.gd       ## tracks managed-server PID + version across reloads
+    ├── client_job_owner.gd      ## plugin-lifetime client worker owner
+    ├── server_lifecycle.gd      ## one serialized lifecycle episode
+    ├── server_authority.gd      ## transport/process/replacement grants
+    ├── transport_capability.gd  ## private record validation and status auth
+    ├── update_manager.gd        ## signed v4 discovery/download owner
+    ├── update_coordinator.gd    ## value-only disable/actor/scan/enable handoff
+    ├── client_mutation_lock.gd  ## durable account-wide mutation authority
+    ├── uv_resolution_policy.gd  ## one production uvx resolver policy
+    ├── port_resolver.gd         ## process identity and port helpers
     ├── windows_port_reservation.gd  ## avoids Windows-reserved ephemeral ports
     └── uv_cache_cleanup.gd      ## prunes stale uvx cache before self-update
 ```
@@ -116,13 +134,15 @@ The server-side counterparts live in:
 - `src/godot_ai/server.py` — FastMCP entry point, lifespan, tool/resource registration, `--exclude-domains`
 - `src/godot_ai/asgi.py` — uvicorn factory for `--reload`; ships `StaleMcpSessionDiagnosticMiddleware`
 - `src/godot_ai/transport/websocket.py` — WebSocket server adopting/owning the :9500 socket
-- `src/godot_ai/sessions/registry.py` — multi-session tracking, active resolution, substring matching
+- `src/godot_ai/transport/security.py` and `transport/capability.py` — bounded authenticated HTTP and private bootstrap records
+- `src/godot_ai/sessions/registry.py` — one authoritative editor/peer/pending-request table with immutable public snapshots
+- `src/godot_ai/update_transaction.py` and `release_verify.py` — transactional mutation/recovery and standalone signed-release verification
 - `src/godot_ai/godot_client/client.py` — typed async client; raises `GodotCommandError`
 - `src/godot_ai/runtime/direct.py` — `DirectRuntime`, the in-process runtime adapter that handlers depend on
 - `src/godot_ai/handlers/` — shared sync handlers; `_readiness.py` gates writes; `_target.py` resolves nodes
 - `src/godot_ai/tools/` — MCP tool wrappers per domain + `_meta_tool.py::register_manage_tool` rollup factory + `domains.py` (CI-paired with `tool_catalog.gd`)
 - `src/godot_ai/resources/` — read-only `godot://...` URI handlers
-- `src/godot_ai/middleware/` — `PreserveGodotCommandErrorData`, `StripClientWrapperKwargs`, `ParseStringifiedParams`, `HintOpTypoOnManage` (registration order is load-bearing — see `server.py` docstring + `tests/unit/test_server_middleware_order.py`)
+- `src/godot_ai/middleware/` — `PreserveGodotCommandErrorData`, `StripClientWrapperKwargs`, `ParseStringifiedParams`, `FoldFlatManageParams`, `HintOpTypoOnManage`, and observational `TrackMcpSessions` (see the registration rationale and complete-inventory lock)
 - `src/godot_ai/protocol/` — envelope types and error codes (kept in sync with `utils/error_codes.gd`)
 
 ---
@@ -163,11 +183,19 @@ _process(delta)
 
 ### `_enter_tree()`
 
-- create `McpConnection`
-- create `Dispatcher`
-- register handlers
-- start connection attempt
-- create or attach the dock panel
+- reject unsupported Godot versions before constructing the lifecycle
+- run the bounded durable update startup barrier before normal composition
+  (a joined worker in interactive editors; bounded synchronous execution for
+  export/import launches)
+- construct plugin-lifetime owners (`McpServerLifecycleManager`,
+  `McpClientJobOwner`, and `McpUpdateManager`) with inert constructors
+- construct the connection/dispatcher/debugger/log composition and lazy
+  handler registrations
+- attach the replaceable Dock as a view over copied owner snapshots
+- if startup reports a durable pending M6, keep that composition inert and run
+  only the client-migration path; otherwise activate client work, lifecycle,
+  transport, telemetry, and update discovery only after the complete
+  composition exists and the normal-start gate is released
 
 ### `_process(delta)`
 
@@ -179,17 +207,18 @@ _process(delta)
 
 ### `_exit_tree()`
 
-Outer-to-inner teardown order matters (see #46). Handlers themselves are preloaded scripts without `class_name`, but they hold typed members backed by `Mcp*` utility classes that *do* carry `class_name` (e.g. `McpGameLogBuffer._storage : Array[Dictionary]`). When Godot reloads those `class_name`-bearing scripts during plugin disable/enable, any Callable still pinning a handler past that moment will hit a stale class descriptor on its first post-reload call and SIGSEGV. The shipped order avoids that:
+Outer-to-inner teardown order matters (see #46). Client work first stops
+accepting requests and realizes every worker thread. The connection stops
+enqueueing commands before `Dispatcher.clear()` drops its lazy handler
+instances and their Callables. The Dock, update manager, client owner,
+connection, debugger plugin, and logger are then detached in that order while
+their script types are still valid. Finally, the lifecycle either stops the
+exact process named by its owned-process grant or detaches from an external,
+keep-alive, or actively leased backend.
 
-1. `_connection.teardown()` first, so `_process` stops enqueuing new commands
-2. `_dispatcher.clear()` next, breaking the Callable→handler ref chain so the array-clear in step 3 actually decrefs the handler RefCounteds to zero
-3. `_handlers.clear()` runs handler destructors while their `Mcp*` utility scripts are still loaded
-4. detach the dock, debugger plugin, and editor logger
-5. `_stop_server()` and reset the spawn-guard so a re-enabled plugin instance can respawn
-
-A symmetric `prepare_for_update_reload()` path runs during self-update so the new plugin version starts (or adopts) the right server.
-
-Step 5 has one opt-in exception: with the `godot_ai/keep_server_on_exit` EditorSetting enabled (#800), spawns skip `GODOT_AI_OWNER_PID` and stage `GODOT_AI_NO_IDLE_EXIT`, so neither the owner-PID reaper nor the session-idle backstop reclaims a server that is idle between editor runs by design. `_exit_tree` routes through `teardown_for_editor_exit()`, which picks by how the *running* server was actually launched — a keep-alive flag set at spawn and persisted in the managed-server record (`managed_server_keep_alive`), never the live setting, which may have been toggled since the spawn. Flag set → `detach_server()`: the watch stops and state settles on STOPPED, but the process, record, and pid-file are left alone, so MCP clients connected over HTTP stay served and the next editor session adopts the survivor — managed adoption recovers the flag from the record, so the survivor detaches again on that session's exit. Flag clear → `stop_server()` kills as always, even with the setting enabled: the server's spawn env has the reapers armed, so detaching would just leave a record pointing at a soon-reaped PID. Net effect: toggling the setting takes effect on the next server start (dock Restart applies it immediately). Explicit stops — dock Restart, `prepare_for_update_reload()` — always kill. Trust model: a kept server keeps listening on its localhost-only port while no editor is attached — the same binding and handshake rules as during a session (tokenless handshakes remain accepted for adoption, #690/#798), so enabling this setting means accepting that any local process can reach the MCP surface between editor runs, not just during them.
+The Dock owns no client worker, update transaction, lifecycle episode, or
+process authority. Replacing the Dock therefore cannot abandon background
+work.
 
 Client-owned `godot-ai attach` bridges add a second bounded-lifetime path. Each
 stdio bridge probes the configured loopback endpoint, adopts a compatible
@@ -201,24 +230,68 @@ editor reconnects to the same instance. Once there are no editor sessions and
 the final bridge lease is released or expires, the Python idle reaper stops the
 backend after its grace period. Explicit restart and update flows may still
 replace a verified owned backend. The lease is lifecycle evidence, not
-authentication or kill authority, and the endpoint remains loopback-only.
+kill authority; lease calls are nevertheless authenticated by the same private
+HTTP capability as the rest of the server.
 
-### Self-update Boundary And Compatibility
+### Transactional self-update boundary
 
-The update path is intentionally split so the runner can stay focused on the fragile editor reload window:
+The permanent updater is v4-to-v4. The final v3 line crosses once through a
+signed temporary bridge and then enters this same exact-tree protocol; see
+[v4-migration.md](v4-migration.md).
 
-- `utils/update_manager.gd` owns pre-runner work: release lookup, download, staging, version checks, and install gating. Its `class_name McpUpdateManager` declaration is published API surface and must remain unless replaced by a same-path compatibility shim.
-- `plugin.gd::prepare_for_update_reload()` owns pre-runner server stop prep. It stops the managed server and resets the spawn guard before the runner starts. Do not move this server lifecycle prep into the runner.
-- `plugin.gd::install_downloaded_update(...)` is the handoff point. It calls `prepare_for_update_reload()`, detaches the dock so it survives plugin teardown, creates the runner, parents it to the editor root, and calls `runner.start(...)`.
-- `update_reload_runner.gd` owns the install-and-reload sequence from that handoff onward: extract files into `addons/godot_ai/`, keep rollback bookkeeping, scan the filesystem, re-enable the plugin, clean up update temp state, and free itself.
+- `utils/update_manager.gd` performs v4-only release discovery. It requires the
+  exact six-name release envelope and downloads only the canonical
+  archive/manifest/signature triple. Transaction preflight first
+  allocates a random owner-private directory under the external recovery root;
+  the manager writes only those three bounded filenames there and never uses a
+  predictable `user://` staging namespace.
+- `src/godot_ai/update_transaction.py prepare` verifies the signature and
+  explicit release identity, stages the complete bounded tree under an
+  external recovery root, uses the already-established exclusive editor
+  preflight, and publishes immutable `prepared.json` before live code is
+  quiesced. The activation actor later reconstructs that authority, acquires
+  the activation lock, and writes intent/journal.
+- `plugin.gd::install_downloaded_update` invokes that exact actor while the old
+  composition is still live. Only after `prepare` succeeds does the root
+  quiesce client/dispatcher work and construct the detached coordinator.
+- `utils/update_coordinator.gd` is a detached value-only actor. It retains no
+  plugin/Dock/Node owner and performs only disable, external transaction
+  invocation, filesystem scan, and enable.
+- The long-running Python activation actor atomically renames complete
+  namespaces, journals every mutation, verifies the activated tree, rolls back
+  or quarantines on failure, and publishes the bounded result. New GDScript
+  invokes the frozen old-package startup actor; that actor publishes readiness,
+  validates and atomically claims the result, and later publishes
+  `migration-complete.json` after GDScript completes the M6 post-update client
+  migration. A durable actor-owned election gives exactly one live editor that
+  completion authority; dead owners are archived only after process-identity
+  proof. Clean-major first start uses the same pattern in a private state
+  directory beside its deny-only marker, and the actor—not GDScript—removes the
+  exact marker after repin. Active activation is cleared before normal
+  composition; a durable pending M6 permits only inert composition and keeps
+  normal effects barred.
+- The clean-major installer requires `uvx` and proves the exact target actor's
+  package/protocol identity before any project mutation. A newly installed tree
+  therefore cannot reach first start without the actor its fail-closed lease
+  barrier requires.
+- Published server, attach, prewarm, and transaction-actor `uvx` commands share
+  one isolated/no-config/no-build resolver policy pinned to official PyPI.
+  Godot-owned spawns additionally clear inherited uv resolver controls while
+  holding the process-spawn mutex. A process-local qualification switch is the
+  only private-index escape. This removes alternate-index configuration as an
+  ambient authority; it does not make the actor identity response
+  cryptographic. PyPI/TLS, uv, its local cache, and same-user machine integrity
+  remain global Python-runtime trust roots until wheel bytes are independently
+  hash-enforced or the runtime is bundled.
 
-The runner's key safety property is a consistent snapshot before scan. It writes all staged new and existing files for v(N+1) in one install pass, then runs one `EditorFileSystem.scan()` before enabling the plugin. This avoids Godot parsing a mixed old/new plugin snapshot and reusing stale Script-object content.
+No GDScript object extracts over the tree containing its own script. A scan can
+observe only the old exact tree, the new exact tree, or a blocked recovery
+state—never a mixed overlay. Successful backups are retained outside the
+project and are never deleted automatically.
 
-Compatibility rules that follow from that model:
-
-- Never delete a `class_name` declaration that has shipped in a release. Dropping a registered global class can produce a "Could not resolve script" cascade during the disable -> extract -> enable window, independent of the single-pass runner fix.
-- If a published `class_name` has to retire, keep the original file path and declaration as a shape-aware shim. Static constants and static methods need explicit forwarding or redeclaration; simple `extends` is only enough for compatible instance-surface cases.
-- Until old two-phase runners have aged out, release ZIPs should avoid adding new files that reference constants, methods, or static/non-static shape changes added to existing load-surface scripts in the same release. This applies to both `class_name` scripts and preload-only scripts because the failure mode is stale Script-object content, not only class registry skew.
+Within v4, published `class_name` APIs remain explicit compatibility surface.
+Do not keep private v3 shims or legacy wire/update branches merely to make the
+new updater accept an old architecture.
 
 ---
 
@@ -226,16 +299,24 @@ Compatibility rules that follow from that model:
 
 The session model exists so the server can distinguish live editor instances and refuse writes when the editor is in an unsafe state.
 
+`SessionRegistry` has one `_entries` table. Each row owns its pending/active
+phase, immutable `Session` snapshot, exact WebSocket peer, and pending response
+futures. The ACK transition publishes a reserved row; disconnect removes that
+same peer's row and fails its work. Public callers receive immutable snapshots
+rather than mutable registry records, and no parallel session/peer/future map
+can drift out of sync.
+
 ### Session Metadata
 
-- session id, formatted `<project-slug>@<4hex>` (e.g. `godot-ai@a3f2`) — slug derives from the project directory name so agents can recognise which editor they're targeting; the hex suffix disambiguates same-project twins
+- session id, formatted `<project-slug>@<16hex>` (for example, `godot-ai@7f9c3a10d8e426b1`) — the slug identifies the project while the cryptographic 64-bit suffix disambiguates same-project editors
 - name (project basename)
 - Godot version, plugin version, server version
 - project path
 - editor PID
 - current scene, play state, readiness state
 - last_seen heartbeat, used by `session_list` and stale-session diagnostics
-- server launch mode (managed vs. external) reported via `session_list`
+- server launch tier (`dev_venv`, `uvx`, `system`, or `unknown`) reported via
+  `session_list`; managed/adopted ownership is a separate lifecycle fact
 
 ### Readiness States
 
@@ -279,7 +360,7 @@ The architecture should treat these as tracked jobs with:
 ## Game-Process Capture Bridge
 
 The running game is always a separate OS child process — "Embed Game Mode"
-on Windows and Linux (and macOS 4.5+) just reparents the game's window into
+on Windows, Linux, and supported macOS versions just reparents the game's window into
 the editor via `SetParent` / `XReparentWindow` / remote-layer. The editor
 never has direct access to the game's framebuffer through its own
 `Viewport`, so anything that needs pixels from the running game has to ask
@@ -430,7 +511,31 @@ This should be visible in both the protocol and the user-facing docs.
 
 ### WebSocket trust boundary — the concrete contract
 
-The editor↔server WebSocket (port 9500) is **effectively unauthenticated** — the primary control is loopback-only binding: the WS port always binds `127.0.0.1` and `--allow-host` deliberately does NOT widen it (see `transport/websocket.py::start`). Defense in depth on top of that: unguessable `uuid4` request ids, session-scoped response correlation (a reply is only accepted from the connection its command was sent to — #690), and a compat-gated per-launch handshake token (#690 finding 4): the spawning plugin generates it, hands it to the server via the `GODOT_AI_WS_TOKEN` spawn env, and echoes it in the handshake; a handshake carrying a *wrong* token is rejected, but a token-less handshake is still accepted (older plugins, adopted servers, and the field is attacker-omittable — so the token is hardening, not an authentication boundary). Never bind the WS port beyond loopback. **The token authenticates the plugin TO the server, and nothing authenticates the server to the plugin**: `connection.gd` dials `ws://127.0.0.1:<ws_port>` and hands whatever answers the full write surface (`filesystem_write_text`, `script_create`, `game_eval`, `editor_quit`), adoption of an existing `:8000` listener is decided by a *self-reported* status JSON, and `_note_post_open_close` drops the token entirely after two close-4003 frames (an attacker-triggerable downgrade, deliberately accepted because omitting the field is always allowed anyway). Loopback binding is the whole boundary on the plugin side — do not add plugin-side logic that assumes the peer on 9500 is trusted.
+The editor WebSocket always binds `127.0.0.1`; `--allow-host` never widens it.
+Loopback is only the first layer. Every v4 backend also has an independent
+32-byte WebSocket capability, published through the private per-port bootstrap
+record.
+
+The handshake is mutual. The editor sends only a random nonce, verifies a
+server HMAC over the protocol/nonces/server version, and discloses project and
+session metadata only after that proof succeeds. The editor then HMAC-binds all
+metadata into its response. The server reserves the session ID, sends the final
+ACK, and publishes the peer only after that send succeeds. Missing/wrong
+capabilities, duplicate JSON keys, replayed nonces, protocol-1/v3 frames, and
+Godot versions below 4.7 fail closed. There is no tokenless retry or downgrade.
+
+Before authentication, frames and parser queues stay under small handshake
+limits; authenticated peers receive the normal bounded command budget. Response
+settlement is bound to the peer and request reservation that originated the
+command, so an unsolicited or replacement peer cannot mutate a session snapshot
+with a guessed request ID.
+
+HTTP is separately bearer-authenticated and bounded. Status/lease routes do not
+form an unauthenticated side channel. Private capability records are owner-only
+on POSIX; caller-selected roots reject link traversal and unsafe ancestors. On
+Windows, v4 uses fixed per-user roots and rejects detectable reparse traversal,
+but does not claim secrecy or integrity against another local account or
+malicious code already running as the same user.
 
 ---
 
@@ -438,26 +543,52 @@ The editor↔server WebSocket (port 9500) is **effectively unauthenticated** —
 
 ### Handshake
 
-Plugin to server (initial handshake — exact field set, see [`connection.gd::_send_handshake`](../plugin/addons/godot_ai/connection.gd)):
+Plugin to server (metadata-free hello):
 
 ```json
 {
-  "type": "handshake",
-  "session_id": "godot-ai@a3f2",
-  "godot_version": "4.6.0",
+  "type": "auth_hello",
+  "protocol_version": 2,
+  "client_nonce": "<64 lowercase hex characters>"
+}
+```
+
+Server to plugin (challenge):
+
+```json
+{
+  "type": "auth_challenge",
+  "protocol_version": 2,
+  "client_nonce": "<same client nonce>",
+  "server_nonce": "<64 lowercase hex characters>",
+  "server_version": "4.0.0",
+  "server_proof": "<transcript HMAC>"
+}
+```
+
+Only after verifying `server_proof`, the plugin returns `auth_response` with
+both nonces, `client_proof`, and the bounded metadata fields:
+
+```json
+{
+  "type": "auth_response",
+  "protocol_version": 2,
+  "client_nonce": "<same client nonce>",
+  "server_nonce": "<same server nonce>",
+  "client_proof": "<metadata-bound transcript HMAC>",
+  "session_id": "godot-ai@7f9c3a10d8e426b1",
+  "godot_version": "4.7.stable.official",
   "project_path": "/path/to/project",
-  "plugin_version": "2.2.3",
-  "protocol_version": 1,
+  "plugin_version": "4.0.0",
   "readiness": "ready",
   "editor_pid": 12345,
   "server_launch_mode": "managed"
 }
 ```
 
-Server-derived fields:
-
-- `name` — derived by the server from `project_path` (the project directory basename); not sent on the wire.
-- `server_version` — sent back to the plugin in a `handshake_ack` reply, not in the handshake itself.
+The server replies with `handshake_ack` containing protocol and server version.
+It derives `name` from the project path rather than accepting a peer-supplied
+display name.
 
 Subsequent runtime state (current scene, play state, readiness transitions) flows as separate `{"type": "event", "event": <name>, "data": …}` messages — `scene_changed`, `readiness_changed`, etc. — not as part of the initial handshake.
 
@@ -481,7 +612,8 @@ Plugin to server:
 {
   "request_id": "uuid",
   "status": "ok",
-  "data": {}
+  "data": {},
+  "readiness": "ready"
 }
 ```
 
@@ -493,6 +625,7 @@ Plugin to server:
 {
   "request_id": "uuid",
   "status": "error",
+  "readiness": "ready",
   "error": {
     "code": "NODE_NOT_FOUND",
     "message": "Node at path '/root/Main/Player' not found"

@@ -121,6 +121,21 @@ class TestTelemetryConfig:
         monkeypatch.setenv(var, "true")
         assert tel.TelemetryConfig().enabled is False
 
+    def test_live_enabled_rereads_env_after_construction(
+        self, monkeypatch, clean_env, isolated_data_dir
+    ) -> None:
+        ## Upstream PR #931 / issue #913: in-process env changes are re-read;
+        ## this is not a dock-to-adopted-server channel (the editor cannot
+        ## mutate another process's environment).
+        monkeypatch.delenv("GODOT_AI_DISABLE_TELEMETRY", raising=False)
+        monkeypatch.delenv("DISABLE_TELEMETRY", raising=False)
+        config = tel.TelemetryConfig()
+        assert config.enabled is True
+        assert config.live_enabled() is True
+        monkeypatch.setenv("GODOT_AI_DISABLE_TELEMETRY", "true")
+        assert config.enabled is True
+        assert config.live_enabled() is False
+
     @pytest.mark.parametrize("value", ["1", "true", "TRUE", "YES", "On"])
     def test_truthy_variants(self, monkeypatch, clean_env, isolated_data_dir, value: str) -> None:
         monkeypatch.setenv("GODOT_AI_DISABLE_TELEMETRY", value)
@@ -254,6 +269,26 @@ class TestTelemetryCollector:
         collector.record(tel.RecordType.USAGE, {"x": 1})
         time.sleep(0.1)
         assert sent == []
+        collector.shutdown()
+
+    def test_runtime_env_opt_out_drops_later_records(
+        self, monkeypatch, clean_env, isolated_data_dir
+    ) -> None:
+        ## A later in-process opt-out is honored on the next record(); the
+        ## dock checkbox still cannot reach an adopted server's environment.
+        collector = tel.TelemetryCollector()
+        sent: list[tel.TelemetryRecord] = []
+        _drain_to(collector, sent)
+        collector.record(tel.RecordType.USAGE, {"x": 1})
+        for _ in range(40):
+            if sent:
+                break
+            time.sleep(0.05)
+        assert len(sent) == 1
+        monkeypatch.setenv("GODOT_AI_DISABLE_TELEMETRY", "true")
+        collector.record(tel.RecordType.USAGE, {"x": 2})
+        time.sleep(0.1)
+        assert len(sent) == 1
         collector.shutdown()
 
     def test_record_enqueues_and_worker_drains(self, clean_env, isolated_data_dir) -> None:

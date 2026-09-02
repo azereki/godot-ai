@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
 import os
 import socket
 import subprocess
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +20,7 @@ import pytest
 from godot_ai import __version__, orphan_reaper
 from godot_ai.attach import ensure as ensure_module
 from godot_ai.attach.ensure import (
+    MAX_STATUS_RESPONSE_BYTES,
     AdvisoryFileLock,
     AttachStartupError,
     BackendEnsurer,
@@ -36,6 +39,15 @@ from godot_ai.protocol.attach import (
     ATTACH_SPAWNED_ENV,
     DEV_TRANSPORT_ENV,
     PLUGIN_SPAWNED_ENV,
+)
+from godot_ai.transport.capability import CapabilityRecord
+from tests.conftest import TEST_TRANSPORT_CAPABILITIES
+
+_HTTPX_ASYNC_CLIENT = httpx.AsyncClient
+TEST_CAPABILITY_RECORD = CapabilityRecord(
+    TEST_TRANSPORT_CAPABILITIES.http,
+    TEST_TRANSPORT_CAPABILITIES.websocket,
+    attach_protocol.SERVER_INSTANCE_ID,
 )
 
 
@@ -63,7 +75,7 @@ def status(*, version: str = __version__, instance_id: str = "instance-a") -> Ba
 def status_payload(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "name": "godot-ai",
-        "instance_id": "instance-a",
+        "instance_id": TEST_CAPABILITY_RECORD.instance_nonce,
         "server_version": __version__,
         "attach_protocol_version": ATTACH_PROTOCOL_VERSION,
         "ws_port": 9500,
@@ -82,24 +94,32 @@ def install_probe_response(
     response: httpx.Response | None = None,
     error: Exception | None = None,
 ) -> None:
-    class FakeClient:
-        def __init__(self, *, timeout: float, trust_env: bool) -> None:
-            self.timeout = timeout
-            assert trust_env is False
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        async def get(self, _url: str) -> httpx.Response:
-            if error is not None:
-                raise error
+    class StaticStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
             assert response is not None
-            return response
+            yield response.content
 
-    monkeypatch.setattr(ensure_module.httpx, "AsyncClient", FakeClient)
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == (f"Bearer {TEST_TRANSPORT_CAPABILITIES.http}")
+        if error is not None:
+            raise error
+        assert response is not None
+        return httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            stream=StaticStream(),
+        )
+
+    def client_factory(**kwargs):
+        assert kwargs.pop("trust_env") is False
+        return _HTTPX_ASYNC_CLIENT(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(
+        ensure_module,
+        "read_capabilities",
+        lambda _port: TEST_CAPABILITY_RECORD,
+    )
+    monkeypatch.setattr(ensure_module.httpx, "AsyncClient", client_factory)
 
 
 def test_backend_status_validates_brand_fields_and_domains() -> None:
@@ -554,7 +574,9 @@ async def test_probe_backend_accepts_valid_status_and_rejects_malformed_brand(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     install_probe_response(monkeypatch, response=httpx.Response(200, json=status_payload()))
-    assert (await probe_backend(8000)).instance_id == "instance-a"  # type: ignore[union-attr]
+    assert (await probe_backend(8000)).instance_id == (  # type: ignore[union-attr]
+        TEST_CAPABILITY_RECORD.instance_nonce
+    )
 
     install_probe_response(
         monkeypatch,
@@ -563,6 +585,79 @@ async def test_probe_backend_accepts_valid_status_and_rejects_malformed_brand(
     with pytest.raises(AttachStartupError) as malformed:
         await probe_backend(8000)
     assert malformed.value.code == "NEW_CLIENT_SESSION_REQUIRED"
+
+
+async def test_probe_retries_once_only_when_the_atomic_record_rotates(monkeypatch) -> None:
+    first = TEST_CAPABILITY_RECORD
+    second = replace(
+        first,
+        http="s" * 32,
+        websocket="c" * 64,
+        instance_nonce="d" * 32,
+    )
+    records = iter((first, second, second))
+    capabilities_seen: list[str] = []
+
+    async def request(_client, _url, capability):
+        capabilities_seen.append(capability)
+        if len(capabilities_seen) == 1:
+            return httpx.Response(401), b""
+        return httpx.Response(200), json.dumps(
+            status_payload(instance_id=second.instance_nonce)
+        ).encode()
+
+    monkeypatch.setattr(ensure_module, "read_capabilities", lambda _port: next(records))
+    monkeypatch.setattr(ensure_module, "_bounded_status_request", request)
+
+    result = await probe_backend(8000)
+
+    assert result is not None
+    assert result.instance_id == second.instance_nonce
+    assert capabilities_seen == [first.http, second.http]
+
+
+async def test_probe_does_not_retry_an_unchanged_record(monkeypatch) -> None:
+    calls = 0
+
+    async def request(_client, _url, _capability):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(401), b""
+
+    monkeypatch.setattr(
+        ensure_module,
+        "read_capabilities",
+        lambda _port: TEST_CAPABILITY_RECORD,
+    )
+    monkeypatch.setattr(ensure_module, "_bounded_status_request", request)
+
+    with pytest.raises(AttachStartupError, match="HTTP 401"):
+        await probe_backend(8000)
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"x" * (MAX_STATUS_RESPONSE_BYTES + 1),
+        (
+            b'{"name":"godot-ai","instance_id":"'
+            + TEST_CAPABILITY_RECORD.instance_nonce.encode()
+            + b'","instance_id":"'
+            + TEST_CAPABILITY_RECORD.instance_nonce.encode()
+            + b'"}'
+        ),
+    ],
+    ids=("oversized", "duplicate-key"),
+)
+async def test_probe_rejects_oversized_or_ambiguous_status(
+    monkeypatch,
+    body: bytes,
+) -> None:
+    install_probe_response(monkeypatch, response=httpx.Response(200, content=body))
+    with pytest.raises(AttachStartupError) as exc_info:
+        await probe_backend(8000)
+    assert exc_info.value.code == "PORT_OCCUPIED"
 
 
 def test_port_available_reports_free_and_bound_ports() -> None:
@@ -589,7 +684,12 @@ def test_spawn_backend_builds_detached_command_and_log(
     (tmp_path / "backend-8123.log").write_text("latest generation", encoding="utf-8")
     (tmp_path / "backend-8123.log.old").write_text("stale generation", encoding="utf-8")
 
-    spawned = spawn_backend(8123, 9567, ("audio", "theme"))
+    spawned = spawn_backend(
+        8123,
+        9567,
+        ("audio", "theme"),
+        TEST_TRANSPORT_CAPABILITIES,
+    )
 
     assert captured["args"][-2:] == ["--exclude-domains", "audio,theme"]  # type: ignore[index]
     kwargs = captured["kwargs"]
@@ -608,9 +708,7 @@ def test_backend_python_uses_sibling_pythonw_on_windows(tmp_path: Path) -> None:
     python.write_bytes(b"")
     pythonw.write_bytes(b"")
 
-    assert (
-        ensure_module.backend_python_executable(python, platform="nt") == str(pythonw)
-    )
+    assert ensure_module.backend_python_executable(python, platform="nt") == str(pythonw)
 
 
 def test_backend_python_falls_back_when_pythonw_is_missing(tmp_path: Path) -> None:
@@ -618,12 +716,8 @@ def test_backend_python_falls_back_when_pythonw_is_missing(tmp_path: Path) -> No
     python.parent.mkdir()
     python.write_bytes(b"")
 
-    assert (
-        ensure_module.backend_python_executable(python, platform="nt") == str(python)
-    )
-    assert (
-        ensure_module.backend_python_executable(python, platform="posix") == str(python)
-    )
+    assert ensure_module.backend_python_executable(python, platform="nt") == str(python)
+    assert ensure_module.backend_python_executable(python, platform="posix") == str(python)
 
 
 def test_spawn_backend_reports_log_rotation_failure(
@@ -640,7 +734,7 @@ def test_spawn_backend_reports_log_rotation_failure(
     )
 
     with pytest.raises(AttachStartupError) as exc_info:
-        spawn_backend(8123, 9567, ())
+        spawn_backend(8123, 9567, (), TEST_TRANSPORT_CAPABILITIES)
 
     assert exc_info.value.code == "BACKEND_START_FAILED"
     assert exc_info.value.data["log_path"] == str(log_path)
@@ -652,7 +746,7 @@ def test_spawn_backend_reports_log_rotation_failure(
 async def test_compatible_backend_is_adopted_without_spawn(tmp_path: Path) -> None:
     spawns: list[bool] = []
 
-    async def probe(_port: int) -> BackendStatus:
+    async def probe(_port: int, *_args) -> BackendStatus:
         return status()
 
     ensurer = BackendEnsurer(
@@ -670,7 +764,7 @@ async def test_compatible_backend_is_adopted_without_spawn(tmp_path: Path) -> No
 async def test_lock_is_held_until_health_and_two_callers_spawn_once(tmp_path: Path) -> None:
     state = {"spawned": False, "healthy": False, "spawns": 0}
 
-    async def probe(_port: int) -> BackendStatus | None:
+    async def probe(_port: int, *_args) -> BackendStatus | None:
         if not state["spawned"]:
             return None
         if not state["healthy"]:
@@ -679,7 +773,12 @@ async def test_lock_is_held_until_health_and_two_callers_spawn_once(tmp_path: Pa
             return None
         return status()
 
-    def spawn(_port: int, _ws_port: int, _domains: tuple[str, ...]) -> SpawnedBackend:
+    def spawn(
+        _port: int,
+        _ws_port: int,
+        _domains: tuple[str, ...],
+        _capabilities,
+    ) -> SpawnedBackend:
         state["spawned"] = True
         state["spawns"] += 1
         return SpawnedBackend(FakeProcess(), tmp_path / "backend.log")
@@ -701,7 +800,7 @@ async def test_lock_is_held_until_health_and_two_callers_spawn_once(tmp_path: Pa
 async def test_version_skew_is_terminal_without_spawn_or_kill(tmp_path: Path) -> None:
     spawns: list[bool] = []
 
-    async def probe(_port: int) -> BackendStatus:
+    async def probe(_port: int, *_args) -> BackendStatus:
         return status(version="0.0.0")
 
     ensurer = BackendEnsurer(
@@ -723,10 +822,15 @@ async def test_three_concurrent_bridges_with_two_version_pins_choose_one_backend
 ) -> None:
     state = {"spawned": False, "spawns": 0}
 
-    async def probe(_port: int) -> BackendStatus | None:
+    async def probe(_port: int, *_args) -> BackendStatus | None:
         return status() if state["spawned"] else None
 
-    def spawn(_port: int, _ws_port: int, _domains: tuple[str, ...]) -> SpawnedBackend:
+    def spawn(
+        _port: int,
+        _ws_port: int,
+        _domains: tuple[str, ...],
+        _capabilities,
+    ) -> SpawnedBackend:
         state["spawned"] = True
         state["spawns"] += 1
         return SpawnedBackend(FakeProcess(), tmp_path / "backend.log")
@@ -758,7 +862,7 @@ async def test_three_concurrent_bridges_with_two_version_pins_choose_one_backend
 async def test_foreign_http_occupant_never_spawns(tmp_path: Path) -> None:
     spawns: list[bool] = []
 
-    async def probe(_port: int) -> None:
+    async def probe(_port: int, *_args) -> None:
         return None
 
     ensurer = BackendEnsurer(
@@ -781,7 +885,7 @@ async def test_slow_backend_is_adopted_after_retry(tmp_path: Path) -> None:
     calls = {"n": 0}
     spawns: list[bool] = []
 
-    async def probe(_port: int) -> BackendStatus | None:
+    async def probe(_port: int, *_args) -> BackendStatus | None:
         calls["n"] += 1
         if calls["n"] == 1:
             return None
@@ -807,7 +911,7 @@ async def test_answered_foreign_occupant_is_not_retried(tmp_path: Path) -> None:
     calls = {"n": 0}
     spawns: list[bool] = []
 
-    async def probe(_port: int) -> BackendStatus | None:
+    async def probe(_port: int, *_args) -> BackendStatus | None:
         calls["n"] += 1
         raise ensure_module._foreign_occupant(_port, "status probe returned HTTP 503")
 
@@ -832,7 +936,7 @@ async def test_bound_http_port_that_frees_falls_through_to_spawn(tmp_path: Path)
     calls = {"n": 0}
     spawns = {"n": 0}
 
-    async def probe(_port: int) -> BackendStatus | None:
+    async def probe(_port: int, *_args) -> BackendStatus | None:
         calls["n"] += 1
         if calls["n"] < 3:
             return None
@@ -843,7 +947,12 @@ async def test_bound_http_port_that_frees_falls_through_to_spawn(tmp_path: Path)
             return True
         return calls["n"] >= 2
 
-    def spawn(_port: int, _ws_port: int, _domains: tuple[str, ...]) -> SpawnedBackend:
+    def spawn(
+        _port: int,
+        _ws_port: int,
+        _domains: tuple[str, ...],
+        _capabilities,
+    ) -> SpawnedBackend:
         spawns["n"] += 1
         return SpawnedBackend(FakeProcess(), tmp_path / "backend.log")
 
@@ -864,7 +973,7 @@ async def test_bound_http_port_that_frees_falls_through_to_spawn(tmp_path: Path)
 
 
 async def test_foreign_websocket_occupant_never_spawns(tmp_path: Path) -> None:
-    async def probe(_port: int) -> None:
+    async def probe(_port: int, *_args) -> None:
         return None
 
     ensurer = BackendEnsurer(
@@ -882,7 +991,7 @@ async def test_foreign_websocket_occupant_never_spawns(tmp_path: Path) -> None:
 
 
 async def test_spawned_backend_early_exit_reports_log(tmp_path: Path) -> None:
-    async def probe(_port: int) -> None:
+    async def probe(_port: int, *_args) -> None:
         return None
 
     log_path = tmp_path / "backend.log"
@@ -907,7 +1016,7 @@ async def test_spawned_backend_early_exit_reports_log(tmp_path: Path) -> None:
 
 
 async def test_spawned_backend_health_timeout_reports_log(tmp_path: Path) -> None:
-    async def probe(_port: int) -> None:
+    async def probe(_port: int, *_args) -> None:
         return None
 
     log_path = tmp_path / "backend.log"
@@ -948,7 +1057,7 @@ async def test_backend_compatibility_checks_every_gate(
     candidate: BackendStatus,
     difference: str,
 ) -> None:
-    async def probe(_port: int) -> BackendStatus:
+    async def probe(_port: int, *_args) -> BackendStatus:
         return candidate
 
     ensurer = BackendEnsurer(probe=probe, runtime_dir=tmp_path)
@@ -1009,13 +1118,14 @@ def test_backend_spawn_environment_removes_parent_process_markers(
     monkeypatch.setenv(DEV_TRANSPORT_ENV, "streamable-http")
     monkeypatch.setenv("GODOT_AI_UNRELATED", "preserved")
 
-    env = _backend_spawn_env()
+    env = _backend_spawn_env(TEST_TRANSPORT_CAPABILITIES)
 
     assert env[ATTACH_SPAWNED_ENV] == "1"
     assert env["GODOT_AI_UNRELATED"] == "preserved"
     assert PLUGIN_SPAWNED_ENV not in env
     assert "GODOT_AI_OWNER_PID" not in env
-    assert "GODOT_AI_WS_TOKEN" not in env
+    assert env["GODOT_AI_HTTP_CAPABILITY"] == TEST_TRANSPORT_CAPABILITIES.http
+    assert env["GODOT_AI_WS_TOKEN"] == TEST_TRANSPORT_CAPABILITIES.websocket
     assert DEV_TRANSPORT_ENV not in env
 
 

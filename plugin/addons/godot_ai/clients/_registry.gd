@@ -30,7 +30,6 @@ const _CLIENT_SCRIPT_PATHS := [
 	"res://addons/godot_ai/clients/zoo_code.gd",
 	"res://addons/godot_ai/clients/kiro.gd",
 	"res://addons/godot_ai/clients/trae.gd",
-	"res://addons/godot_ai/clients/cherry_studio.gd",
 	"res://addons/godot_ai/clients/opencode.gd",
 	"res://addons/godot_ai/clients/qwen_code.gd",
 	"res://addons/godot_ai/clients/kimi_code.gd",

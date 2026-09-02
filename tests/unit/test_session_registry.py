@@ -182,15 +182,19 @@ class TestSessionMetadata:
         s = _make_session(editor_pid=12345)
         assert s.editor_pid == 12345
 
-    def test_touch_updates_last_seen(self):
+    def test_table_activity_replaces_snapshot_without_mutating_old_value(self):
         s = _make_session()
-        original = s.last_seen
+        reg = SessionRegistry()
+        reg.register(s)
         ## busy-wait a tiny amount to guarantee timestamp delta
         import time
 
         time.sleep(0.001)
-        s.touch()
-        assert s.last_seen > original
+        reg.note_peer_activity(s.session_id)
+        refreshed = reg.get(s.session_id)
+        assert refreshed is not None
+        assert refreshed.last_seen > s.last_seen
+        assert s.last_seen < refreshed.last_seen
 
 
 class TestWaitForSession:

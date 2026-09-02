@@ -3,10 +3,37 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+
+WS_PROTOCOL_VERSION = 2
+
+NonceHex = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
+ProofHex = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
+SessionId = Annotated[StrictStr, Field(pattern=r"^[A-Za-z0-9._@-]{1,128}$")]
+VersionToken = Annotated[StrictStr, Field(min_length=1, max_length=64)]
+
+## The plugin emits exactly these six counters. Keeping the wire shape finite
+## prevents an untrusted local WebSocket peer from parking a near-4 MiB mapping
+## in Session and making every later one-field state transition copy it.
+ErrorWatermarkKey = Literal[
+    "run_seq",
+    "editor_ring",
+    "debugger_promoted",
+    "game_error_warn",
+    "editor_ring_warn",
+    "game_warn",
+]
+ErrorWatermarkValue = Annotated[StrictInt, Field(ge=0, le=(1 << 63) - 1)]
+ErrorWatermark = Annotated[
+    dict[ErrorWatermarkKey, ErrorWatermarkValue],
+    Field(max_length=6),
+]
+
+Readiness = Literal["ready", "importing", "playing", "no_scene"]
+KNOWN_READINESS: frozenset[str] = frozenset(Readiness.__args__)
 
 
 def find_non_finite_float(value: Any, path: str = "params") -> str | None:
@@ -45,22 +72,14 @@ class CommandResponse(BaseModel):
     """A response sent from the Godot plugin back to the Python server."""
 
     request_id: str
-    status: str  # "ok" or "error"
+    status: Literal["ok", "error"]
     data: dict[str, Any] = Field(default_factory=dict)
     error: ErrorDetail | None = None
-    ## Live readiness snapshot stamped by the plugin's dispatcher onto every
-    ## response envelope. The server uses it to keep `Session.readiness` in
-    ## lockstep with editor state, so a stale "playing" / "importing" cache
-    ## (e.g. a `readiness_changed` event lost in transit, or a one-frame race
-    ## around `pause_processing`) self-heals on the very next tool call —
-    ## without the agent having to call `editor_state` first. Older plugins
-    ## omit the field; the server falls through to the existing event-driven
-    ## path. See connection.gd::get_readiness for the producer.
-    readiness: str | None = None
+    readiness: Readiness
     ## Optional monotonic-ish counters stamped by newer plugins after each
     ## command. Components may reset independently (game run rotation), so the
     ## server compares per key and treats decreases as a reset baseline.
-    error_watermark: dict[str, int] | None = None
+    error_watermark: ErrorWatermark | None = None
 
 
 class ErrorDetail(BaseModel):
@@ -71,35 +90,36 @@ class ErrorDetail(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
-class HandshakeMessage(BaseModel):
-    """Initial handshake sent by the Godot plugin on connection."""
+class AuthenticationHello(BaseModel):
+    """Metadata-free first message for the single v4 editor protocol."""
 
-    type: str = "handshake"
-    ## Bounded + charset-constrained: the plugin always produces "<slug>@<4hex>"
-    ## (slug is [a-z0-9-]; see connection.gd::_make_session_id), so this only
-    ## rejects a malformed or non-plugin peer. The value is used as a registry
-    ## key, logged, and hashed into telemetry, so an unbounded/arbitrary string
-    ## from an untrusted WS client shouldn't flow downstream unchecked (#527).
-    session_id: str = Field(pattern=r"^[A-Za-z0-9._@-]{1,128}$")
-    godot_version: str
-    project_path: str
-    plugin_version: str
-    protocol_version: int = 1
-    readiness: str = "ready"
-    ## Optional because older plugins won't send it; server falls back to 0.
-    editor_pid: int = 0
-    ## Which launcher tier the plugin resolved for the Python server. Older
-    ## plugins omit the field entirely, which lands as "unknown" on the
-    ## server — distinguishable from a live detection that returned
-    ## "unknown" only by plugin_version.
-    server_launch_mode: str = "unknown"
-    ## Per-launch WS auth token (#690). The spawning plugin generates it,
-    ## passes it to the server via the GODOT_AI_WS_TOKEN spawn env, and
-    ## echoes it here. None from older plugins and from editors adopting a
-    ## server they didn't spawn — both accepted (compat gate); only a
-    ## PRESENT-but-wrong token is rejected. Bounded like session_id so an
-    ## untrusted peer can't stuff an unbounded string into the handshake.
-    auth_token: str | None = Field(default=None, max_length=128)
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["auth_hello"]
+    protocol_version: Literal[2]
+    client_nonce: NonceHex
+
+
+class AuthenticatedHandshake(BaseModel):
+    """Editor identity disclosed only after it verifies the server proof."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["auth_response"]
+    protocol_version: Literal[2]
+    client_nonce: NonceHex
+    server_nonce: NonceHex
+    client_proof: ProofHex
+    session_id: SessionId
+    godot_version: VersionToken
+    project_path: Annotated[StrictStr, Field(min_length=1, max_length=4096)]
+    plugin_version: VersionToken
+    readiness: Readiness
+    editor_pid: Annotated[StrictInt, Field(ge=0, le=(1 << 63) - 1)]
+    server_launch_mode: Annotated[
+        StrictStr,
+        Field(pattern=r"^[A-Za-z0-9._+-]{1,32}$"),
+    ]
 
 
 ## State events emitted by the plugin's _check_state_changes() poller. Each
@@ -110,15 +130,15 @@ class HandshakeMessage(BaseModel):
 
 
 class SceneChangedEvent(BaseModel):
-    current_scene: str = ""
+    current_scene: Annotated[StrictStr, Field(max_length=4096)]
 
 
 class PlayStateChangedEvent(BaseModel):
-    play_state: str = "stopped"
+    play_state: Literal["stopped", "playing"]
 
 
 class ReadinessChangedEvent(BaseModel):
-    readiness: str = "ready"
+    readiness: Readiness
 
 
 ## Plugin-emitted telemetry event. The plugin relays its own events

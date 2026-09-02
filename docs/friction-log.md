@@ -280,7 +280,7 @@ another repro datapoint.
 Workaround: relaunch Godot after a reload when possible. Long-term fix
 tracked in #46.
 
-### friction — `--reload` uvicorn uses the root repo's src, not the worktree's — FIXED (`script/serve-this-worktree` + dock auto-detect; see issue #84)
+### friction — `--reload` uvicorn uses the root repo's src, not the worktree's — FIXED (`script/serve-this-worktree`; see issue #84)
 
 Dev server was running as `python -m godot_ai ... --reload` with the
 repo's editable install in `.venv`. `import godot_ai` resolves to
@@ -288,7 +288,7 @@ repo's editable install in `.venv`. `import godot_ai` resolves to
 worktree I'm in. Had to kill and restart with `PYTHONPATH=<worktree>/src`
 to get PR code into the server.
 
-Addressed in two places:
+Originally addressed in two places:
 - `script/serve-this-worktree` is the CLI one-liner (prepends
   `<worktree>/src` to `PYTHONPATH`, frees the port, starts `--reload`).
 - The dock's **Start Dev Server** button now auto-detects a sibling
@@ -296,6 +296,11 @@ Addressed in two places:
   `PYTHONPATH=<that>/src` for the spawn. On the root repo it matches the
   editable install and is a no-op; in a worktree it makes the button Do
   The Right Thing without any new UI.
+
+V4 supersedes the second implementation: the Dock no longer owns a parallel
+`--reload` process state machine. `script/serve-this-worktree` remains the one
+external auto-reload path, while the Dock controls only the lifecycle's exact
+managed child and refuses to kill an external port occupant.
 
 ### friction — `scene_create` briefly rejects with `EDITOR_NOT_READY: importing` — FIXED in PR #95 (retryable/state hints on EDITOR_NOT_READY)
 

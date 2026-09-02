@@ -78,28 +78,42 @@ script/ci-find-regression-range
 For changes that touch self-update, plugin reload handoff, or install/extract logic, run the interactive local harness:
 
 ```bash
-script/local-self-update-smoke
+python script/local-self-update-smoke
 ```
 
 It creates a disposable project with a physical `addons/godot_ai/` copy, stages a synthetic v(N+1) plugin ZIP, launches Godot, and prints the single manual action: click Update in the Godot AI dock. After you close Godot normally, the script verifies the fixture version advanced, the update temp dir was consumed, and no new macOS `Godot*.ips` crash report appeared.
 
 ### Self-update compatibility rules
 
-Self-update safety depends on the installed runner. Releases that include the fixed runner write one complete v(N+1) snapshot before Godot scans, so future upgrades from that release avoid mixed old/new script parsing. Users on older releases still take their next update through the old two-phase runner, so release shape still matters during that transition.
+V4 is the runtime boundary. The final signed v3 line consumes only the
+temporary signed migration capsule; the capsule then crosses the boundary with
+the same external actor, retained old-tree backup, startup barrier, and exact
+signed inventory used by v4 updates. It gracefully restarts Godot after the
+swap so v4 never runs against cached v3 script classes. V4 carries no permanent
+v3 runtime path.
 
-- Do not delete a `class_name` declaration that has shipped in any release. If a published class needs to move or retire, leave the original file path and `class_name` in place as a compatibility shim.
-- Before cutting a release that may be installed by an old two-phase runner, avoid adding new files that reference constants, methods, or static/non-static shape changes added to existing load-surface scripts in the same release. This applies to `class_name` scripts and preload-only scripts.
-- Keep historical old-runner upgrade tests manual or explicitly marked. Default CI should gate the forward fixed-runner path, not permanently fail on old shipped runner behavior.
+- `godot-ai-plugin.zip` must remain a temporary bridge built from the exact
+  source commit with the canonical signed triple embedded. Never make it an
+  alias for the canonical archive or a second final plugin tree.
+- File and `class_name` deletions are permitted only when the signed candidate
+  inventory, prepare-before-quiesce path, exact-tree swap, and startup recovery
+  tests all pass; never overlay a candidate onto the live tree.
+- Qualify the exact current-to-candidate pair that will ship. A synthetic or
+  relabeled successor is not evidence for a different release.
 
 ## Dev Server with Auto-Reload
 
 For Python-side changes without restarting Godot:
 
 ```bash
-python -m godot_ai --transport streamable-http --port 8000 --reload
+script/serve-this-worktree
 ```
 
-The Godot AI dock also has a **Start/Stop Dev Server** button when running from a dev checkout.
+This is an externally owned auto-reload server. The Godot AI Dock deliberately
+does not kill or restart it. In a development checkout the Dock can separately
+start/restart/stop only the lifecycle's exact managed child; when an external
+server owns the port it displays **External Server Running** and leaves control
+with the launching terminal.
 
 ## PR Workflow
 

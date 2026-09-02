@@ -47,8 +47,14 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 from PIL import Image
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "script"))
+from _transport_auth import authorization_header  # noqa: E402
 
 # Mirror script/_ci_env.sh: smoke-run editors/servers must not send
 # telemetry from CI (audit backlog). setdefault keeps explicit overrides.
@@ -92,6 +98,7 @@ SESSION_LOSS_GRACE_SEC = 45.0
 
 def _post(session_id: str | None, body: dict, timeout: float = 10.0) -> dict:
     headers = dict(HEADERS)
+    headers["Authorization"] = authorization_header(SERVER_URL)
     if session_id:
         headers["Mcp-Session-Id"] = session_id
     req = urllib.request.Request(

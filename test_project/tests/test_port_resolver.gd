@@ -1,11 +1,7 @@
 @tool
 extends McpTestSuite
 
-## Direct coverage for McpPortResolver. Pure parsers are also exercised
-## indirectly via plugin.gd shims in test_netstat_parser.gd /
-## test_plugin_lifecycle.gd; this suite focuses on (a) live OS smoke
-## that the parsers can't reach and (b) seam smoke proving the new
-## `class_name` is callable from outside plugin.gd.
+## Direct coverage for the static OS/process boundary.
 
 
 func suite_name() -> String:
@@ -21,13 +17,19 @@ func test_parser_seam_callable_directly() -> void:
 	assert_eq(pid, 57865)
 
 
-func test_resolved_ws_port_seam_callable_directly() -> void:
-	## Stale record version drops cached ws_port — pure logic, locked in
-	## end-to-end by test_plugin_lifecycle.gd; here only as a seam check.
-	assert_eq(
-		McpPortResolver.resolved_ws_port_for_existing_server(9500, "2.1.0", "2.2.0", 10500),
-		10500
+func test_lsof_parser_deduplicates_ipv4_and_ipv6_listener_rows() -> void:
+	assert_eq(McpPortResolver.parse_lsof_pids("4242\n4242\n0\nnope\n"), [4242])
+
+
+func test_linux_ss_parser_pins_exact_port_and_deduplicates_pids() -> void:
+	var dump := (
+		"LISTEN 0 2048 127.0.0.1:8000 0.0.0.0:* users:((\"python\",pid=4242,fd=6))\n"
+		+ "LISTEN 0 2048 [::1]:8000 [::]:* users:((\"python\",pid=4242,fd=7))\n"
+		+ "LISTEN 0 2048 127.0.0.1:18000 0.0.0.0:* users:((\"python\",pid=9999,fd=8))\n"
 	)
+	assert_eq(McpPortResolver.parse_linux_ss_pids(dump, 8000), [4242])
+	assert_eq(McpPortResolver.parse_linux_ss_pids(dump, 18000), [9999])
+	assert_eq(McpPortResolver.parse_linux_ss_pids(dump, 0), [])
 
 
 # ----- live OS smoke (genuinely new coverage) -------------------------
@@ -107,6 +109,8 @@ func test_pid_alive_rejects_sentinel_pids() -> void:
 func test_pid_alive_recognises_editor_pid() -> void:
 	## The Godot editor process is a known-live PID on every platform.
 	assert_true(McpPortResolver.pid_alive(OS.get_process_id()))
+	assert_true(McpPortResolver.process_descends_from(OS.get_process_id(), OS.get_process_id()))
+	assert_false(McpPortResolver.process_descends_from(OS.get_process_id(), 1))
 
 
 func test_read_pid_file_round_trips_value() -> void:

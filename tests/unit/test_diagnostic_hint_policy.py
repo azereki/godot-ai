@@ -10,8 +10,13 @@ from godot_ai.sessions.registry import Session, SessionRegistry
 
 
 class _StaticWsServer:
+    def __init__(self, registry: SessionRegistry | None = None) -> None:
+        self.registry = registry if registry is not None else SessionRegistry()
+
     async def send_command(self, **_kwargs) -> CommandResponse:
-        return CommandResponse(request_id="hint-contract", status="ok", data={"ok": True})
+        return CommandResponse(
+            request_id="hint-contract", status="ok", data={"ok": True}, readiness="ready"
+        )
 
 
 def _client_with_pending_diagnostics(*, errors: int = 0, warnings: int = 0) -> GodotClient:
@@ -25,7 +30,7 @@ def _client_with_pending_diagnostics(*, errors: int = 0, warnings: int = 0) -> G
     )
     registry = SessionRegistry()
     registry.register(session)
-    return GodotClient(_StaticWsServer(), registry)  # type: ignore[arg-type]
+    return GodotClient(_StaticWsServer(registry))  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -66,7 +71,7 @@ def test_suppress_diagnostic_hints_env_sets_client_default(
     else:
         monkeypatch.setenv("GODOT_AI_SUPPRESS_DIAGNOSTIC_HINTS", env_value)
 
-    client = GodotClient(None, None)  # type: ignore[arg-type]
+    client = GodotClient(_StaticWsServer())  # type: ignore[arg-type]
 
     assert client.default_hint_policy == expected_policy
 
@@ -75,8 +80,7 @@ def test_constructor_hint_policy_override_beats_environment(monkeypatch) -> None
     monkeypatch.setenv("GODOT_AI_SUPPRESS_DIAGNOSTIC_HINTS", "true")
 
     client = GodotClient(  # type: ignore[arg-type]
-        None,
-        None,
+        _StaticWsServer(),
         default_hint_policy="surface",
     )
 
@@ -86,14 +90,13 @@ def test_constructor_hint_policy_override_beats_environment(monkeypatch) -> None
 def test_constructor_rejects_unknown_hint_policy() -> None:
     with pytest.raises(ValueError, match="Unknown diagnostic hint policy"):
         GodotClient(  # type: ignore[arg-type]
-            None,
-            None,
+            _StaticWsServer(),
             default_hint_policy="banana",  # type: ignore[arg-type]
         )
 
 
 async def test_send_rejects_unknown_hint_policy() -> None:
-    client = GodotClient(None, None)  # type: ignore[arg-type]
+    client = GodotClient(_StaticWsServer())  # type: ignore[arg-type]
 
     with pytest.raises(ValueError, match="Unknown diagnostic hint policy"):
         await client.send("get_editor_state", hint_policy="banana")  # type: ignore[arg-type]

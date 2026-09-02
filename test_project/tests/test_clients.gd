@@ -3,6 +3,7 @@ extends McpTestSuite
 
 const ClientHandler := preload("res://addons/godot_ai/handlers/client_handler.gd")
 const ClientBaseScript := preload("res://addons/godot_ai/clients/_base.gd")
+const ClientMutationLock := preload("res://addons/godot_ai/utils/client_mutation_lock.gd")
 
 ## Tests for the client configuration registry + strategies.
 ##
@@ -30,6 +31,26 @@ var _saved_ws_port: Variant = null
 ## registering at a scope the user never chose.
 var _had_client_scope_setting := false
 var _saved_client_scope: Variant = null
+
+
+class _StatusOwner:
+	var requests: Array[String] = []
+	var accept := true
+
+	func request_mcp_status(request_id: String) -> bool:
+		requests.append(request_id)
+		return accept
+
+
+class _ActionOwner:
+	var requests: Array[Dictionary] = []
+	var accept := true
+
+	func request_mcp_action(request_id: String, client_id: String, action: String) -> Dictionary:
+		requests.append({"request_id": request_id, "client_id": client_id, "action": action})
+		if not accept:
+			return {"ok": false, "error": "action owner is busy"}
+		return {"ok": true, "deferred_timeout_ms": 80000}
 
 
 func suite_name() -> String:
@@ -312,10 +333,6 @@ func test_pi_client_json_descriptor() -> void:
 		"Pi's command_user_fields must preserve `env`"
 	)
 	assert_true(
-		client.command_supports_url_fallback,
-		"Pi's loader accepts URL entries too — manual-instruction fallback must stay"
-	)
-	assert_true(
 		client.command_transport_key.is_empty(),
 		"Pi stdio entries must remain typeless"
 	)
@@ -423,31 +440,45 @@ func test_manual_command_escapes_backslashes_in_paths() -> void:
 	## Build a synthetic flat-bridge client with a path containing every
 	## hazardous char so the inline JSON the manual command emits parses
 	## back without errors.
+	var config_path := _scratch_dir.path_join("manual_escape.json")
+	_remove_if_exists(config_path)
 	var client := McpClient.new()
 	client.id = "manual_escape_test"
 	client.display_name = "Escape Test"
 	client.config_type = "json"
-	client.path_template = {"darwin": "/tmp/m.json", "windows": "/tmp/m.json", "linux": "/tmp/m.json", "unix": "/tmp/m.json"}
+	client.path_template = {"darwin": config_path, "windows": config_path, "linux": config_path, "unix": config_path}
 	client.server_key_path = PackedStringArray(["mcpServers"])
-	client.entry_extra_fields = {
-		"command": "C:\\Users\\foo bar\\uvx.exe",
+	client.command_shape = McpClient.CommandShape.FLAT
+	client.command_initial_fields = {
 		"hint": "say \"hello\"\nworld",
 	}
+	var launch := {
+		"ok": true,
+		"command": "C:\\Users\\foo bar\\uvx.exe",
+		"args": ["godot-ai", "attach"],
+	}
 
-	var manual := McpManualCommand.build(client, "godot-ai", "http://x", "/tmp/m.json")
+	var manual := McpManualCommand.build(
+		client, "godot-ai", "http://x", config_path, launch
+	)
 	# Extract the JSON object body — everything from the first `{` after the
 	# entry key onwards to the matching trailing `}`.
 	var first_brace := manual.find("{")
 	assert_gt(first_brace, 0, "manual command should contain a JSON-ish entry")
+	if first_brace <= 0:
+		return
 	var entry_text := manual.substr(first_brace)
 	var parsed = JSON.parse_string(entry_text)
 	assert_true(
 		parsed is Dictionary,
 		"manual-command entry must be valid JSON; got: %s" % entry_text,
 	)
+	if not parsed is Dictionary:
+		return
 	assert_eq(parsed.get("command"), "C:\\Users\\foo bar\\uvx.exe")
 	assert_eq(parsed.get("hint"), "say \"hello\"\nworld")
-	assert_eq(parsed.get("url"), "http://x")
+	assert_eq(parsed.get("args"), ["godot-ai", "attach"])
+	assert_false(parsed.has("url"), "v4 manual instructions must not expose the backend URL")
 
 
 # ----- server launch mode -----
@@ -1413,6 +1444,55 @@ func test_env_lookup_worker_thread_never_warmed_var_reads_empty() -> void:
 		"un-warmed worker read must degrade to \"\", never touch the live env")
 
 
+func test_startup_actor_discovery_warms_home_for_its_worker() -> void:
+	## GUI-launched editors often have a minimal PATH. The startup worker must
+	## still find uvx in the user's well-known home directory without reading
+	## the process environment off-main.
+	var saved_home := OS.get_environment("HOME")
+	var saved_profile := OS.get_environment("USERPROFILE")
+	var fake_home := _scratch_dir.path_join("startup_actor_home")
+	_remove_dir_recursive(fake_home)
+	var bin_dir := fake_home.path_join(".local/bin")
+	DirAccess.make_dir_recursive_absolute(bin_dir)
+	var exe_name := "uvx.exe" if OS.get_name() == "Windows" else "uvx"
+	var expected := bin_dir.path_join(exe_name)
+	var fixture := FileAccess.open(expected, FileAccess.WRITE)
+	assert_true(fixture != null, "must create the well-known uvx fixture")
+	if fixture == null:
+		_remove_dir_recursive(fake_home)
+		return
+	fixture.store_string("fixture")
+	fixture.close()
+
+	if OS.get_name() == "Windows":
+		OS.unset_environment("HOME")
+		OS.set_environment("USERPROFILE", fake_home)
+	else:
+		OS.set_environment("HOME", fake_home)
+	McpClientConfigurator.invalidate_uvx_cli_cache()
+	McpClientConfigurator.warm_update_actor_discovery_env()
+	var thread := Thread.new()
+	var start_err := thread.start(func() -> String:
+		return McpClientConfigurator.find_uvx()
+	)
+	var found := str(thread.wait_to_finish()) if start_err == OK else ""
+
+	if saved_home.is_empty():
+		OS.unset_environment("HOME")
+	else:
+		OS.set_environment("HOME", saved_home)
+	if saved_profile.is_empty():
+		OS.unset_environment("USERPROFILE")
+	else:
+		OS.set_environment("USERPROFILE", saved_profile)
+	McpClientConfigurator.invalidate_uvx_cli_cache()
+	McpClientConfigurator.warm_update_actor_discovery_env()
+	_remove_dir_recursive(fake_home)
+
+	assert_eq(start_err, OK, "startup actor discovery worker must start")
+	assert_eq(found, expected, "worker must use the main-thread-warmed home snapshot")
+
+
 func test_editor_setting_lookup_worker_thread_serves_snapshot() -> void:
 	## #691: mode_override() runs on the startup walk's discovery worker
 	## (via get_server_command) and EditorSettings is not thread-safe. A
@@ -1462,6 +1542,48 @@ func test_capture_launch_context_worker_thread_serves_snapshot() -> void:
 		expected,
 		"worker launch capture must use the complete main-thread snapshot",
 	)
+
+
+func test_resolved_ws_port_is_one_published_launch_policy() -> void:
+	var configured := 23001
+	var resolved := 23002
+	var policy := McpClientConfigurator.capture_endpoint_policy(configured)
+	policy["http_port"] = 23000
+	policy["ws_port"] = resolved
+	var published := McpClientConfigurator.capture_launch_context(policy)
+	# Mutating the caller's policy after publication must not alias the retained
+	# endpoint used by later main-thread or worker launch derivations.
+	policy["http_port"] = 24000
+	policy["ws_port"] = configured
+	var refreshed := McpClientConfigurator.capture_launch_context()
+	var thread := Thread.new()
+	var start_err := thread.start(func() -> Dictionary:
+		return McpClientConfigurator.capture_launch_context()
+	)
+	assert_eq(start_err, OK)
+	var worker_context: Dictionary = thread.wait_to_finish()
+	var attach := McpClientConfigurator.resolve_attach_launch(refreshed, {
+		"venv_python": "/tmp/godot-ai-test-python",
+		"consoleless_python": "C:/Python313/pythonw.exe",
+	})
+	var server_flags := McpServerLifecycleManager._server_flags({
+		"http_port": refreshed.http_port,
+		"ws_port": refreshed.ws_port,
+		"pid_file": "/tmp/godot-ai-test.pid",
+	})
+	# Restore the standalone-test default after proving the published override.
+	McpClientConfigurator.capture_launch_context(
+		McpClientConfigurator.capture_endpoint_policy()
+	)
+	assert_eq(int(published.ws_port), resolved)
+	assert_eq(int(refreshed.http_port), 23000)
+	assert_eq(int(refreshed.ws_port), resolved)
+	assert_eq(int(worker_context.ws_port), resolved)
+	assert_true(bool(attach.get("ok", false)))
+	assert_eq(str(attach.args[attach.args.find("--ws-port") + 1]), str(resolved))
+	assert_eq(str(server_flags[server_flags.find("--ws-port") + 1]), str(resolved))
+	assert_false(attach.args.has(str(configured)))
+	assert_false(server_flags.has(str(configured)))
 
 
 func test_warm_env_snapshot_covers_descriptor_config_path_envs() -> void:
@@ -1611,19 +1733,38 @@ func test_config_file_env_configure_status_remove_and_manual_use_exact_file() ->
 	var client := _make_test_json_client(default_path)
 	client.display_name = "Exact File Test"
 	client.config_file_env = TEST_CFG_FILE_ENV
+	client.command_shape = McpClient.CommandShape.FLAT
+	var launch := _test_attach_launch()
+	var drift_launch := launch.duplicate(true)
+	var drift_args: Array = (launch.get("args", []) as Array).duplicate()
+	var port_index := drift_args.find("--port")
+	drift_args[port_index + 1] = "9000"
+	drift_launch["args"] = drift_args
 	var prior_env := OS.get_environment(TEST_CFG_FILE_ENV)
 	OS.set_environment(TEST_CFG_FILE_ENV, override_path)
 
 	var resolution := client.resolved_config_path_details()
-	var result := McpJsonStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp")
-	var status := McpJsonStrategy.check_status(client, "godot-ai", "http://127.0.0.1:8000/mcp")
-	var drift := McpJsonStrategy.check_status(client, "godot-ai", "http://127.0.0.1:9000/mcp")
+	var result := McpJsonStrategy.configure(
+		client, "godot-ai", "http://127.0.0.1:8000/mcp", launch
+	)
+	var status := McpJsonStrategy.check_status(
+		client, "godot-ai", "http://127.0.0.1:8000/mcp", launch
+	)
+	var drift := McpJsonStrategy.check_status(
+		client, "godot-ai", "http://127.0.0.1:8000/mcp", drift_launch
+	)
 	var manual := McpManualCommand.build(
-		client, "godot-ai", "http://127.0.0.1:8000/mcp", str(resolution.get("path", ""))
+		client,
+		"godot-ai",
+		"http://127.0.0.1:8000/mcp",
+		str(resolution.get("path", "")),
+		launch,
 	)
 	var installed := client.is_installed()
 	var removed := McpJsonStrategy.remove(client, "godot-ai")
-	var post_remove := McpJsonStrategy.check_status(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	var post_remove := McpJsonStrategy.check_status(
+		client, "godot-ai", "http://127.0.0.1:8000/mcp", launch
+	)
 
 	if prior_env.is_empty():
 		OS.unset_environment(TEST_CFG_FILE_ENV)
@@ -2001,7 +2142,6 @@ func test_claude_code_declares_stdio_attach_registration() -> void:
 	assert_eq(client.command_transport_key, "type")
 	assert_eq(client.command_transport_value, "stdio")
 	assert_true(client.command_legacy_keys.has("url"), "legacy HTTP entry's url must be removed")
-	assert_true(client.command_supports_url_fallback)
 	var register := client.cli_register_template
 	assert_true(register.has("--scope"), "registration must stay explicitly scoped")
 	assert_true(register.has("{scope}"), "scope comes from the setting, not a hardcoded value")
@@ -2208,7 +2348,8 @@ func test_scope_probe_dispatch_uses_its_own_template_and_the_selected_scope() ->
 		return
 	var argv_log := _scratch_dir.path_join("probe_argv.log")
 	_remove_if_exists(argv_log)
-	var cli := _write_fake_probe_cli(_PROBE_USER, argv_log)
+	var matching_user_probe := _PROBE_USER.replace("Args: --flag", "Args:")
+	var cli := _write_fake_probe_cli(matching_user_probe, argv_log)
 	var client := _make_scope_cli_client(_scratch_dir.path_join("probe_route.json"))
 	var launch := {"ok": true, "command": _PROBE_TARGET, "args": []}
 
@@ -2244,7 +2385,8 @@ func test_scope_probe_dispatch_uses_its_own_template_and_the_selected_scope() ->
 
 	## And the green path through the same subprocess: swap the canned output to
 	## a project-scope entry and re-probe at project scope.
-	_write_text(_scratch_dir.path_join("probe_stdout.txt"), _PROBE_PROJECT)
+	var matching_project_probe := _PROBE_PROJECT.replace("Args: --p", "Args:")
+	_write_text(_scratch_dir.path_join("probe_stdout.txt"), matching_project_probe)
 	es.set_setting(McpSettings.SETTING_CLIENT_SCOPE, "project")
 	var matching := McpClientConfigurator._dispatch_check_status_with_cli_path_details(
 		client, "", cli, {}, launch
@@ -2365,6 +2507,38 @@ func test_scope_probe_verdict_absent_entry_and_drift() -> void:
 	)
 
 
+func test_scope_probe_verdict_requires_exact_type_command_and_version_pinned_args() -> void:
+	var old_pin := """godot-ai:
+  Scope: Project config (shared via .mcp.json)
+  Type: stdio
+  Command: /opt/homebrew/bin/uvx
+  Args: --from godot-ai==3.2.4 godot-ai attach --port 8000 --ws-port 9500
+"""
+	var expected_args: Array[String] = [
+		"--from", "godot-ai==4.0.0", "godot-ai", "attach",
+		"--port", "8000", "--ws-port", "9500",
+	]
+	var drifted := McpCliStrategy._scope_probe_verdict(
+		0, old_pin, "project", "/opt/homebrew/bin/uvx", expected_args, "stdio"
+	)
+	assert_eq(drifted.get("status"), McpClient.Status.CONFIGURED_MISMATCH,
+		"the same uvx path with an old godot-ai pin must enter M6 repin")
+	var current := old_pin.replace("godot-ai==3.2.4", "godot-ai==4.0.0")
+	assert_eq(
+		McpCliStrategy._scope_probe_verdict(
+			0, current, "project", "/opt/homebrew/bin/uvx", expected_args, "stdio"
+		).get("status"),
+		McpClient.Status.CONFIGURED,
+	)
+	var wrong_type := current.replace("Type: stdio", "Type: http")
+	assert_eq(
+		McpCliStrategy._scope_probe_verdict(
+			0, wrong_type, "project", "/opt/homebrew/bin/uvx", expected_args, "stdio"
+		).get("status"),
+		McpClient.Status.CONFIGURED_MISMATCH,
+	)
+
+
 func test_json_fallback_configure_notes_the_scope_it_could_not_honour() -> void:
 	## #872 + #463: with no CLI on PATH, Configure falls back to writing the
 	## config file directly — and that file is the USER-scope one whatever the
@@ -2430,8 +2604,8 @@ func test_claude_code_manual_command_shows_json_fallback() -> void:
 	assert_contains(cmd, ".claude.json", "manual command should also show the JSON fallback path")
 	assert_contains(cmd, " -- ", "CLI form must carry the argv separator")
 	assert_contains(cmd, "\"type\": \"stdio\"", "JSON fallback should show the stdio entry shape")
-	assert_contains(cmd, "Advanced fallback", "URL mode stays available as the documented fallback")
-	assert_contains(cmd, "\"type\": \"http\"", "URL fallback entry keeps the type:http shape")
+	assert_false(cmd.contains("Advanced fallback"))
+	assert_false(cmd.contains("\"type\": \"http\""))
 
 
 func test_claude_code_manual_command_renders_pre_cleanup_sweep() -> void:
@@ -3326,6 +3500,48 @@ func test_atomic_write_preserves_existing_file_when_swap_fails() -> void:
 	DirAccess.remove_absolute(backup_path)
 
 
+# ----- cross-owner mutation authority -----
+
+func test_global_mutation_claim_allows_one_cross_owner_worker() -> void:
+	## Cursor and Grok are file-backed clients, but their user-global configs can
+	## be mutated from different projects/installations. Two independent workers
+	## must therefore contend on the same OS-config claim, not merely on one
+	## ClientJobOwner instance. This test never touches either client config.
+	if ClientMutationLock.is_locked():
+		skip("a real client mutation safety claim already exists")
+		return
+	var cursor_worker := Thread.new()
+	var grok_worker := Thread.new()
+	var cursor_start := cursor_worker.start(func() -> Dictionary:
+		return ClientMutationLock.acquire("cursor", "configure")
+	)
+	var grok_start := grok_worker.start(func() -> Dictionary:
+		return ClientMutationLock.acquire("grok", "remove")
+	)
+	var cursor_claim: Dictionary = (
+		cursor_worker.wait_to_finish() if cursor_start == OK else {}
+	)
+	var grok_claim: Dictionary = (
+		grok_worker.wait_to_finish() if grok_start == OK else {}
+	)
+	var claims: Array[Dictionary] = [cursor_claim, grok_claim]
+	var winners: Array[Dictionary] = []
+	for claim in claims:
+		if bool(claim.get("ok", false)):
+			winners.append(claim)
+	var releases := 0
+	## Clean up before assertions so even a broken exclusivity result does not
+	## intentionally leave test-created durable state behind.
+	for claim in winners:
+		if ClientMutationLock.release(claim):
+			releases += 1
+	assert_eq(cursor_start, OK, "Cursor mutation worker must start")
+	assert_eq(grok_start, OK, "Grok mutation worker must start")
+	assert_eq(winners.size(), 1, "exactly one cross-owner mutation claim may win")
+	assert_eq(releases, 1, "the exact winning claim must release cleanly")
+	assert_false(ClientMutationLock.is_locked(), "the test claim must not leak")
+
+
 # ----- atomic write: concurrency + symlink targets (#534) -----
 
 ## List leftover files in _scratch_dir whose name starts with `prefix` — used
@@ -3425,6 +3641,10 @@ func test_atomic_write_preserves_symlinked_target() -> void:
 	assert_true(McpAtomicWrite.write(link, "new via link"))
 
 	assert_true(da.is_link(link), "the symlink must survive the atomic write — issue #534")
+	assert_true(
+		ClientMutationLock._is_link(link),
+		"the mutation lock's fail-closed link check must accept absolute child paths",
+	)
 	var rf := FileAccess.open(target, FileAccess.READ)
 	var got := rf.get_as_text()
 	rf.close()
@@ -3578,10 +3798,26 @@ func test_handler_status_requires_deferred_request_context() -> void:
 	assert_contains(str(result.get("error", {}).get("message", "")), "deferred request context")
 
 
+func test_handler_mutations_require_deferred_request_context() -> void:
+	var configured := _handler.configure_client({"client": "codex"})
+	var removed := _handler.remove_client({"client": "codex"})
+	for result in [configured, removed]:
+		assert_is_error(result)
+		assert_contains(
+			str(result.get("error", {}).get("message", "")),
+			"top-level deferred commands",
+		)
+
+
 func test_status_sweep_returns_array_of_clients() -> void:
-	var result := McpClientConfigurator.run_client_status_sweep(
-		McpClientConfigurator.capture_launch_context()
-	)
+	var statuses := {}
+	for client_id in McpClientConfigurator.client_ids():
+		statuses[client_id] = {
+			"status": McpClient.Status.CONFIGURED,
+			"installed": true,
+			"error_msg": "",
+		}
+	var result := McpClientConfigurator.client_status_response(statuses)
 	assert_has_key(result, "data")
 	assert_has_key(result.data, "clients")
 	var clients = result.data.clients
@@ -3614,23 +3850,35 @@ func test_status_sweep_entry_surfaces_actionable_error_only_when_present() -> vo
 	assert_false(without_error.has("error"), "healthy rows must not gain an empty error field")
 
 
-func test_handler_teardown_defers_status_worker_join() -> void:
-	var handler := ClientHandler.new()
-	var worker := Thread.new()
-	var start_error := worker.start(func() -> Dictionary:
-		OS.delay_msec(100)
-		return {"data": {}}
+func test_handler_delegates_status_to_the_client_job_owner() -> void:
+	var owner := _StatusOwner.new()
+	var handler := ClientHandler.new(owner)
+	var result := handler.check_client_status({"_request_id": "status-1"})
+	assert_eq(result, McpDispatcher.DEFERRED_RESPONSE)
+	assert_eq(owner.requests, ["status-1"])
+	owner.accept = false
+	assert_is_error(handler.check_client_status({"_request_id": "status-2"}))
+
+
+func test_handler_delegates_mutations_to_the_client_job_owner() -> void:
+	var owner := _ActionOwner.new()
+	var handler := ClientHandler.new(owner)
+	var configured := handler.configure_client({"client": "codex", "_request_id": "action-1"})
+	assert_true(bool(configured.get("_deferred", false)))
+	assert_eq(int(configured.get("_deferred_timeout_ms", 0)), 80000)
+	assert_eq(
+		owner.requests[0],
+		{"request_id": "action-1", "client_id": "codex", "action": "configure"},
 	)
-	assert_eq(start_error, OK)
-	handler._status_workers.append(worker)
-	handler.prepare_for_teardown()
-	assert_true(worker.is_alive(), "teardown must not block the main thread waiting for a live worker")
-	assert_eq(handler._status_workers, [worker], "the polling coroutine must retain worker ownership")
-	assert_true(handler._status_tearing_down, "teardown must reject new status sweeps")
-	# This synthetic worker has no finisher coroutine, so realize it explicitly
-	# after the non-blocking contract above has been asserted.
-	worker.wait_to_finish()
-	handler._status_workers.erase(worker)
+	var removed := handler.remove_client({"client": "codex", "_request_id": "action-2"})
+	assert_true(bool(removed.get("_deferred", false)))
+	assert_eq(owner.requests[1].get("action"), "remove")
+	owner.accept = false
+	assert_is_error(
+		handler.configure_client({"client": "codex", "_request_id": "action-3"}),
+		"INTERNAL_ERROR",
+		"busy/unavailable mutation owners must fail closed",
+	)
 
 
 # ----- entry-builder shape sanity for shipped clients -----
@@ -3726,7 +3974,6 @@ func test_windsurf_and_trae_and_kiro_attach_declarations() -> void:
 		assert_eq(c.command_shape, McpClient.CommandShape.FLAT, "%s must be FLAT" % probe[0])
 		assert_true(c.command_legacy_keys.has(String(probe[1])), "%s must scrub %s" % [probe[0], probe[1]])
 		assert_true(c.command_transport_key.is_empty(), "%s documents no type field" % probe[0])
-		assert_true(c.command_supports_url_fallback, "%s keeps a documented URL mode" % probe[0])
 
 
 func test_claude_desktop_declares_flat_attach_shape() -> void:
@@ -3745,10 +3992,6 @@ func test_claude_desktop_declares_flat_attach_shape() -> void:
 		"the Store publisher hash must not be hardcoded",
 	)
 	assert_true(client.detect_paths.has("$LOCALAPPDATA/Packages/Claude_*"))
-	assert_false(
-		client.command_supports_url_fallback,
-		"claude_desktop_config.json local entries do not support URL transport",
-	)
 	assert_true(client.command_legacy_keys.has("url"), "URL migration must remove the legacy key")
 	assert_true(client.command_env_legacy_keys.has("UV_LINK_MODE"), "legacy bridge env pin must be removed")
 	assert_true(client.command_user_fields.has("env"))
@@ -3891,16 +4134,6 @@ func test_claude_desktop_manual_command_shows_attach_without_url_fallback() -> v
 	assert_false(unavailable.contains('"url": "http://x"'))
 
 
-func test_json_manual_url_fallback_requires_descriptor_capability() -> void:
-	var client := _make_claude_flat_client("/tmp/flat.json")
-	client.command_supports_url_fallback = true
-	var manual := McpManualCommand.build(
-		client, "godot-ai", "http://x", "/tmp/flat.json", _test_attach_launch()
-	)
-	assert_contains(manual, "Advanced fallback")
-	assert_contains(manual, '"url": "http://x"')
-
-
 func test_json_manual_command_rejects_unsupported_command_shape() -> void:
 	var client := McpClient.new()
 	client.display_name = "Future JSON Client"
@@ -3926,6 +4159,7 @@ func test_yaml_build_entry_rejects_unsupported_command_shape() -> void:
 func test_zed_attach_entry_scrubs_every_http_only_key() -> void:
 	var c := McpClientRegistry.get_by_id("zed")
 	assert_eq(c.command_shape, McpClient.CommandShape.FLAT)
+	assert_false(c.automatic_config_edits, "Zed JSONC settings must remain manual-edit-only")
 	var launch := _test_attach_launch()
 	## Zed's context_servers entry is an UNTAGGED serde enum — an entry
 	## carrying `command` plus any HTTP-only key (url/headers/oauth) matches
@@ -3944,6 +4178,35 @@ func test_zed_attach_entry_scrubs_every_http_only_key() -> void:
 	assert_true(McpJsonStrategy.verify_entry(c, entry, "http://unused", launch))
 	var fallback := McpJsonStrategy.build_url_entry(c, "http://x")
 	assert_eq(fallback.get("url", ""), "http://x")
+
+
+func test_zed_configure_and_remove_never_mutate_jsonc() -> void:
+	var client := McpClientRegistry.get_by_id("zed")
+	var saved_paths: Dictionary = client.path_template.duplicate(true)
+	var path := _scratch_dir.path_join("zed-manual-only.json")
+	var body := "// Zed settings\n{\n\t\"context_servers\": {}\n}\n"
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	file.store_string(body)
+	file.close()
+	client.path_template = {
+		"darwin": path,
+		"linux": path,
+		"windows": path,
+		"unix": path,
+	}
+
+	var configured := McpClientConfigurator.configure("zed", "http://127.0.0.1:8000/mcp")
+	var removed := McpClientConfigurator.remove("zed", "http://127.0.0.1:8000/mcp")
+	var check := FileAccess.open(path, FileAccess.READ)
+	var after := check.get_as_text()
+	check.close()
+	client.path_template = saved_paths
+
+	assert_eq(configured.get("status"), "error")
+	assert_contains(str(configured.get("message", "")), "manual edit")
+	assert_eq(removed.get("status"), "error")
+	assert_contains(str(removed.get("message", "")), "manual edit")
+	assert_eq(after, body, "manual-only operations must preserve Zed settings byte-for-byte")
 
 
 func test_vscode_attach_entry_flips_type_pin_to_stdio() -> void:
@@ -4167,8 +4430,8 @@ func test_hermes_attach_entry_is_flat_and_typeless() -> void:
 	assert_contains(manual, "command: C:/Python313/pythonw.exe")
 	assert_contains(manual, "args: [")
 	assert_contains(manual, "\"attach\"")
-	assert_contains(manual, "Advanced fallback")
-	assert_contains(manual, "url: http://x")
+	assert_false(manual.contains("Advanced fallback"))
+	assert_false(manual.contains("url: http://x"))
 	assert_false(manual.contains("type:"), "manual hint must not mention a type field")
 
 
@@ -4439,7 +4702,6 @@ func test_deepseek_harness_client_descriptor() -> void:
 	assert_eq(client.command_shape, McpClient.CommandShape.FLAT)
 	assert_eq(String(client.command_transport_key), "transport")
 	assert_eq(String(client.command_transport_value), "stdio")
-	assert_true(client.command_supports_url_fallback, "DSH accepts a streamable-http URL entry")
 	assert_true(
 		McpDshStrategy.entry_id("godot-ai") == "mcp-godot-ai",
 		"the loader entry id must be the mcp- prefixed server name"
@@ -4823,9 +5085,8 @@ func test_dsh_strategy_replacement_matches_existing_indent() -> void:
 	DirAccess.remove_absolute(path)
 
 
-func test_dsh_manual_command_shows_insert_row() -> void:
-	## The manual-instruction text must render the exact insert row Configure
-	## would write, plus the URL-mode fallback.
+func test_dsh_manual_command_shows_authenticated_insert_row() -> void:
+	## The manual-instruction text must render the exact insert row Configure writes.
 	var path := _tmp_scratch_path("godot_ai_dsh_manual.yaml")
 	var c := _make_test_dsh_client(path)
 	var manual := McpManualCommand.build(
@@ -4836,21 +5097,14 @@ func test_dsh_manual_command_shows_insert_row() -> void:
 	assert_contains(manual, "name: '@deepseek-ai/dsh-mcp-client'")
 	assert_contains(manual, "serverName: godot-ai")
 	assert_contains(manual, "transport: stdio")
-	assert_contains(manual, "Advanced fallback", "URL fallback text must be present")
-	assert_contains(manual, "replace the command/args block above", "with a launcher, the fallback refers to the rendered block")
-	assert_contains(manual, "streamable-http")
+	assert_false(manual.contains("Advanced fallback"))
+	assert_false(manual.contains("streamable-http"))
 
-	## On the launch-error path no command/args block is rendered, so the
-	## fallback text must not tell the user to replace one.
 	var manual_no_launch := McpManualCommand.build(
 		c, "godot-ai", "http://127.0.0.1:8000/mcp", path, {"ok": false, "error": "no launcher"}
 	)
 	assert_contains(manual_no_launch, "Attach launch command unavailable: no launcher")
-	assert_contains(manual_no_launch, "use this URL-mode entry instead")
-	assert_false(
-		manual_no_launch.contains("replace the command/args block above"),
-		"no command block was rendered, so nothing exists to replace"
-	)
+	assert_false(manual_no_launch.contains("URL-mode"))
 
 
 func _make_test_dsh_client(path: String) -> McpClient:
@@ -4864,7 +5118,6 @@ func _make_test_dsh_client(path: String) -> McpClient:
 	c.command_transport_value = "stdio"
 	c.command_legacy_keys = PackedStringArray(["url"])
 	c.command_user_fields = PackedStringArray(["env", "toolCallTimeoutMs", "reconnect"])
-	c.command_supports_url_fallback = true
 	return c
 
 

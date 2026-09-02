@@ -17,7 +17,7 @@ from godot_ai.godot_client.session_diagnostics import (
 )
 from godot_ai.protocol.envelope import find_non_finite_float
 from godot_ai.protocol.errors import ErrorCode
-from godot_ai.sessions.registry import SessionRegistry
+from godot_ai.sessions.registry import PendingCommandLimitError
 from godot_ai.transport.websocket import GodotWebSocketServer
 
 logger = logging.getLogger(__name__)
@@ -69,12 +69,11 @@ class GodotClient:
     def __init__(
         self,
         ws_server: GodotWebSocketServer,
-        registry: SessionRegistry,
         circuit_breaker: EditorBridgeCircuitBreaker | None = None,
         default_hint_policy: HintPolicy | None = None,
     ):
         self.ws_server = ws_server
-        self.registry = registry
+        self._table = ws_server.registry
         self.default_hint_policy = (
             _default_hint_policy_from_env()
             if default_hint_policy is None
@@ -191,7 +190,7 @@ class GodotClient:
         ## otherwise a once-tripped no-session circuit would falsely
         ## block calls against an editor that has since come back up.
         if session_id is None:
-            session = self.registry.get_active()
+            session = self._table.get_active()
             if session is None:
                 self._raise_if_circuit_open(None)
                 self._record_failure(None, kind="no_active_session")
@@ -201,17 +200,17 @@ class GodotClient:
                     data=no_active_session_data(circuit_open=False),
                 )
             session_id = session.session_id
-            if len(self.registry) > 1:
+            if len(self._table) > 1:
                 logger.debug(
                     "Routing %s to active session %s (%d sessions connected)",
                     command,
                     session_id[:8],
-                    len(self.registry),
+                    len(self._table),
                 )
 
         self._raise_if_circuit_open(session_id)
 
-        if self.registry.get(session_id) is None:
+        if self._table.get(session_id) is None:
             self._record_failure(session_id, kind="session_not_found")
             raise GodotCommandError(
                 code=ErrorCode.PLUGIN_DISCONNECTED,
@@ -229,6 +228,20 @@ class GodotClient:
         except (ConnectionError, TimeoutError) as exc:
             self._record_failure(session_id, kind=type(exc).__name__)
             raise
+        except PendingCommandLimitError as exc:
+            raise GodotCommandError(
+                code=ErrorCode.TRANSPORT_OVERLOADED,
+                message=str(exc),
+                data={
+                    "retryable": True,
+                    "reason": "pending_command_limit",
+                    "scope": exc.scope,
+                    "pending_count": exc.count,
+                    "pending_limit": exc.limit,
+                    "session_id": exc.session_id,
+                    "hint": "Wait for an in-flight editor command to finish before retrying.",
+                },
+            ) from None
 
         ## A bridge round-trip completed (even if the plugin returned an
         ## error response — that's the plugin saying "no" to a valid
@@ -243,31 +256,25 @@ class GodotClient:
                 data=error.data if error else {},
             )
 
-        live_session = self.registry.get(session_id)
-        pending_new_errors = live_session.pending_new_errors if live_session else 0
-        pending_new_warnings = live_session.pending_new_warnings if live_session else 0
-
         if effective_hint_policy == "discard":
-            if live_session:
-                live_session.pending_new_errors = 0
-                live_session.pending_new_warnings = 0
+            self._table.consume_diagnostic_counts(session_id)
             return response.data
 
         if effective_hint_policy == "retain":
             return response.data
 
+        pending_new_errors, pending_new_warnings = self._table.consume_diagnostic_counts(
+            session_id
+        )
+
         if pending_new_errors > 0 or pending_new_warnings > 0:
             data = dict(response.data)
             if pending_new_errors > 0:
                 count = pending_new_errors
-                if live_session:
-                    live_session.pending_new_errors = 0
                 data["new_errors_since_last_call"] = count
                 data["new_errors_hint"] = _diagnostic_hint("error", count)
             if pending_new_warnings > 0:
                 wcount = pending_new_warnings
-                if live_session:
-                    live_session.pending_new_warnings = 0
                 data["new_warnings_since_last_call"] = wcount
                 data["new_warnings_hint"] = _diagnostic_hint("warning", wcount)
             return data
