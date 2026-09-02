@@ -1140,23 +1140,32 @@ func _on_telemetry_toggled(pressed: bool) -> void:
 
 
 ## Report the running server's telemetry state, not just this editor's
-## checkbox. Apply & Restart injects opt-out into a server this plugin
-## spawns; it cannot change an adopted process's environment. Ported from
-## upstream PR #931 / issue #913.
+## checkbox, so the two can never silently disagree (#913). Applying an
+## opt-out reaches the live server over the authenticated WebSocket and
+## latches there, so both directions of a disagreement are real states worth
+## explaining — not just the unreachable one.
 func _live_telemetry_tooltip(local_enabled: bool) -> String:
 	_live_server_probe_result = {}
 	live_server_probe_requested.emit(ClientConfigurator.http_port())
 	var live := _live_server_probe_result
 	if not (live.get("telemetry_enabled") is bool):
+		## Absent means "too old to publish it", not false. Say nothing.
 		return ""
 	var server_enabled: bool = live.get("telemetry_enabled")
 	if server_enabled == local_enabled:
 		return "Running server telemetry is %s." % ("on" if server_enabled else "off")
+	if local_enabled:
+		return (
+			"The running server has telemetry off and will stay off until it is "
+			+ "replaced. An opt-out — this editor's earlier one, another editor "
+			+ "sharing this server, or GODOT_AI_DISABLE_TELEMETRY in its "
+			+ "environment — latched it. Restart the server to apply this."
+		)
 	return (
-		"This editor wants telemetry %s, but the running server still has it %s. "
-		+ "Opt-out only reaches a server this plugin spawned. Stop that process "
-		+ "or set GODOT_AI_DISABLE_TELEMETRY in its environment."
-	) % ["on" if local_enabled else "off", "on" if server_enabled else "off"]
+		"The running server still has telemetry on. Applying sends it an "
+		+ "opt-out over the authenticated connection, which it honors for the "
+		+ "rest of its life."
+	)
 
 
 # --- Dev mode persistence ---

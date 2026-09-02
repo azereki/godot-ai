@@ -66,6 +66,8 @@ __all__ = [
     "TelemetryRecord",
     "get_telemetry",
     "hash_session_id",
+    "latch_runtime_opt_out",
+    "live_telemetry_enabled",
     "record_failure",
     "record_latency",
     "record_milestone",
@@ -73,6 +75,7 @@ __all__ = [
     "record_telemetry",
     "record_tool_usage",
     "reset_telemetry",
+    "runtime_opt_out_latched",
     "shutdown_if_initialized",
     "telemetry_resource",
     "telemetry_tool",
@@ -149,6 +152,41 @@ def hash_session_id(session_id: str | None, *, salt: str = "") -> str:
     return _digest(session_id)
 
 
+# --- runtime opt-out latch ----------------------------------------------
+
+## #913: an editor cannot write the environment of a server it adopted
+## rather than spawned, so it latches the opt-out here instead — over the
+## authenticated WebSocket, never the read-only status/lease surface.
+## One-way and unpersisted: the wire has no "enable" message, so on a
+## shared backend the most restrictive editor wins, and a replacement
+## server reads the env/EditorSetting preference at spawn as usual. An
+## ``Event`` because ``record()`` and ``_send()`` read it off-thread.
+_runtime_opt_out = threading.Event()
+
+
+def latch_runtime_opt_out() -> bool:
+    """Disable telemetry for the rest of this process's life.
+
+    Returns whether this call flipped the latch, so a caller re-asserting
+    on every reconnect can log the transition once.
+    """
+    already_latched = _runtime_opt_out.is_set()
+    _runtime_opt_out.set()
+    return not already_latched
+
+
+def runtime_opt_out_latched() -> bool:
+    """Whether an editor has latched telemetry off for this process."""
+    return _runtime_opt_out.is_set()
+
+
+def live_telemetry_enabled() -> bool:
+    """Whether this process will send telemetry right now: env vars plus
+    the runtime latch, re-read on every call. Published by
+    ``/godot-ai/status`` as ``telemetry_enabled`` (#913)."""
+    return not (TelemetryConfig._is_disabled_via_env() or _runtime_opt_out.is_set())
+
+
 class TelemetryConfig:
     """Telemetry configuration resolved from env vars at construction time.
 
@@ -202,21 +240,14 @@ class TelemetryConfig:
             self._cleanup_local_files()
 
     def live_enabled(self) -> bool:
-        """Re-read opt-out env vars on every call.
+        """Re-read the opt-out env vars and the runtime latch on every call.
 
-        ``enabled`` is the construction-time snapshot used to decide whether to create
-        on-disk artifacts and start the worker. Record/send paths consult this method
-        so a later in-process opt-out takes effect without reconstructing the
-        collector (upstream PR #931 at
-        418fb5e2eec516f2b34251f0034dc37fe26e680c / issue #913).
-
-        This does not receive the dock checkbox: the Godot editor cannot mutate
-        another process's environment. An adopted server keeps sending until that
-        process sees an opt-out env var. Status ``telemetry_enabled`` reports this
-        live read so the dock can show the disagreement instead of claiming the
-        checkbox applied.
+        ``enabled`` is the construction-time snapshot deciding whether on-disk
+        artifacts and the worker exist. Record/send paths consult this instead, so
+        a later opt-out — an in-process env change, or an editor latching one over
+        the WebSocket — applies without reconstructing the collector (#913).
         """
-        return not self._is_disabled_via_env()
+        return live_telemetry_enabled()
 
     # --- env helpers -----------------------------------------------------
 
@@ -583,6 +614,11 @@ def reset_telemetry() -> None:
         if _collector is not None:
             _collector.shutdown()
             _collector = None
+    ## One-way per *server* process, but a test process runs many notional
+    ## servers: without this, the first test to latch disables telemetry for
+    ## every test after it. The lifespan path is ``shutdown_if_initialized``,
+    ## which leaves the latch set.
+    _runtime_opt_out.clear()
 
 
 def shutdown_if_initialized() -> None:

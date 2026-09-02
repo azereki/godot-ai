@@ -151,6 +151,14 @@ class PluginTelemetryEvent(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
+## Runtime telemetry opt-out (#913). Field-free on purpose: the wire carries
+## no way to turn telemetry back *on*, so one editor's opt-out survives
+## another's preference on a shared backend. Validated anyway to reject a
+## non-dict ``data`` like the other events here.
+class TelemetryOptOutEvent(BaseModel):
+    pass
+
+
 class CustomToolsChangedEvent(BaseModel):
     ## Required (no default): a snapshot event without a tools list is
     ## malformed, not "empty". Bounded per the server-side catalog budgets

@@ -124,9 +124,9 @@ class TestTelemetryConfig:
     def test_live_enabled_rereads_env_after_construction(
         self, monkeypatch, clean_env, isolated_data_dir
     ) -> None:
-        ## Upstream PR #931 / issue #913: in-process env changes are re-read;
-        ## this is not a dock-to-adopted-server channel (the editor cannot
-        ## mutate another process's environment).
+        ## #913: the construction-time ``enabled`` snapshot decides whether
+        ## on-disk artifacts exist; ``live_enabled`` is the send-time answer
+        ## and re-reads the env on every call.
         monkeypatch.delenv("GODOT_AI_DISABLE_TELEMETRY", raising=False)
         monkeypatch.delenv("DISABLE_TELEMETRY", raising=False)
         config = tel.TelemetryConfig()
@@ -510,3 +510,78 @@ class TestCustomerUuidValidation:
             assert uuid_file.read_text(encoding="utf-8").strip() == fixed
         finally:
             collector.shutdown()
+
+
+class TestRuntimeOptOutLatch:
+    """#913: the opt-out that reaches a server the plugin adopted rather than
+    spawned. These own the latch's semantics; ``test_telemetry_integration.py``
+    owns the wire event that sets it."""
+
+    def test_latch_disables_live_reads_without_touching_the_snapshot(
+        self, clean_env, isolated_data_dir
+    ) -> None:
+        config = tel.TelemetryConfig()
+        assert config.enabled is True
+        assert config.live_enabled() is True
+        assert tel.live_telemetry_enabled() is True
+
+        tel.latch_runtime_opt_out()
+
+        assert tel.runtime_opt_out_latched() is True
+        assert tel.live_telemetry_enabled() is False
+        assert config.live_enabled() is False
+        ## The snapshot stays put — it records what this process decided about
+        ## data dirs and the worker at startup, not the live answer.
+        assert config.enabled is True
+
+    def test_latch_reports_only_the_first_transition(
+        self, clean_env, isolated_data_dir
+    ) -> None:
+        ## Every reconnect re-asserts, so without this the "opted out" log
+        ## line would fire on every handshake for the rest of the process.
+        assert tel.latch_runtime_opt_out() is True
+        assert tel.latch_runtime_opt_out() is False
+        assert tel.latch_runtime_opt_out() is False
+
+    def test_latch_is_one_way_and_a_clean_env_cannot_lift_it(
+        self, monkeypatch, clean_env, isolated_data_dir
+    ) -> None:
+        ## What makes this safe on a shared backend: nothing re-enables for
+        ## the life of the process — no un-latch, and clearing the env vars
+        ## (the other opt-out source) must not resurrect sends either.
+        tel.latch_runtime_opt_out()
+        monkeypatch.delenv("GODOT_AI_DISABLE_TELEMETRY", raising=False)
+        monkeypatch.delenv("DISABLE_TELEMETRY", raising=False)
+        assert tel.live_telemetry_enabled() is False
+        assert not hasattr(tel, "unlatch_runtime_opt_out")
+
+    def test_latched_collector_drops_records_and_milestones(
+        self, clean_env, isolated_data_dir
+    ) -> None:
+        collector = tel.TelemetryCollector()
+        sent: list[tel.TelemetryRecord] = []
+        _drain_to(collector, sent)
+        collector.record(tel.RecordType.USAGE, {"x": 1})
+        for _ in range(40):  # up to ~2s
+            if sent:
+                break
+            time.sleep(0.05)
+        assert len(sent) == 1
+
+        tel.latch_runtime_opt_out()
+
+        collector.record(tel.RecordType.USAGE, {"x": 2})
+        assert collector.record_milestone(tel.MilestoneType.FIRST_TOOL_USAGE) is False
+        time.sleep(0.1)
+        assert len(sent) == 1
+        collector.shutdown()
+
+    def test_reset_telemetry_clears_the_latch_for_the_next_test(
+        self, clean_env, isolated_data_dir
+    ) -> None:
+        ## One-way per server process, but a test process runs many of them:
+        ## an uncleared latch would disable telemetry for every later test.
+        tel.latch_runtime_opt_out()
+        tel.reset_telemetry()
+        assert tel.runtime_opt_out_latched() is False
+        assert tel.live_telemetry_enabled() is True
