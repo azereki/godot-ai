@@ -54,7 +54,7 @@ decisions were incorporated into the approved plan and executable gates, the
 scaffold was removed rather than maintained as a second source of truth.
 Release-candidate inputs and outputs are still frozen in the pre-publication
 qualification bundle. The immutable pre-v4 investigation is distilled into
-[pre-v4-updater-one-time-evidence.md](../verification/pre-v4-updater-one-time-evidence.md).
+[pre-v4-updater-one-time-evidence.md](verification/pre-v4-updater-one-time-evidence.md).
 
 ## 3. Mandatory platform matrix
 
@@ -86,7 +86,7 @@ at both the floor and ceiling.
 ## 4. Completed historical updater boundary proof
 
 The retained
-[one-time evidence](../verification/pre-v4-updater-one-time-evidence.md)
+[one-time evidence](verification/pre-v4-updater-one-time-evidence.md)
 classified the historical tags and established how they select the legacy
 asset. That evidence remains historical; the new signed final-v3 bridge is a
 separate recurring candidate gate rather than a claim that every old updater is

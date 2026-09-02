@@ -166,7 +166,7 @@ proves each explicit route against its separate project root.
 its embedded SHA-256.
 
 Locked profiles reject `--thresholds` and `SS_THRESHOLDS`; their effective
-thresholds come only from `verification/storm-profiles-v1.json` and are hashed
+thresholds come only from `docs/verification/storm-profiles-v1.json` and are hashed
 into the report. Exploratory non-locked runs may use a threshold file. Changing
 a locked threshold requires a reviewed change to the checked-in manifest, not
 a per-run override. A locked run also refuses before contacting an editor while

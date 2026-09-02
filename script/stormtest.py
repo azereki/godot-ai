@@ -38,7 +38,7 @@ Knobs (all env-overridable):
 
 Locked runs use --profile, --seed, --target, --qualification-project, and
 optionally --trace-out or --replay-trace. See
-verification/storm-profiles-v1.json.
+docs/verification/storm-profiles-v1.json.
 
     Default ≈ 1000 calls.  Brutal: SS_WORKERS=12 SS_WAVES=30 (≈ 9000 calls).
     Reads-only smoke: SS_RELOAD=0.
@@ -112,7 +112,7 @@ from stormtest_support import (  # noqa: E402
     worker_rng,
 )
 
-DEFAULT_PROFILE_CONFIG = PROJECT_ROOT / "verification" / "storm-profiles-v1.json"
+DEFAULT_PROFILE_CONFIG = PROJECT_ROOT / "docs" / "verification" / "storm-profiles-v1.json"
 
 
 def _mcp_client(url: str) -> Client:
@@ -183,7 +183,9 @@ try:
         )
     if (requested_profile or replay_profile) in LOCKED_PROFILES:
         if ARGS.config.resolve() != DEFAULT_PROFILE_CONFIG.resolve():
-            raise StormConfigError("locked profiles require verification/storm-profiles-v1.json")
+            raise StormConfigError(
+                "locked profiles require docs/verification/storm-profiles-v1.json"
+            )
         PROFILE_CONFIG = load_profile_config(ARGS.config)
         validate_locked_qualification_thresholds(
             PROFILE_CONFIG, requested_profile or replay_profile

@@ -157,7 +157,7 @@ The CI stack should exercise at least four tiers:
   the add-on tree and `project.godot` without creating capability state.
 - release-surface smoke, especially install and packaging paths once distribution work is active (3 OS)
 - the retained
-  [one-time pre-v4 updater evidence](../verification/pre-v4-updater-one-time-evidence.md).
+  [one-time pre-v4 updater evidence](verification/pre-v4-updater-one-time-evidence.md).
   It source-classified all 104 tags into 24 behavior classes and ran 29 selected
   runtime rows on macOS/Godot 4.7. Historical releases remain immutable and
   unsupported after the v4 boundary. Recurring CI tests one canonical v4 tree,

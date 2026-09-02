@@ -341,5 +341,5 @@ recoverable backup. This interactive check is release-blocking and supplements,
 rather than replaces, the automated failpoint, rollback, multi-editor, exact
 release-shape, bridge-migration, and clean-install suites. Historical pre-v4
 behavior remains recorded in
-[pre-v4-updater-one-time-evidence.md](../verification/pre-v4-updater-one-time-evidence.md),
+[pre-v4-updater-one-time-evidence.md](verification/pre-v4-updater-one-time-evidence.md),
 but the signed final-v3→v4 bridge path is a recurring release-blocking smoke.

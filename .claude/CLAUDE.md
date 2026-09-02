@@ -1,7 +1,7 @@
 # CLAUDE.md - Godot AI
 
 Claude Code loads this file automatically. The shared assistant instructions for
-this repository live in [AGENTS.md](AGENTS.md). Read and follow `AGENTS.md` as
+this repository live in [AGENTS.md](../AGENTS.md). Read and follow `AGENTS.md` as
 the source of truth for project structure, development workflow, tool changes,
 testing expectations, worktree safety, and release compatibility.
 
@@ -10,13 +10,13 @@ from the relevant `AGENTS.md` section — load it when the task calls for it:
 
 | Task | Read |
 |---|---|
-| Adding or changing an MCP tool | [docs/tool-surface.md](docs/tool-surface.md) |
-| Verifying a change before commit | [docs/verification.md](docs/verification.md) |
-| Server start/adopt/teardown, reload | [docs/server-lifecycle.md](docs/server-lifecycle.md) |
-| Release or self-update paths | [docs/releasing.md](docs/releasing.md) |
-| Undo patterns, readiness, WS security | [docs/plugin-architecture.md](docs/plugin-architecture.md) |
-| Repairing or sharing a worktree | [docs/worktrees.md](docs/worktrees.md) |
-| Adding an MCP client descriptor | [docs/client-configuration.md](docs/client-configuration.md) |
+| Adding or changing an MCP tool | [docs/tool-surface.md](../docs/tool-surface.md) |
+| Verifying a change before commit | [docs/verification.md](../docs/verification.md) |
+| Server start/adopt/teardown, reload | [docs/server-lifecycle.md](../docs/server-lifecycle.md) |
+| Release or self-update paths | [docs/releasing.md](../docs/releasing.md) |
+| Undo patterns, readiness, WS security | [docs/plugin-architecture.md](../docs/plugin-architecture.md) |
+| Repairing or sharing a worktree | [docs/worktrees.md](../docs/worktrees.md) |
+| Adding an MCP client descriptor | [docs/client-configuration.md](../docs/client-configuration.md) |
 
 ## Claude-specific notes
 

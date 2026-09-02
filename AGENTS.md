@@ -1,6 +1,6 @@
 # AGENTS.md - Godot AI
 
-This guide is for any AI assistant working in this repository. Keep Claude-specific files such as `CLAUDE.md` and `.claude/skills/*` as thin pointers to this shared guidance.
+This guide is for any AI assistant working in this repository. Keep Claude-specific files such as `.claude/CLAUDE.md` and `.claude/skills/*` as thin pointers to this shared guidance.
 
 ## What this project is
 

@@ -8,7 +8,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "script" / "architecture_simplification_gates.py"
-BASELINE = ROOT / "verification" / "architecture-simplification-gates-a468a7e.json"
+BASELINE = ROOT / "docs" / "verification" / "architecture-simplification-gates-a468a7e.json"
 LANDING_COMMIT = "a468a7eedd7dcbbeb0221a297f7e7c50f5ab2b4e"
 LANDING_TREE = "508149f3ca1f79fa1b60c23cc922e7ff7caa0c9b"
 

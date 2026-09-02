@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-CONFIG = ROOT / "verification" / "storm-profiles-v1.json"
+CONFIG = ROOT / "docs" / "verification" / "storm-profiles-v1.json"
 SPEC = importlib.util.spec_from_file_location(
     "stormtest_support", ROOT / "script" / "stormtest_support.py"
 )
