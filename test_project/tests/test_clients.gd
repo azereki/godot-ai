@@ -4308,6 +4308,185 @@ func test_zed_configure_and_remove_never_mutate_jsonc() -> void:
 	assert_eq(after, body, "manual-only operations must preserve Zed settings byte-for-byte")
 
 
+# ----- #914: comment-tolerant READ for JSONC clients -----
+#
+# Zed ships settings.json with a `//` header, which Godot's JSON.parse rejects,
+# so a stock install reported a permanent parse error. Comments are stripped
+# from a throwaway parse copy and only for clients nothing rewrites.
+
+
+func test_zed_descriptor_opts_into_read_only_jsonc() -> void:
+	var c := McpClientRegistry.get_by_id("zed")
+	assert_true(c.config_allows_comments, "Zed settings.json is JSONC — its reads must tolerate comments")
+	assert_false(
+		c.automatic_config_edits,
+		"comment tolerance is only safe while nothing re-serializes the file",
+	)
+
+
+func test_zed_status_reads_stock_jsonc_settings() -> void:
+	## A default install carries a comment header and must show a real status.
+	var client := McpClientRegistry.get_by_id("zed")
+	var saved_paths: Dictionary = client.path_template.duplicate(true)
+	var path := _scratch_dir.path_join("zed-stock-jsonc.json")
+	var launch := _test_attach_launch()
+	client.path_template = {"darwin": path, "linux": path, "windows": path, "unix": path}
+
+	_write_text(path, "// Zed settings\n/* multi\n   line */\n{\n\t\"theme\": \"One Dark\"\n}\n")
+	var absent := McpJsonStrategy.check_status_details(client, "godot-ai", "http://unused", launch)
+
+	var entry := McpJsonStrategy.build_entry(client, "http://unused", null, launch)
+	_write_text(
+		path,
+		"// Zed settings\n{\n\t\"context_servers\": {\n\t\t\"godot-ai\": %s\n\t}\n}\n" % JSON.stringify(entry),
+	)
+	var present := McpJsonStrategy.check_status_details(client, "godot-ai", "http://unused", launch)
+
+	client.path_template = saved_paths
+	_remove_if_exists(path)
+
+	assert_eq(
+		absent.get("status"),
+		McpClient.Status.NOT_CONFIGURED,
+		"a commented file without our entry is not configured, not broken",
+	)
+	assert_eq(String(absent.get("error_msg", "")), "", "a JSONC header is not an error")
+	assert_eq(
+		present.get("status"),
+		McpClient.Status.CONFIGURED,
+		"our entry must verify through a commented file: %s" % String(present.get("error_msg", "")),
+	)
+
+
+func test_zed_manual_instructions_do_not_report_a_parse_failure() -> void:
+	## `manual_target_details` backs the "Run this manually" block Zed users are
+	## sent to precisely because Configure will not write, so it must not
+	## decorate those instructions with "Target inspection failed".
+	var client := McpClientRegistry.get_by_id("zed")
+	var path := _scratch_dir.path_join("zed-manual-target.json")
+	_write_text(path, "// Zed settings\n{\n\t\"context_servers\": {}\n}\n")
+
+	var target := McpJsonStrategy.manual_target_details(client, "godot-ai", path)
+	_remove_if_exists(path)
+
+	assert_true(
+		target.get("ok", false),
+		"manual target inspection must survive a JSONC header: %s" % str(target.get("error", "")),
+	)
+	assert_eq(str(target.get("path", "")), path)
+	var key_path: PackedStringArray = target.get("key_path", PackedStringArray())
+	assert_eq(key_path.size(), 1, "Zed's map is a single top-level key")
+	if key_path.size() == 1:
+		assert_eq(key_path[0], "context_servers")
+
+
+func test_json_comment_tolerance_is_gated_on_manual_edit_descriptors() -> void:
+	## `configure` re-serializes the parsed dict, so tolerating comments for a
+	## writable client would hand back a comment-free rewrite. The gate is the
+	## pair of flags, not either one alone.
+	var path := _scratch_dir.path_join("jsonc_gate.json")
+	_write_text(path, "// header\n{\n\t\"mcpServers\": {}\n}\n")
+	var client := _make_test_json_client(path)
+
+	var plain := McpJsonStrategy.check_status_details(client, "godot-ai", "http://x")
+	client.config_allows_comments = true
+	var writable := McpJsonStrategy.check_status_details(client, "godot-ai", "http://x")
+	client.automatic_config_edits = false
+	var manual := McpJsonStrategy.check_status_details(client, "godot-ai", "http://x")
+	_remove_if_exists(path)
+
+	assert_eq(plain.get("status"), McpClient.Status.ERROR, "a plain JSON client keeps the strict parser")
+	assert_contains(String(plain.get("error_msg", "")), "parse error")
+	assert_eq(
+		writable.get("status"),
+		McpClient.Status.ERROR,
+		"opting in while the dock still writes the file must stay strict",
+	)
+	assert_contains(String(writable.get("error_msg", "")), "parse error")
+	assert_eq(
+		manual.get("status"),
+		McpClient.Status.NOT_CONFIGURED,
+		"a manual-edit JSONC client reads the commented file: %s" % String(manual.get("error_msg", "")),
+	)
+
+
+func test_json_jsonc_read_fails_closed_on_unterminated_block_comment() -> void:
+	## Parsing the leftover source is worse than the error we set out to remove.
+	var path := _scratch_dir.path_join("jsonc_unterminated.json")
+	_write_text(path, "/* never closed\n{\n\t\"mcpServers\": {}\n}\n")
+	var client := _make_test_json_client(path)
+	client.config_allows_comments = true
+	client.automatic_config_edits = false
+
+	var details := McpJsonStrategy.check_status_details(client, "godot-ai", "http://x")
+	_remove_if_exists(path)
+
+	assert_eq(details.get("status"), McpClient.Status.ERROR)
+	assert_contains(String(details.get("error_msg", "")), "unterminated block comment")
+
+
+func test_merged_json_status_reads_jsonc_tiers() -> void:
+	## Merge-tier reads fold through `_load_merge_tiers`; gating only the
+	## single-file read would half-support the next JSONC descriptor.
+	var tier := _scratch_dir.path_join("merge_jsonc/mcp.json")
+	_write_text(
+		tier,
+		"// tier header\n{\n\t\"mcpServers\": {\n\t\t\"godot-ai\": {\"url\": \"http://127.0.0.1:8000/mcp\"}\n\t}\n}\n",
+	)
+	var client := _make_merged_json_client(PackedStringArray([tier]))
+	client.config_allows_comments = true
+	client.automatic_config_edits = false
+
+	var details := McpJsonStrategy.check_status_details(client, "godot-ai", "http://127.0.0.1:8000/mcp")
+	_remove_if_exists(tier)
+
+	assert_eq(
+		details.get("status"),
+		McpClient.Status.CONFIGURED,
+		"a commented merge tier must still verify: %s" % String(details.get("error_msg", "")),
+	)
+
+
+func test_strip_jsonc_preserves_comment_markers_inside_strings() -> void:
+	var stripped := McpJsonStrategy._strip_jsonc('{"a": "// not a comment", "b": "/* also not */"}')
+	assert_true(stripped.get("ok", false))
+	var parsed: Variant = JSON.parse_string(str(stripped.get("text", "")))
+	assert_true(parsed is Dictionary, "in-string comment markers must not break the parse")
+	if parsed is Dictionary:
+		assert_eq(parsed.get("a"), "// not a comment")
+		assert_eq(parsed.get("b"), "/* also not */")
+
+
+func test_strip_jsonc_does_not_glue_tokens_across_a_comment() -> void:
+	## `tru/* x */e` must not be welded into the literal `true`.
+	var stripped := McpJsonStrategy._strip_jsonc('{"a": tru/* x */e}')
+	assert_true(stripped.get("ok", false))
+	var json := JSON.new()
+	assert_ne(
+		json.parse(str(stripped.get("text", ""))),
+		OK,
+		"two half-tokens either side of a comment must not become one literal",
+	)
+
+
+func test_strip_jsonc_keeps_block_comment_newlines() -> void:
+	## So JSON.parse error lines still point at the user's source line.
+	var stripped := McpJsonStrategy._strip_jsonc("/* one\ntwo */{\"a\": 1}")
+	assert_true(stripped.get("ok", false))
+	var text := str(stripped.get("text", ""))
+	assert_eq(text.count("\n"), 1, "the comment's newline must be re-emitted")
+	assert_true(text.strip_edges().begins_with("{"), "only the comment bytes are dropped")
+
+
+func test_strip_jsonc_rejects_unterminated_comment_and_string() -> void:
+	var comment := McpJsonStrategy._strip_jsonc("{\n\t\"a\": 1 /* open")
+	assert_false(comment.get("ok", true))
+	assert_contains(str(comment.get("error", "")), "unterminated block comment")
+	var string_run := McpJsonStrategy._strip_jsonc('{"a": "open')
+	assert_false(string_run.get("ok", true))
+	assert_contains(str(string_run.get("error", "")), "unterminated string")
+
+
 func test_vscode_attach_entry_flips_type_pin_to_stdio() -> void:
 	for id in ["vscode", "vscode_insiders"]:
 		var c := McpClientRegistry.get_by_id(id)
