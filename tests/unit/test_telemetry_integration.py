@@ -545,8 +545,12 @@ class TestRuntimeTelemetryOptOut:
         ## The point of the exercise: after the opt-out lands, the adopted
         ## server stops producing records.
         reg = self._registry_with_session()
-        self._dispatch(reg, "demo@a3f2", {})
+        ## Registering queues a connect record. Drain it *before* latching —
+        ## the fixture swaps ``_send`` for a list append, so the worker can
+        ## still deliver it after a later clear and fail the assert below.
+        _wait_for(captured, 1)
         captured.clear()
+        self._dispatch(reg, "demo@a3f2", {})
 
         tel.record_telemetry(tel.RecordType.USAGE, {"x": 1}, session_id="demo@a3f2")
         _wait_for(captured, 1, timeout=0.3)

@@ -133,6 +133,7 @@ def test_status_route_telemetry_enabled_reflects_the_runtime_latch(isolated_data
 
     response = client.get("/godot-ai/status")
     assert response.status_code == 200
+    assert response.json()["telemetry_enabled"] is False
     ## Reporting an opt-out is not accepting one: the route still 200s
     ## and serves the same payload.
     assert response.json()["name"] == "godot-ai"
