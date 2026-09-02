@@ -161,3 +161,29 @@ def test_ci_env_does_not_fall_back_to_environment_for_missing_loopback_record(
     assert result.returncode != 0
     assert result.stdout == ""
     assert "missing Godot AI HTTP capability record" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "http://remote.example.invalid/mcp",
+        "http://127.0.0.1.evil.invalid/mcp",
+        "http://localhost@remote.example.invalid/mcp",
+        "https://user:password@remote.example.invalid/mcp",
+        "ftp://remote.example.invalid/mcp",
+        "https:///mcp",
+    ),
+)
+def test_ci_env_rejects_unsafe_target_before_exposing_capability(url: str) -> None:
+    result = _load_http_auth(
+        _environment(
+            **{
+                "MCP_SERVER_URL": url,
+                HTTP_CAPABILITY_ENV: REMOTE_HTTP_CAPABILITY,
+            }
+        )
+    )
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "capability target must be" in result.stderr
+    assert REMOTE_HTTP_CAPABILITY not in result.stderr

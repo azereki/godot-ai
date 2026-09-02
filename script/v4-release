@@ -312,16 +312,16 @@ def _snapshot_git_directory(
     return snapshot
 
 
-def _run(command: list[str], context: str) -> bytes:
-    process = subprocess.run(command, capture_output=True)
+def _run(command: list[str], context: str, *, input_bytes: bytes | None = None) -> bytes:
+    process = subprocess.run(command, capture_output=True, input=input_bytes)
     if process.returncode:
         detail = process.stderr.decode("utf-8", "replace").strip()
         raise ReleaseError(f"{context} failed ({process.returncode}): {detail}")
     return process.stdout
 
 
-def _openssl(*args: str) -> bytes:
-    return _run(["openssl", "dgst", "-sha256", *args], "openssl")
+def _openssl(*args: str, input_bytes: bytes | None = None) -> bytes:
+    return _run(["openssl", "dgst", "-sha256", *args], "openssl", input_bytes=input_bytes)
 
 
 def _validate_embedded_public_key(data: bytes) -> None:
@@ -853,7 +853,9 @@ def sign_release(
     signature.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".v4-sign-", dir=signature.parent) as temporary:
         candidate = Path(temporary) / SIGNATURE_NAME
-        _openssl("-sign", str(private_key), "-out", str(candidate), str(manifest_path))
+        # OpenSSL's Windows file APIs may reject nested staging paths even
+        # when Python supports them. Only the key needs a filesystem argument.
+        candidate.write_bytes(_openssl("-sign", str(private_key), input_bytes=raw))
         _verify_signature(raw, _read_bounded(candidate, SIGNATURE_SIZE), PUBLIC_KEY_PEM)
         _publish_new_files((candidate,), (signature,))
     return signature
@@ -944,7 +946,7 @@ def build_migration_capsule(
             _fail("migration capsule", "archive is empty")
         checksum.write_bytes(f"{digest}  {LEGACY_ASSET_NAME}\n".encode("ascii"))
         raw = _read_bounded(checksum, LEGACY_MAX_CHECKSUM_SIZE)
-        _openssl("-sign", str(private_key.resolve()), "-out", str(signature), str(checksum))
+        signature.write_bytes(_openssl("-sign", str(private_key.resolve()), input_bytes=raw))
         _verify_signature(raw, _read_bounded(signature, SIGNATURE_SIZE), PUBLIC_KEY_PEM)
         _publish_new_files((archive, checksum, signature), destinations)
     return destinations

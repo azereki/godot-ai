@@ -7,6 +7,18 @@ import yaml
 WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
 
 
+def test_ci_checkouts_do_not_persist_credentials() -> None:
+    workflow = yaml.safe_load((WORKFLOWS / "ci.yml").read_text(encoding="utf-8"))
+    checkouts = [
+        step
+        for job in workflow["jobs"].values()
+        for step in job["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    ]
+    assert checkouts
+    assert all(step["with"]["persist-credentials"] is False for step in checkouts)
+
+
 def test_signing_secret_check_uses_the_protected_environment() -> None:
     workflow = (WORKFLOWS / "verify-signing.yml").read_text(encoding="utf-8")
     assert "RELEASE_SIGNING_KEY_PEM" in workflow

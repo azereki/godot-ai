@@ -10,11 +10,14 @@ Godot AI v4 is a breaking release and requires Godot 4.7 or newer within the
 
 Leave Godot open while the migration finishes; Godot will restart itself once
 to discard v3's loaded script classes and open the authenticated v4 tree in a
-clean process. You do not need to download release files, run a verifier, stop
-the server, edit client configuration, press a second confirmation button, or
-restart Godot yourself. Godot AI prepares and authenticates v4, replaces the
+clean process. For supported clients, you do not need to download release files,
+run a verifier, stop the server, edit client configuration, press a second
+confirmation button, or restart Godot yourself. Godot AI prepares and authenticates v4, replaces the
 complete add-on tree, updates owned client entries, and restarts the matching
 managed server automatically.
+
+Cherry Studio is not supported in v4; remove its stale v3 entry in Cherry
+Studio itself. Godot AI cannot safely edit that application's internal database.
 
 The public v4 release is not available yet: publication remains fail-closed
 until its immutable cross-platform qualification and release attestation

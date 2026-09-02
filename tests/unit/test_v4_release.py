@@ -218,10 +218,7 @@ def test_update_actor_prewarm_preserves_only_explicitly_authorized_qualification
         return subprocess.CompletedProcess(
             command,
             0,
-            stdout=(
-                b'{"package_version":"4.0.1","protocol_version":1,'
-                b'"status":"identity"}'
-            ),
+            stdout=(b'{"package_version":"4.0.1","protocol_version":1,"status":"identity"}'),
             stderr=b"",
         )
 
@@ -267,8 +264,7 @@ def test_update_actor_prewarm_has_a_fixed_deadline(monkeypatch):
     [
         b"not-json",
         b'{"package_version":"4.0.1","protocol_version":1,"status":"identity"}',
-        b'{"extra":true,"package_version":"4.0.0",'
-        b'"protocol_version":1,"status":"identity"}',
+        b'{"extra":true,"package_version":"4.0.0","protocol_version":1,"status":"identity"}',
         b'{"package_version":"4.0.1","package_version":"4.0.0",'
         b'"protocol_version":1,"status":"identity"}',
     ],
@@ -342,9 +338,40 @@ def test_build_is_deterministic_and_emits_one_archive_shape(signed_release):
     }
 
 
-def test_release_set_adds_one_deterministic_signed_v3_migration_capsule(
-    signed_release, tmp_path
+def test_signing_streams_both_payloads_without_openssl_output_paths(
+    signed_release, tmp_path, monkeypatch
 ):
+    # Python handles these paths on Windows; OpenSSL's file API may not.
+    output = tmp_path / ("nested-release-" + "x" * 100) / ("candidate-" + "x" * 60)
+    calls = []
+    original = v4_release._openssl
+
+    def observe(*args, input_bytes=None):
+        assert args == ("-sign", str(signed_release["private"].resolve()))
+        assert isinstance(input_bytes, bytes)
+        calls.append(input_bytes)
+        return original(*args, input_bytes=input_bytes)
+
+    monkeypatch.setattr(v4_release, "_openssl", observe)
+    outputs = v4_release.build_release_set(
+        signed_release["repo"],
+        output,
+        signed_release["private"],
+        *IDENTITY[1:],
+        signed_release["source"],
+    )
+    by_name = {path.name: path for path in outputs}
+    assert calls == [
+        by_name[v4_release.MANIFEST_NAME].read_bytes(),
+        by_name[v4_release.LEGACY_CHECKSUM_NAME].read_bytes(),
+    ]
+    for payload, name in zip(
+        calls, (v4_release.SIGNATURE_NAME, v4_release.LEGACY_SIGNATURE_NAME), strict=True
+    ):
+        v4_release._verify_signature(payload, by_name[name].read_bytes(), signed_release["public"])
+
+
+def test_release_set_adds_one_deterministic_signed_v3_migration_capsule(signed_release, tmp_path):
     first = tmp_path / "release-set-first"
     second = tmp_path / "release-set-second"
     arguments = (
@@ -378,17 +405,16 @@ def test_release_set_adds_one_deterministic_signed_v3_migration_capsule(
     with zipfile.ZipFile(capsule) as package:
         names = package.namelist()
         assert names == sorted(names)
-        assert package.read("addons/godot_ai/plugin.cfg").decode().count(
-            'version="4.0.0"'
-        ) == 1
+        assert package.read("addons/godot_ai/plugin.cfg").decode().count('version="4.0.0"') == 1
         for name in (
             v4_release.ASSET_NAME,
             v4_release.MANIFEST_NAME,
             v4_release.SIGNATURE_NAME,
         ):
-            assert package.read(f"{v4_release.MIGRATION_PAYLOAD_PREFIX}{name}") == by_name[
-                name
-            ].read_bytes()
+            assert (
+                package.read(f"{v4_release.MIGRATION_PAYLOAD_PREFIX}{name}")
+                == by_name[name].read_bytes()
+            )
 
 
 def test_build_never_overwrites_an_existing_candidate(signed_release):
@@ -458,24 +484,18 @@ def test_release_limits_match_every_self_update_acceptor():
     assert v4_release.MAX_MANIFEST_SIZE == 1024 * 1024
     assert transaction.DOWNLOAD_LIMITS[transaction.ASSET_NAME] == v4_release.MAX_ARCHIVE_SIZE
     assert transaction.DOWNLOAD_LIMITS[transaction.MANIFEST_NAME] == v4_release.MAX_MANIFEST_SIZE
-    manager = (ROOT / "plugin/addons/godot_ai/utils/update_manager.gd").read_text(
-        encoding="utf-8"
-    )
+    manager = (ROOT / "plugin/addons/godot_ai/utils/update_manager.gd").read_text(encoding="utf-8")
     assert "const MAX_ARCHIVE_SIZE_BYTES := 64 * 1024 * 1024" in manager
     assert "const MAX_MANIFEST_SIZE_BYTES := 1024 * 1024" in manager
     assert "ASSET_NAME: MAX_ARCHIVE_SIZE_BYTES" in manager
     assert "MANIFEST_NAME: MAX_MANIFEST_SIZE_BYTES" in manager
 
 
-def test_release_verifier_rejects_inputs_the_updater_cannot_receive(
-    signed_release, tmp_path
-):
+def test_release_verifier_rejects_inputs_the_updater_cannot_receive(signed_release, tmp_path):
     manifest = json.loads(signed_release["outputs"][1].read_bytes())
     manifest["asset"]["size"] = v4_release.MAX_ARCHIVE_SIZE + 1
     with pytest.raises(v4_release.ReleaseError, match="manifest.asset.size"):
-        v4_release._validate_manifest(
-            v4_release._canonical(manifest), signed_release["expected"]
-        )
+        v4_release._validate_manifest(v4_release._canonical(manifest), signed_release["expected"])
 
     oversized_manifest = tmp_path / v4_release.MANIFEST_NAME
     oversized_manifest.write_bytes(b"x" * (v4_release.MAX_MANIFEST_SIZE + 1))
@@ -555,9 +575,7 @@ def _fresh_project(root: Path) -> Path:
     return project
 
 
-def test_install_proves_actor_before_any_project_mutation(
-    signed_release, tmp_path, monkeypatch
-):
+def test_install_proves_actor_before_any_project_mutation(signed_release, tmp_path, monkeypatch):
     project, old = _old_project(tmp_path)
     recovery = tmp_path / "recovery"
 
@@ -1143,14 +1161,10 @@ def test_manifest_json_is_strict(raw):
 )
 def test_windows_extended_device_names_are_rejected(name):
     with pytest.raises(v4_release.ReleaseError, match="reserved path component"):
-        v4_release._verify._safe_path(
-            f"{v4_release.PLUGIN_PREFIX}{name}.gd", "fixture path"
-        )
+        v4_release._verify._safe_path(f"{v4_release.PLUGIN_PREFIX}{name}.gd", "fixture path")
 
 
-def _zip(
-    path: Path, entries: list[tuple[str, bytes, int, int]], *, create_system: int = 3
-) -> None:
+def _zip(path: Path, entries: list[tuple[str, bytes, int, int]], *, create_system: int = 3) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         for name, data, mode, compression in entries:
             info = zipfile.ZipInfo(name, v4_release.FIXED_TIME)
@@ -1273,8 +1287,19 @@ def test_build_refuses_wrong_signing_key_before_publishing(signed_release, tmp_p
 def test_build_refuses_linked_plugin_content(signed_release, tmp_path):
     repo = tmp_path / "repo"
     shutil.copytree(signed_release["repo"], repo, symlinks=True)
-    (repo / "plugin/addons/godot_ai/untracked.gd").symlink_to("plugin.gd")
-    _run("git", "add", "plugin", cwd=repo)
+    # The release reads Git objects, not the worktree. Create the linked entry
+    # directly so this rejection test needs no Windows symlink privilege.
+    target = repo / "link-target.txt"
+    target.write_text("plugin.gd", encoding="utf-8")
+    blob = _run("git", "hash-object", "-w", str(target), cwd=repo).decode().strip()
+    _run(
+        "git",
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"120000,{blob},plugin/addons/godot_ai/untracked.gd",
+        cwd=repo,
+    )
     _run("git", "commit", "-q", "-m", "linked fixture", cwd=repo)
     source = _run("git", "rev-parse", "HEAD", cwd=repo).decode().strip()
     _run("git", "tag", "-f", "v4.0.0", cwd=repo)
@@ -1294,16 +1319,14 @@ def test_package_reads_exact_commit_and_ignores_all_workspace_bytes(signed_relea
     committed = _run(
         "git",
         "show",
-        f'{signed_release["source"]}:plugin/addons/godot_ai/plugin.gd',
+        f"{signed_release['source']}:plugin/addons/godot_ai/plugin.gd",
         cwd=repo,
     )
     (repo / ".git/info/exclude").write_text("plugin/addons/godot_ai/ignored.gd\n")
     (repo / "plugin/addons/godot_ai/plugin.gd").write_text("workspace mutation\n")
     (repo / "plugin/addons/godot_ai/untracked.gd").write_text("extends RefCounted\n")
     (repo / "plugin/addons/godot_ai/ignored.gd").write_text("ignored bytes\n")
-    (repo / "pyproject.toml").write_text(
-        '[project]\nversion="9.9.9"\n', encoding="utf-8"
-    )
+    (repo / "pyproject.toml").write_text('[project]\nversion="9.9.9"\n', encoding="utf-8")
 
     archive, _manifest = v4_release.package_release(
         repo,
@@ -1378,7 +1401,7 @@ def test_workspace_mutation_after_source_check_cannot_enter_package(
     committed = _run(
         "git",
         "show",
-        f'{signed_release["source"]}:plugin/addons/godot_ai/plugin.gd',
+        f"{signed_release['source']}:plugin/addons/godot_ai/plugin.gd",
         cwd=repo,
     )
     validate = v4_release._validate_source

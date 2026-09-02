@@ -817,6 +817,7 @@ func _process(_delta: float) -> void:
 
     disable = log.find("MCP | v3 bridge disabling transition plugin")
     assert disable >= 0, log
+    assert "Failed to create an autoload" not in log, log
     transition_window = log[disable:]
     parse_errors = (
         "SCRIPT ERROR: Parse Error",
@@ -852,6 +853,12 @@ func _process(_delta: float) -> void:
     assert intent.from_version == from_version
     assert (backup / "migration_payload" / smoke.SMOKE_ARCHIVE_NAME).is_file()
     assert (backup / "update_reload_runner.gd").is_file()
+    # The supported v3 updater overlays the capsule; it retains the old
+    # autoload until the canonical tree replaces it. The capsule is not a
+    # standalone add-on and must not grow a second game-helper implementation.
+    assert (backup / "runtime/game_helper.gd").read_bytes() == (
+        extracted / "plugin/addons/godot_ai/runtime/game_helper.gd"
+    ).read_bytes()
 
 
 @pytest.mark.parametrize("prewarm_mode", ["cold", "offline", "wedged"])

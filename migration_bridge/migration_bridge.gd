@@ -15,7 +15,7 @@ const PREPARE_TIMEOUT_MSEC := 180 * 1000
 const ACTOR_PROTOCOL := 1
 const PENDING_V3_UPDATE_SETTING := "godot_ai/pending_self_update_event"
 
-signal state_changed(message: String, failed: bool)
+signal state_changed(message: String, failed: bool, termination_unproven: bool)
 signal prepared(package: Dictionary)
 
 var _thread: Thread
@@ -30,7 +30,7 @@ func start() -> void:
 	_started = true
 	var identity := _release_identity()
 	if identity.is_empty():
-		state_changed.emit("The embedded signed v4 release metadata is invalid.", true)
+		state_changed.emit("The embedded signed v4 release metadata is invalid.", true, false)
 		return
 	var nonce := Crypto.new().generate_random_bytes(16).hex_encode()
 	var transaction := Crypto.new().generate_random_bytes(16).hex_encode()
@@ -51,7 +51,7 @@ func start() -> void:
 		Callable(MigrationBridgeWorker, "prepare").bind(job, Callable(self, "_cancel_requested"))
 	) != OK:
 		_thread = null
-		state_changed.emit("Could not start the v4 migration preparation worker.", true)
+		state_changed.emit("Could not start the v4 migration preparation worker.", true, false)
 		return
 	set_process(true)
 
@@ -64,19 +64,22 @@ func _process(_delta: float) -> void:
 	set_process(false)
 	if not result is Dictionary or not bool(result.get("ok", false)):
 		var message := str(result.get("error", "The v4 migration could not be prepared.")) if result is Dictionary else "The v4 migration worker returned no result."
-		state_changed.emit(message, true)
+		state_changed.emit(message, true, result is Dictionary and bool(result.get("termination_unproven", false)))
 		return
-	state_changed.emit("Activating the verified Godot AI v4 tree…", false)
+	state_changed.emit("Activating the verified Godot AI v4 tree…", false, false)
 	prepared.emit((result as Dictionary).get("package", {}).duplicate(true))
 
 
-func cancel_and_join() -> void:
+func cancel_and_join() -> bool:
+	## Return whether actor termination is proved, including during plugin unload.
 	if _thread != null:
 		_cancel_mutex.lock()
 		_cancelled = true
 		_cancel_mutex.unlock()
-		_thread.wait_to_finish()
+		var result: Variant = _thread.wait_to_finish()
 		_thread = null
+		return result is Dictionary and not bool(result.get("termination_unproven", false))
+	return true
 
 
 func _cancel_requested() -> bool:

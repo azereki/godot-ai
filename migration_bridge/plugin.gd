@@ -9,6 +9,7 @@ const MigrationBridge := preload("res://addons/godot_ai/migration_bridge.gd")
 const MigrationCoordinator := preload("res://addons/godot_ai/migration_coordinator.gd")
 const BRIDGE_STATUS_SETTING := "godot_ai/v4_migration_bridge_status"
 const FLOOR_REFUSAL := "Godot AI v4 migration requires Godot 4.7 or newer; bridge remains inactive."
+const RESTART_REQUIRED := "Migration actor termination could not be proved. Restart Godot before retrying."
 
 var _dock: VBoxContainer
 var _label: Label
@@ -18,6 +19,9 @@ var _bridge
 
 func _enter_tree() -> void:
 	_build_dock()
+	if Engine.has_meta(_restart_key()):
+		_present_state(str(Engine.get_meta(_restart_key())), true, true)
+		return
 	var prior := _bridge_status()
 	if not prior.is_empty():
 		_present_error(str(prior.get("error", "The previous migration attempt did not finish.")))
@@ -32,7 +36,8 @@ func _enter_tree() -> void:
 
 func _exit_tree() -> void:
 	if _bridge != null and is_instance_valid(_bridge):
-		_bridge.cancel_and_join()
+		if not _bridge.cancel_and_join():
+			Engine.set_meta(_restart_key(), RESTART_REQUIRED)
 		_bridge.queue_free()
 	_bridge = null
 	if _dock != null and is_instance_valid(_dock):
@@ -58,7 +63,7 @@ func _build_dock() -> void:
 
 
 func _start_migration() -> void:
-	if _bridge != null:
+	if _bridge != null or Engine.has_meta(_restart_key()):
 		return
 	_clear_bridge_status()
 	_retry.visible = false
@@ -74,14 +79,25 @@ func _start_migration() -> void:
 	_bridge.start()
 
 
-func _present_state(message: String, failed: bool = false) -> void:
+func _present_state(message: String, failed: bool = false, termination_unproven: bool = false) -> void:
+	if termination_unproven:
+		message = RESTART_REQUIRED
+		Engine.set_meta(_restart_key(), message)
+	if failed:
+		print("MCP | v3 bridge: %s" % message)
 	if _label != null:
 		_label.text = message
 	if failed and _retry != null:
-		if _bridge != null and is_instance_valid(_bridge):
-			_bridge.queue_free()
-		_bridge = null
-		_retry.visible = true
+		_retry.visible = not Engine.has_meta(_restart_key())
+		if _retry.visible:
+			if _bridge != null and is_instance_valid(_bridge):
+				_bridge.queue_free()
+			_bridge = null
+
+
+static func _restart_key() -> String:
+	## Process-scoped and project-bound: plugin reload must not permit Retry.
+	return "godot_ai_bridge_restart_" + ProjectSettings.globalize_path("res://").sha256_text()
 
 
 func _present_error(message: String) -> void:

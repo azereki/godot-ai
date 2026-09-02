@@ -234,14 +234,18 @@ def test_post_update_client_repin_is_broad_only_across_the_v4_boundary(
     intent = _scenario(tmp_path).intent
     terminal = {"outcome": "success"}
     assert tx._post_outcome(intent, terminal)["replace_owned_mismatches"] is False
-    assert tx._post_outcome(
-        replace(intent, from_version="3.2.4"), terminal
-    )["replace_owned_mismatches"] is True
+    assert (
+        tx._post_outcome(replace(intent, from_version="3.2.4"), terminal)[
+            "replace_owned_mismatches"
+        ]
+        is True
+    )
 
 
 @pytest.mark.parametrize("predecessor_state", ["dead", "reused"])
 def test_editor_lease_transfers_only_after_nonce_bound_predecessor_is_gone(
-    tmp_path: Path, predecessor_state: str,
+    tmp_path: Path,
+    predecessor_state: str,
 ) -> None:
     scenario = _scenario(tmp_path)
     leases = tx.EditorLeases(scenario.recovery, scenario.project, scenario.install)
@@ -507,9 +511,9 @@ def test_manual_migration_has_one_durable_winner_and_actor_owned_completion(
         assert sorted(kind for kind, _index, _value in outcomes) == ["lost", "won"]
         winner = next(index for kind, index, _value in outcomes if kind == "won")
         editor = tx.editor_identity(holders[winner].pid, f"manual-editor-{winner}-012345")
-        expected_transaction = "manual-" + hashlib.sha256(
-            tx.canonical_json(marker)
-        ).hexdigest()[:24]
+        expected_transaction = (
+            "manual-" + hashlib.sha256(tx.canonical_json(marker)).hexdigest()[:24]
+        )
         assert tx.complete_manual_migration(project, install, editor) == {
             "status": "migration_complete",
             "transaction": expected_transaction,
@@ -685,9 +689,7 @@ def test_simultaneous_post_crash_startups_have_one_durable_m6_winner(
 
     try:
         assert sorted(kind for kind, _value in outcomes) == ["lost", "won"]
-        election = tx.MigrationElection(
-            scenario.recovery, scenario.project, scenario.install
-        )
+        election = tx.MigrationElection(scenario.recovery, scenario.project, scenario.install)
         row, owner = election.owner()
         assert row["transaction"] == scenario.intent.transaction
         assert owner.pid in {holder.pid for holder in holders}
@@ -3054,7 +3056,14 @@ def test_activate_cli_uses_authenticated_environment_failpoint_without_secret_le
                 # durable denial still fails at the enclosing deadline.
                 return False
             except tx.TransactionError as exc:
-                if str(exc).endswith("record changed before reading"):
+                # This is only the phase poll. Full validation below still
+                # rejects a durable or malicious hard link.
+                if str(exc).endswith(
+                    (
+                        "record changed before reading",
+                        "record has an unexpected hard link",
+                    )
+                ):
                     return False
                 raise
 

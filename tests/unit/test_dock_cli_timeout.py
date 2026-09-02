@@ -355,9 +355,15 @@ def test_composition_and_post_update_barriers_precede_every_normal_start_effect(
     assert "_client_jobs.activate()" not in compose
     assert "_start_server()" not in compose
     assert "check_for_updates" not in compose
-    assert "begin_post_update_repin(" in begin
-    assert '"replace_owned_mismatches"' in begin
-    assert 'get("manual_migration", false)' in begin
+    expected_call = """_client_jobs.begin_post_update_repin(
+        str(_post_update_outcome.get("from_version", "")),
+        str(_post_update_outcome.get("to_version", "")),
+        bool(_post_update_outcome.get(
+            "replace_owned_mismatches",
+            _post_update_outcome.get("manual_migration", false),
+        )),
+    )"""
+    assert "".join(expected_call.split()) in "".join(begin.split())
     for effect in (
         "_client_jobs.activate()",
         "_update_manager.check_for_updates.call_deferred()",

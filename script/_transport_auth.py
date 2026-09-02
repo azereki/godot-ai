@@ -20,7 +20,16 @@ def raw_capability(url: str) -> str:
     """Resolve and validate a raw HTTP capability for a target URL."""
 
     parsed = urlsplit(url)
-    if parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+    loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or (parsed.scheme == "http" and not loopback)
+    ):
+        raise ValueError("capability target must be loopback HTTP or HTTPS without userinfo")
+    if loopback:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         record = read_capabilities(port)
         if record is None:

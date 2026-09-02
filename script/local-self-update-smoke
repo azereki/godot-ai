@@ -309,9 +309,7 @@ def fixture_environment_paths(project_dir: Path) -> dict[str, Path]:
     root = project_dir / ".godot-ai-self-update-smoke" / "client-environment"
     local_app_data = root / "local-app-data"
     capability_dir = (
-        local_app_data / "godot-ai" / "capabilities"
-        if os.name == "nt"
-        else root / "capabilities"
+        local_app_data / "godot-ai" / "capabilities" if os.name == "nt" else root / "capabilities"
     )
     return {
         "home": root / "home",
@@ -358,7 +356,7 @@ def prepare_isolated_client_environment(
     config.write_text(
         (
             '[mcp_servers."godot-ai"]\n'
-            f'command = {json.dumps(str(paths["client_command"]))}\n'
+            f"command = {json.dumps(str(paths['client_command']))}\n"
             f"args = [{encoded_args}]\n"
             "enabled = true\n"
             "startup_timeout_sec = 60\n"
@@ -857,7 +855,7 @@ def prepare_server_selector(
         "    raw = PLUGIN_CFG.read_text(encoding='utf-8')\n"
         "except OSError as exc:\n"
         "    raise SystemExit(f'refused unreadable plugin.cfg: {exc}') from exc\n"
-        "matches = re.findall(r'^version=\"([^\"\\r\\n]+)\"$', raw, re.MULTILINE)\n"
+        'matches = re.findall(r\'^version="([^"\\r\\n]+)"$\', raw, re.MULTILINE)\n'
         "if len(matches) != 1 or matches[0] not in COMMANDS:\n"
         "    raise SystemExit('refused unknown or ambiguous plugin version')\n"
         "command = COMMANDS[matches[0]]\n"
@@ -946,8 +944,7 @@ def create_signed_v4_bundle(
 
 
 def patch_local_update_banner(path: Path, next_version: str) -> None:
-    """Expose the frozen local signed triple through the production package seam."""
-
+    """Replace only network I/O; retain production discovery and download control."""
     text = path.read_text(encoding="utf-8")
     text = replace_once(
         path,
@@ -959,7 +956,7 @@ def patch_local_update_banner(path: Path, next_version: str) -> None:
             f'const SELF_UPDATE_SMOKE_MANIFEST := "res://{SMOKE_DIR}/{SMOKE_MANIFEST_NAME}"\n'
             f'const SELF_UPDATE_SMOKE_SIGNATURE := "res://{SMOKE_DIR}/{SMOKE_SIGNATURE_NAME}"\n'
             f'const SELF_UPDATE_SMOKE_NEXT_VERSION := "{next_version}"\n'
-            f'const SELF_UPDATE_SMOKE_SOURCE := "{SMOKE_SOURCE}"\n'
+            "var _smoke_downloads: Array[String] = []\n"
         ),
         "SELF_UPDATE_SMOKE constants",
     )
@@ -967,56 +964,51 @@ def patch_local_update_banner(path: Path, next_version: str) -> None:
         text,
         "func check_for_updates() -> void:",
         """func check_for_updates() -> void:
-\t_release = {
-\t\t"has_update": true,
-\t\t"version": SELF_UPDATE_SMOKE_NEXT_VERSION,
-\t\t"tag": "v" + SELF_UPDATE_SMOKE_NEXT_VERSION,
-\t\t"channel": "stable",
-\t\t"label_text": "Smoke update available: v%s" % SELF_UPDATE_SMOKE_NEXT_VERSION,
-\t\t"urls": {},
-\t\t"sizes": {},
+\tvar assets: Array[Dictionary] = []
+\tvar canonical := {
+\t\tASSET_NAME: SELF_UPDATE_SMOKE_ARCHIVE,
+\t\tMANIFEST_NAME: SELF_UPDATE_SMOKE_MANIFEST,
+\t\tSIGNATURE_NAME: SELF_UPDATE_SMOKE_SIGNATURE,
 \t}
-\tupdate_check_completed.emit(_release)""",
+\tfor name in _RELEASE_ASSET_LIMITS:
+\t\tvar size := 512 if name == LEGACY_SIGNATURE_NAME else 1
+\t\tif canonical.has(name):
+\t\t\tsize = FileAccess.get_file_as_bytes(str(canonical[name])).size()
+\t\tassets.append({
+\t\t\t"name": name, "size": size,
+\t\t\t"browser_download_url": (
+\t\t\t\t"https://github.com/hi-godot/godot-ai/releases/download/v%s/%s"
+\t\t\t\t% [SELF_UPDATE_SMOKE_NEXT_VERSION, name]),
+\t\t})
+\tvar release := {"tag_name": "v" + SELF_UPDATE_SMOKE_NEXT_VERSION, "assets": assets}
+\t_on_check_completed(HTTPRequest.RESULT_SUCCESS, 200, PackedStringArray(),
+\t\tJSON.stringify(release).to_utf8_buffer())""",
     )
     text = replace_function(
         text,
-        "func start_install(preflight: Dictionary) -> void:",
-        """func start_install(preflight: Dictionary) -> void:
-\tif _release.is_empty():
+        "func _request_active_asset(url: String) -> void:",
+        """func _request_active_asset(url: String) -> void:
+\tvar canonical := {
+\t\tASSET_NAME: SELF_UPDATE_SMOKE_ARCHIVE,
+\t\tMANIFEST_NAME: SELF_UPDATE_SMOKE_MANIFEST,
+\t\tSIGNATURE_NAME: SELF_UPDATE_SMOKE_SIGNATURE,
+\t}
+\tif not canonical.has(_active_asset) or url != str(_release.urls.get(_active_asset, "")):
+\t\t_fail_download("smoke attempted a non-canonical asset")
 \t\treturn
-\tif not bool(preflight.get("ok", false)):
-\t\tinstall_state_changed.emit({
-\t\t\t"button_text": "Smoke update blocked by preflight",
-\t\t\t"button_disabled": false,
-\t\t})
+\tvar error := DirAccess.copy_absolute(
+\t\tProjectSettings.globalize_path(str(canonical[_active_asset])), _download_path(_active_asset))
+\tif error != OK:
+\t\t_fail_download("smoke copy failed: " + error_string(error))
 \t\treturn
-\tvar directory := str(preflight.get("download_root", ""))
-\tif (
-\t\tdirectory.is_empty()
-\t\tor not directory.is_absolute_path()
-\t\tor not DirAccess.dir_exists_absolute(directory)
-\t):
-\t\tinstall_state_changed.emit({
-\t\t\t"button_text": "Smoke update blocked — private download directory unavailable",
-\t\t\t"button_disabled": false,
-\t\t})
-\t\treturn
-\t## Retain the actor-allocated empty directory only so the production root's
-\t## post-prepare discard path removes it. The signed fixture assets remain
-\t## immutable under res:// and are never mistaken for disposable downloads.
-\t_download_root = directory
-\tprint("MCP | self-update smoke: staged signed local bundle")
-\tactivation_requested.emit({
-\t\t"archive": ProjectSettings.globalize_path(SELF_UPDATE_SMOKE_ARCHIVE),
-\t\t"manifest": ProjectSettings.globalize_path(SELF_UPDATE_SMOKE_MANIFEST),
-\t\t"signature": ProjectSettings.globalize_path(SELF_UPDATE_SMOKE_SIGNATURE),
-\t\t"repository": REPOSITORY,
-\t\t"channel": "stable",
-\t\t"tag": "v" + SELF_UPDATE_SMOKE_NEXT_VERSION,
-\t\t"version": SELF_UPDATE_SMOKE_NEXT_VERSION,
-\t\t"source": SELF_UPDATE_SMOKE_SOURCE,
-\t\t"download_root": directory,
-\t})""",
+\t_smoke_downloads.append(_active_asset)
+\tif _queue.is_empty():
+\t\tif _smoke_downloads != [ASSET_NAME, MANIFEST_NAME, SIGNATURE_NAME]:
+\t\t\t_fail_download("smoke did not download exactly the canonical three")
+\t\t\treturn
+\t\tprint("MCP | self-update smoke: staged signed local bundle")
+\t_on_asset_completed.call_deferred(
+\t\tHTTPRequest.RESULT_SUCCESS, 200, PackedStringArray(), PackedByteArray())""",
     )
     path.write_text(text, encoding="utf-8")
 
@@ -1585,7 +1577,8 @@ def new_diagnostic_reports(
         (
             path
             for path in current - baseline
-            if path.exists() and path.stat().st_mtime >= started - 2
+            if path.exists()
+            and path.stat().st_mtime >= started - 2
             and _report_matches_executable(path, godot_path)
         ),
         key=lambda path: path.stat().st_mtime,

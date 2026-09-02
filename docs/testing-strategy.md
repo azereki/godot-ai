@@ -102,10 +102,12 @@ python script/local-self-update-smoke
 ```
 
 The harness prepares a disposable physical add-on from the current branch,
-builds and signs a synthetic next-v4 exact-tree release, serves the three
-release assets through the normal discovery/download surface, records the
-pre-run macOS DiagnosticReports baseline, and launches Godot. The operator step
-is only to click **Update** in the dock.
+builds and signs a synthetic next-v4 exact-tree release, feeds six-asset metadata
+through production discovery, and exercises the production three-asset download
+queue and completion checks. Only network I/O is replaced with local fixture
+reads; the smoke asserts that exactly the canonical three are requested. It
+records the pre-run macOS DiagnosticReports baseline, and launches Godot. The
+operator step is only to click **Update** in the dock.
 
 Passing criteria:
 

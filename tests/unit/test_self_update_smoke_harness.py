@@ -91,6 +91,25 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     assert 'preflight.get("download_root", "")' in base_manager
     assert "_download_root = directory" in base_manager
     assert '"download_root": directory' in base_manager
+    production_manager = (ROOT / "plugin/addons/godot_ai/utils/update_manager.gd").read_text(
+        encoding="utf-8"
+    )
+    def function_block(source: str, signature: str) -> str:
+        return source[source.index(signature) :].split("\n\nfunc ", 1)[0]
+
+    for signature in (
+        "func start_install(preflight: Dictionary) -> void:",
+        "func _on_check_completed(",
+        "func _on_asset_completed(",
+        "func _finish_downloads() -> void:",
+    ):
+
+        assert function_block(base_manager, signature) == function_block(
+            production_manager, signature
+        )
+    assert "for name in _RELEASE_ASSET_LIMITS:" in base_manager
+    assert "_on_check_completed(HTTPRequest.RESULT_SUCCESS" in base_manager
+    assert "_smoke_downloads != [ASSET_NAME, MANIFEST_NAME, SIGNATURE_NAME]" in base_manager
 
     base_configurator = (project / "addons" / "godot_ai" / "client_configurator.gd").read_text(
         encoding="utf-8"
@@ -123,8 +142,9 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     assert '"tier": "self_update_smoke"' in launch_block
     assert "find_uvx" not in launch_block
     prewarm_block = base_configurator[
-        base_configurator.index("static func prewarm_server_package_blocking(")
-        : base_configurator.index("static func prewarm_attach_plan(")
+        base_configurator.index(
+            "static func prewarm_server_package_blocking("
+        ) : base_configurator.index("static func prewarm_attach_plan(")
     ]
     assert "find_uvx" not in prewarm_block
     assert "McpCliExec.run" not in prewarm_block
@@ -164,7 +184,7 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     fixture_paths = smoke.fixture_environment_paths(project)
     client_config = fixture_paths["codex_home"] / "config.toml"
     config_text = client_config.read_text(encoding="utf-8")
-    assert f'command = {json.dumps(str(fixture_paths["client_command"]))}' in config_text
+    assert f"command = {json.dumps(str(fixture_paths['client_command']))}" in config_text
     assert "godot-ai==4.0.0" in config_text
     assert "godot-ai==4.0.1" not in config_text
     if os.name != "nt":
@@ -194,9 +214,7 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
         vnext_dock = zf.read("addons/godot_ai/mcp_dock.gd").decode()
         vnext_manager = zf.read("addons/godot_ai/utils/update_manager.gd").decode()
         vnext_configurator = (
-            zf.read("addons/godot_ai/client_configurator.gd")
-            .decode()
-            .replace("\r\n", "\n")
+            zf.read("addons/godot_ai/client_configurator.gd").decode().replace("\r\n", "\n")
         )
         vnext_settings = zf.read("addons/godot_ai/utils/settings.gd").decode()
         vnext_base = zf.read("addons/godot_ai/utils/self_update_smoke_base.gd").decode()
@@ -222,6 +240,7 @@ def test_self_update_smoke_harness_prepares_fixture(tmp_path: Path) -> None:
     assert vnext_child_uid.strip() == "uid://bm2056w0qvj7x"
     assert "const DEFAULT_HTTP_PORT := 18000" in vnext_configurator
     assert "server-selector.py" in vnext_configurator
+
     def server_command_block(text: str) -> str:
         start = text.index("static func get_server_command() -> Array[String]:")
         end = text.index("static func get_update_transaction_command() -> Array[String]:")
@@ -360,14 +379,17 @@ def test_launch_passes_isolation_only_to_godot_child(
     monkeypatch.setattr(smoke, "wait_for_live_status", fake_wait)
     monkeypatch.setattr(smoke, "verify_post_run", lambda *_args, **_kwargs: True)
 
-    assert smoke.launch_and_verify(
-        project,
-        str(godot),
-        "4.0.1",
-        set(),
-        http_port=18000,
-        next_server_version="4.0.1",
-    ) == 0
+    assert (
+        smoke.launch_and_verify(
+            project,
+            str(godot),
+            "4.0.1",
+            set(),
+            http_port=18000,
+            next_server_version="4.0.1",
+        )
+        == 0
+    )
 
     assert os.environ["HOME"] == str(parent_home)
     assert os.environ["CODEX_HOME"] == str(parent_codex)
@@ -416,8 +438,8 @@ def test_transaction_recovery_requires_bound_migration_completion(
     project = tmp_path / "project"
     live = project / "addons" / "godot_ai"
     live.mkdir(parents=True)
-    recovery = project.parent / ".godot-ai-recovery" / smoke.install_id(
-        project.resolve(), live.resolve()
+    recovery = (
+        project.parent / ".godot-ai-recovery" / smoke.install_id(project.resolve(), live.resolve())
     )
     backup = recovery / "retained-backup"
     transaction = "transaction-0123456789"
@@ -456,9 +478,7 @@ def test_transaction_recovery_requires_bound_migration_completion(
         return {"status": "migration_complete"}
 
     monkeypatch.setattr(smoke, "validate_migration_complete", accept_completion)
-    verified_transaction, verified_backup = smoke.verify_transaction_recovery(
-        project, "4.0.1"
-    )
+    verified_transaction, verified_backup = smoke.verify_transaction_recovery(project, "4.0.1")
     assert verified_transaction == transaction
     assert verified_backup == backup
     assert seen == {
@@ -742,9 +762,7 @@ def test_fetch_status_payload_none_on_truncated_body(
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        assert smoke.fetch_status_payload(
-            port, capability_dir=capability_dir, timeout=1.0
-        ) is None
+        assert smoke.fetch_status_payload(port, capability_dir=capability_dir, timeout=1.0) is None
     finally:
         server.shutdown()
         server.server_close()
@@ -832,9 +850,7 @@ def test_crash_report_filter_ignores_an_unrelated_godot_binary(tmp_path: Path) -
     unrelated.touch()
     report = tmp_path / "Godot-test.ips"
     report.write_text(
-        json.dumps({"app_name": "Godot"})
-        + "\n"
-        + json.dumps({"procPath": str(unrelated)}),
+        json.dumps({"app_name": "Godot"}) + "\n" + json.dumps({"procPath": str(unrelated)}),
         encoding="utf-8",
     )
 

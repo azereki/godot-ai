@@ -34,9 +34,9 @@ environment's temporary `RELEASE_KEY_MIGRATION_TOKEN` secret were deleted.
 Metadata readback confirmed neither exists at repository scope and the sole
 remaining environment secret is `RELEASE_SIGNING_KEY_PEM`. The one-time transfer
 input, shell step, and obsolete transfer tests are retired; the permanent
-workflow remains a read-only, human-gated synthetic signing check. Operator
-revocation of the temporary fine-grained token at GitHub is still awaiting
-confirmation; deleting its Actions secret alone does not revoke it. See the
+workflow remains a read-only, human-gated synthetic signing check. The owner
+confirmed revocation of the temporary fine-grained GitHub token `godot-toke`
+(ID `19038725`) after deleting its Actions secret. See the
 [operator runbook](releasing.md#operator-setup-before-candidate-signing).
 
 The prior occurrence-selector commit `531f1bf` passed **32/32 hosted CI jobs**
@@ -65,25 +65,46 @@ occupied its inherited ports. The successful run used an intact self-contained
 Godot 4.7.2 app copy with isolated settings and ports; no existing client was
 stopped and no production source was patched for that run.
 
-### Review follow-up still open
+### Review follow-up in progress
 
 The latest review was inspected during signing cleanup, not silently marked
-addressed. Four inline threads remain open: CI checkout credential persistence,
-end-to-end six-asset discovery in the manual smoke, the Cherry Studio exception
-in the migration introduction, and the repin argument assertion. The parser
-already has separate six-asset coverage; the smoke gap is integration coverage.
-The older out-of-diff non-loopback HTTP capability finding still matches
-`script/_transport_auth.py`. The resolved bridge-timeout thread also needs
-reassessment: `_process()` discards the `termination_unproven` flag before the
-plugin exposes Retry. Neither issue was changed by signing cleanup.
+addressed. This review tranche disables checkout credential
+persistence, drives six-asset discovery through the production callback in the
+manual smoke, states the Cherry Studio exception at the migration entry point,
+and asserts the complete repin call. It also restricts non-loopback capability
+targets to HTTPS and suppresses Retry, including across plugin reload, when
+actor termination cannot be proved. Automated and actual-editor regression
+checks passed as recorded below; the final manual-smoke gate remains open.
 
 The [Windows qualification report](https://github.com/hi-godot/godot-ai/pull/943#issuecomment-5498715882)
-also needs disposition: nested signing paths and the privilege-dependent
-symlink fixture still match current code. Check the capsule/autoload report
-against the supported overlay update path before adding a compatibility stub;
-the capsule is not a standalone final install. Its missing failure-log report
-matches the dock-only bridge error presentation. These observations are review
-follow-up, not completed fixes or exact-candidate qualification.
+also received direct dispositions in the current tranche: signing streams bytes
+through OpenSSL rather than passing its nested output paths; the link fixture
+uses a Git index entry and needs no Windows privilege; the supported v3 overlay
+path explicitly proves the old autoload remains present; and bridge failures
+are emitted to the editor log as well as the dock. The capsule remains a
+temporary overlay, not a supported standalone add-on. These fixes do not
+constitute exact-candidate qualification.
+
+Review-tranche development validation: Ruff clean; Python **2,268 passed,
+11 environment-gated skips**; isolated live Godot **2,128 passed, 24 skips,
+0 failed**; actual-editor updater integration **12 passed**; and the changed
+migration bridge passed its real-editor failure/reload cases. Godot 4.5 and 4.6
+both refused the v4 runtime and migration bridge without mutating the add-on or
+project configuration. The prior-head CI run failed only while its test poll
+observed the journal's short-lived two-name atomic-publication interval; this
+tranche lets that preliminary poll retry the transient identity while retaining
+the subsequent full authenticated intent/journal validation. All three CLI
+failpoint cases also passed ten consecutive runs (**30/30**). Hosted CI for
+this tranche remains pending at commit time.
+
+The operator clicked Update in the disposable manual fixture: the production
+discovery/download path selected the canonical triple, the verified plugin
+loaded, migration completed durably, and the replacement server authenticated.
+The assistant then sent SIGTERM rather than waiting for normal editor Quit;
+the wrapper correctly failed with exit `-15`. That is not recorded as a passed
+manual smoke. A fresh fixture is awaiting its Update click and normal exit.
+Pushing this tested tranche to obtain hosted CI does not close that remaining
+merge gate or authorize merging or publishing.
 
 ## Qualification preparation — occurrence selector and operator preflight
 
