@@ -551,7 +551,9 @@ static func _skip_jsonc_comment_at(text: String, i: int) -> int:
 		return i
 	if text[i + 1] == "/":
 		i += 2
-		while i < n and text[i] != "\n":
+		# `get_as_text()` keeps CR, so a CR-only file never presents a `\n` and
+		# a `\n`-only terminator would swallow the rest of the file.
+		while i < n and text[i] != "\n" and text[i] != "\r":
 			i += 1
 		return i
 	if text[i + 1] == "*":

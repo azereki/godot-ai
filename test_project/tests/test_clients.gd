@@ -4469,6 +4469,34 @@ func test_strip_jsonc_does_not_glue_tokens_across_a_comment() -> void:
 	)
 
 
+func test_strip_jsonc_terminates_line_comments_on_cr() -> void:
+	## `get_as_text()` keeps CR, so a CR-only file gives the scanner no `\n`.
+	## Ending the comment only on `\n` would swallow the JSON behind it.
+	var stripped := McpJsonStrategy._strip_jsonc("// header\r{\"a\": 1}\r")
+	assert_true(stripped.get("ok", false))
+	var parsed: Variant = JSON.parse_string(str(stripped.get("text", "")))
+	assert_true(parsed is Dictionary, "a CR-terminated comment must not eat the object")
+	if parsed is Dictionary:
+		assert_eq(parsed.get("a"), 1.0)
+
+
+func test_json_jsonc_read_handles_cr_only_line_endings() -> void:
+	var path := _scratch_dir.path_join("jsonc_cr_only.json")
+	_write_text(path, "// header\r{\r\t\"mcpServers\": {}\r}\r")
+	var client := _make_test_json_client(path)
+	client.config_allows_comments = true
+	client.automatic_config_edits = false
+
+	var details := McpJsonStrategy.check_status_details(client, "godot-ai", "http://x")
+	_remove_if_exists(path)
+
+	assert_eq(
+		details.get("status"),
+		McpClient.Status.NOT_CONFIGURED,
+		"CR-only JSONC must read, not error: %s" % String(details.get("error_msg", "")),
+	)
+
+
 func test_strip_jsonc_keeps_block_comment_newlines() -> void:
 	## So JSON.parse error lines still point at the user's source line.
 	var stripped := McpJsonStrategy._strip_jsonc("/* one\ntwo */{\"a\": 1}")
