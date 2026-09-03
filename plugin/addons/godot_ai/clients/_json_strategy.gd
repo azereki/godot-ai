@@ -825,9 +825,13 @@ static func _text_remove_server_entry(text: String, key_path: PackedStringArray,
 	# itself stays in `text` so the byte-survival F5 contract still holds
 	# (codex round 3, F-3-6 — without it, files saved with a Windows BOM
 	# left the entry in place after Remove).
-	while cursor < text.length() and _is_json_ws(text[cursor]):
-		cursor += 1
+	# The BOM can only ever be byte 0, so it is skipped BEFORE the whitespace
+	# walk: a file saved as BOM + newline + `{` (common from Windows editors)
+	# otherwise leaves the cursor on the newline, the root `{` is never
+	# consumed, and the entry silently survives Remove.
 	if cursor < text.length() and text[cursor] == "﻿":
+		cursor += 1
+	while cursor < text.length() and _is_json_ws(text[cursor]):
 		cursor += 1
 	if cursor < text.length() and (text[cursor] == "{" or text[cursor] == "["):
 		cursor += 1
