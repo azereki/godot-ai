@@ -568,18 +568,45 @@ func _move(old_path: String, new_path: String) -> Dictionary:
 		return ErrorCodes.make(
 			ErrorCodes.INTERNAL_ERROR,
 			"Failed to create directory %s: %s" % [parent_dir, error_string(mkdir_err)])
+	# Sidecars that will travel with a single file. Their destinations are
+	# preflighted like the file's own, so a stray `foo.gd.uid` at the target
+	# is refused before anything moves instead of failing halfway.
+	var sidecars: Array[String] = []
+	if not is_dir:
+		for suffix in _SIDECAR_SUFFIXES:
+			if FileAccess.file_exists(old_path + suffix):
+				sidecars.append(suffix)
+				var side_target := new_path + suffix
+				if not case_only and (FileAccess.file_exists(side_target) or DirAccess.dir_exists_absolute(side_target)):
+					return ErrorCodes.make(
+						ErrorCodes.INVALID_PARAMS,
+						"new_path already exists: %s (the sidecar of %s would be overwritten)" % [side_target, old_path])
 	var rename_err := DirAccess.rename_absolute(old_path, new_path)
 	if rename_err != OK:
 		return ErrorCodes.make(
 			ErrorCodes.INTERNAL_ERROR,
 			"Failed to move %s to %s: %s" % [old_path, new_path, error_string(rename_err)])
+	# The file and its sidecars move as one unit: a sidecar rename that
+	# still fails (the disk changed under us) rolls the whole move back
+	# rather than leaving `foo.gd` and `foo.gd.uid` in different folders and
+	# reporting success.
+	var moved_sidecars: Array[String] = []
+	for suffix in sidecars:
+		var side_err := DirAccess.rename_absolute(old_path + suffix, new_path + suffix)
+		if side_err == OK:
+			moved_sidecars.append(suffix)
+			continue
+		var rollback: Array[String] = []
+		for done in moved_sidecars:
+			if DirAccess.rename_absolute(new_path + done, old_path + done) != OK:
+				rollback.append(new_path + done)
+		if DirAccess.rename_absolute(new_path, old_path) != OK:
+			rollback.append(new_path)
+		var message := "Failed to move sidecar %s: %s; the move was rolled back" % [old_path + suffix, error_string(side_err)]
+		if not rollback.is_empty():
+			message += " except for %s, which could not be moved back" % ", ".join(rollback)
+		return ErrorCodes.make(ErrorCodes.INTERNAL_ERROR, message)
 	var warnings: Array[String] = []
-	if not is_dir:
-		for suffix in _SIDECAR_SUFFIXES:
-			if FileAccess.file_exists(old_path + suffix):
-				var side_err := DirAccess.rename_absolute(old_path + suffix, new_path + suffix)
-				if side_err != OK:
-					warnings.append("Failed to move sidecar %s: %s" % [old_path + suffix, error_string(side_err)])
 
 	# 5. Loaded copies keep working under the new path, so an open scene
 	# whose script just moved saves the new path rather than the stale one.

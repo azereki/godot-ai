@@ -517,6 +517,28 @@ func test_move_file_refuses_existing_destination() -> void:
 	_fs_cleanup_move_fixtures()
 
 
+func test_move_file_refuses_when_sidecar_destination_is_taken() -> void:
+	## A stray folder sitting where the `.uid` sidecar would land must be
+	## refused up front — the file and its sidecar move as one unit, never
+	## halfway.
+	_fs_cleanup_move_fixtures()
+	var uid := _fs_write_script_with_uid(FS_SRC_SCRIPT)
+	if not FileAccess.file_exists(FS_SRC_SCRIPT + ".uid"):
+		_fs_cleanup_move_fixtures()
+		skip("no .uid sidecar was minted for the fixture")
+		return
+	DirAccess.make_dir_recursive_absolute(FS_DST_SCRIPT + ".uid")
+	var result := _handler.move_file({"path": FS_SRC_SCRIPT, "new_path": FS_DST_SCRIPT})
+	assert_is_error(result, ErrorCodes.INVALID_PARAMS)
+	assert_contains(result.error.message, "sidecar")
+	assert_true(FileAccess.file_exists(FS_SRC_SCRIPT), "source untouched on refusal")
+	assert_true(FileAccess.file_exists(FS_SRC_SCRIPT + ".uid"), "source sidecar untouched on refusal")
+	assert_false(FileAccess.file_exists(FS_DST_SCRIPT), "nothing landed at the destination")
+	assert_eq(ResourceUID.get_id_path(uid), FS_SRC_SCRIPT, "ResourceUID still points at the source")
+	DirAccess.remove_absolute(FS_DST_SCRIPT + ".uid")
+	_fs_cleanup_move_fixtures()
+
+
 func test_move_file_missing_source() -> void:
 	var result := _handler.move_file({
 		"path": "res://tests/_mcp_fs_nope.txt", "new_path": "res://tests/_mcp_fs_nope_2.txt",
