@@ -709,6 +709,12 @@ func _on_dock_settings_apply_requested(changes: Dictionary, reload: bool) -> voi
 	if not bool(applied.get("ok", false)):
 		push_error("MCP | refused settings change: %s" % str(applied.get("error", "invalid settings")))
 		return
+	## #913: the setting is persisted, so push any opt-out to the live server —
+	## the reload below replaces this plugin, not a server it merely adopted.
+	## Best-effort: the reload may cut the socket first, and the reconnect
+	## re-asserts it from `Telemetry._on_connection_state_changed` anyway.
+	if _telemetry != null:
+		_telemetry.assert_opt_out()
 	if reload:
 		_on_dock_plugin_reload_requested("endpoint_settings")
 

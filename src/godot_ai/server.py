@@ -65,8 +65,8 @@ from godot_ai.sessions.registry import SessionRegistry
 from godot_ai.telemetry import (
     MilestoneType,
     RecordType,
-    TelemetryConfig,
     install_fastmcp_wraps,
+    live_telemetry_enabled,
     record_milestone,
     record_telemetry,
     shutdown_if_initialized,
@@ -710,10 +710,10 @@ def create_server(
                 ## ``instance_id`` it belongs to, so it cannot be stale
                 ## relative to that instance.
                 "active_lease_count": leases.active_count(),
-                ## Live env re-read so the dock can show what this process
-                ## will actually send. Advisory only — this route does not
-                ## accept an opt-out mutation (upstream PR #931 / issue #913).
-                "telemetry_enabled": not TelemetryConfig._is_disabled_via_env(),
+                ## Live read of what this process will actually send: env vars
+                ## plus any opt-out latched over the WebSocket (#913). Report
+                ## only — that WebSocket is the opt-out channel, not this route.
+                "telemetry_enabled": live_telemetry_enabled(),
             }
         )
 

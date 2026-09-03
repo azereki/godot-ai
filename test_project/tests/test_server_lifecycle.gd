@@ -444,6 +444,39 @@ func test_status_projection_keeps_instance_and_whitelisted_values() -> void:
 	assert_false(projected.has("secret"))
 
 
+func test_status_projection_surfaces_telemetry_enabled() -> void:
+	## #913: the tooltip reads the live server's state from this projection,
+	## never from EditorSettings — that is what stops the two disagreeing.
+	var off := Lifecycle.project_status_payload({
+		"name": "godot-ai", "telemetry_enabled": false,
+	})
+	assert_true(off.has("telemetry_enabled"))
+	assert_eq(off.get("telemetry_enabled"), false)
+	var on := Lifecycle.project_status_payload({
+		"name": "godot-ai", "telemetry_enabled": true,
+	})
+	assert_eq(on.get("telemetry_enabled"), true)
+
+
+func test_status_projection_leaves_telemetry_enabled_absent_on_old_backend() -> void:
+	## Same absent-stays-absent rule the lease count follows: "too old to
+	## publish it" must stay distinguishable from an explicit false, so the
+	## dock shows nothing rather than a state it cannot know.
+	var projected := Lifecycle.project_status_payload({
+		"name": "godot-ai", "server_version": "3.0.6",
+	})
+	assert_false(projected.has("telemetry_enabled"))
+
+
+func test_status_projection_rejects_a_non_bool_telemetry_value() -> void:
+	## A garbled backend must not push a truthy string into the field the
+	## dock renders a privacy claim from.
+	var projected := Lifecycle.project_status_payload({
+		"name": "godot-ai", "telemetry_enabled": "true",
+	})
+	assert_false(projected.has("telemetry_enabled"))
+
+
 func test_replacement_target_match_is_instance_and_version_bound() -> void:
 	var target := {"instance_id": INSTANCE, "version": "4.0.1"}
 	var live := {

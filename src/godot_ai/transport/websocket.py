@@ -29,10 +29,11 @@ from godot_ai.protocol.envelope import (
     PluginTelemetryEvent,
     ReadinessChangedEvent,
     SceneChangedEvent,
+    TelemetryOptOutEvent,
 )
 from godot_ai.services.custom_tool_service import CustomToolDefinition, CustomToolService
 from godot_ai.sessions.registry import Session, SessionRegistry
-from godot_ai.telemetry import RecordType, record_telemetry
+from godot_ai.telemetry import RecordType, latch_runtime_opt_out, record_telemetry
 from godot_ai.transport.origin_guard import make_websocket_request_guard
 
 logger = logging.getLogger(__name__)
@@ -269,6 +270,11 @@ _PLUGIN_EVENT_NAMES: frozenset[str] = frozenset(
         "dev_server_toggle",
     }
 )
+## #913. Twinned with ``telemetry.gd::OPT_OUT_EVENT``, locked by
+## test_telemetry_event_name_parity.py — a one-sided rename would silently
+## stop delivering opt-outs. Not in ``_PLUGIN_EVENT_NAMES``: that allowlist
+## gates events the server *records*, and this is the opposite.
+TELEMETRY_OPT_OUT_EVENT = "telemetry_opt_out"
 _SELF_UPDATE_STATUSES: frozenset[str] = frozenset(
     {"success", "failed_clean", "failed_mixed", "unknown"}
 )
@@ -749,6 +755,19 @@ class GodotWebSocketServer:
                     logger.debug(
                         "Dropping plugin_event with unknown name %r from %s",
                         payload.name,
+                        session_id[:8],
+                    )
+            elif event == TELEMETRY_OPT_OUT_EVENT:
+                ## #913: an editor that adopted this server cannot put
+                ## GODOT_AI_DISABLE_TELEMETRY in our environment, so it says so
+                ## here — authenticated and instance-bound, past the registry
+                ## check above, while status/lease stays read-only. Latching
+                ## and one-way; holds until this process is replaced.
+                TelemetryOptOutEvent.model_validate(event_data)
+                if latch_runtime_opt_out():
+                    logger.info(
+                        "Session %s opted this server out of telemetry for the "
+                        "rest of its life; restart it to re-enable.",
                         session_id[:8],
                     )
         except ValidationError as exc:

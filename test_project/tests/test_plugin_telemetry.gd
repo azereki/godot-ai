@@ -66,6 +66,16 @@ func _clear_telemetry_env_vars() -> void:
 	OS.unset_environment(_TENV2)
 
 
+## Frames the telemetry pipeline actually recorded, ignoring the opt-out
+## control frame that rides the same connection.
+func _plugin_event_count(conn) -> int:
+	var count := 0
+	for entry in conn.sent:
+		if str(entry.get("event", "")) == "plugin_event":
+			count += 1
+	return count
+
+
 # ----- opt-out -----
 
 func test_disabled_when_editor_setting_is_false() -> void:
@@ -191,7 +201,12 @@ func test_buffered_events_flush_when_connection_signal_fires() -> void:
 	conn.flip_connected(true)
 
 	assert_eq(t._test_pending_count(), 0, "Buffer must drain on connection_state_changed(true)")
-	assert_eq(conn.sent.size(), 2, "Both buffered events should ship without a third record_event call")
+	## Count plugin_event frames rather than everything on the wire: the same
+	## signal also asserts a telemetry opt-out when this editor is opted out
+	## (#913), which CI always is via GODOT_AI_DISABLE_TELEMETRY. That frame
+	## is not a buffered record and must not be counted as one.
+	assert_eq(_plugin_event_count(conn), 2,
+		"Both buffered events should ship without a third record_event call")
 
 
 func test_buffer_drops_oldest_at_cap() -> void:
@@ -206,3 +221,92 @@ func test_buffer_drops_oldest_at_cap() -> void:
 
 	assert_eq(t._test_pending_count(), Telemetry._MAX_BUFFER,
 		"Buffer must clamp at _MAX_BUFFER and silently drop overflow")
+
+
+# ----- runtime opt-out to an adopted server (#913) -----
+
+func test_opt_out_is_asserted_on_connect_when_editor_is_opted_out() -> void:
+	## #913: a server this plugin adopted never saw the opt-out env var, and
+	## the editor cannot write another process's environment. The handshake
+	## is where we tell it, over the authenticated WebSocket.
+	_clear_telemetry_env_vars()
+	EditorInterface.get_editor_settings().set_setting(
+		McpSettings.SETTING_TELEMETRY_ENABLED, false
+	)
+	var conn := StubConnection.new()
+	conn.is_connected = false
+	var t := Telemetry.new(conn)
+	assert_true(t._disabled, "precondition: this editor is opted out")
+
+	conn.flip_connected(true)
+
+	assert_eq(conn.sent.size(), 1, "Opting out must reach the server on connect")
+	var payload: Dictionary = conn.sent[0]
+	assert_eq(payload["event"], Telemetry.OPT_OUT_EVENT)
+	assert_eq(payload["data"], {},
+		"The opt-out carries no payload — there is no field to re-enable with")
+
+
+func test_opt_out_is_not_sent_when_telemetry_is_enabled() -> void:
+	## Opt-out-only: an editor with telemetry on says nothing, so it cannot
+	## re-enable a server another editor already opted out.
+	_clear_telemetry_env_vars()
+	EditorInterface.get_editor_settings().set_setting(
+		McpSettings.SETTING_TELEMETRY_ENABLED, true
+	)
+	var conn := StubConnection.new()
+	conn.is_connected = true
+	var t := Telemetry.new(conn)
+
+	var sent := t.assert_opt_out()
+
+	assert_false(sent, "assert_opt_out must report that it sent nothing")
+	assert_eq(conn.sent.size(), 0, "An enabled editor must put nothing on the wire")
+
+
+func test_opt_out_reads_the_setting_live_not_the_disabled_snapshot() -> void:
+	## The dock applies the checkbox and then asks us to push it, before the
+	## reload swaps this instance out. `_disabled` still says "enabled", so
+	## reading it would drop the opt-out the user just asked for.
+	_clear_telemetry_env_vars()
+	EditorInterface.get_editor_settings().set_setting(
+		McpSettings.SETTING_TELEMETRY_ENABLED, true
+	)
+	var conn := StubConnection.new()
+	conn.is_connected = true
+	var t := Telemetry.new(conn)
+	assert_false(t._disabled, "precondition: constructed while telemetry was on")
+
+	EditorInterface.get_editor_settings().set_setting(
+		McpSettings.SETTING_TELEMETRY_ENABLED, false
+	)
+	var sent := t.assert_opt_out()
+
+	assert_true(sent, "the freshly applied opt-out must ship")
+	assert_eq(conn.sent.size(), 1)
+	assert_eq(conn.sent[0]["event"], Telemetry.OPT_OUT_EVENT)
+
+
+func test_opt_out_is_not_buffered_when_disconnected() -> void:
+	## Re-asserted on every connect, so buffering it would only stack
+	## duplicates for a server already due to be told at handshake.
+	_clear_telemetry_env_vars()
+	EditorInterface.get_editor_settings().set_setting(
+		McpSettings.SETTING_TELEMETRY_ENABLED, false
+	)
+	var conn := StubConnection.new()
+	conn.is_connected = false
+	var t := Telemetry.new(conn)
+
+	var sent := t.assert_opt_out()
+
+	assert_false(sent, "nothing to send while the socket is down")
+	assert_eq(conn.sent.size(), 0)
+	assert_eq(t._test_pending_count(), 0, "the opt-out must not enter the record buffer")
+
+
+func test_opt_out_is_outside_the_recorded_event_allowlist() -> void:
+	## It tells the server to stop recording; it is not itself a record.
+	assert_eq(Telemetry.OPT_OUT_EVENT, "telemetry_opt_out")
+	assert_false(Telemetry._ALLOWED_EVENTS.has(Telemetry.OPT_OUT_EVENT),
+		"the opt-out must never be forwarded into the telemetry pipeline")

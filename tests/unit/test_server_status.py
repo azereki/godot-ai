@@ -13,7 +13,7 @@ from godot_ai.protocol.attach import (
     SERVER_INSTANCE_ID,
     owner_type_from_env,
 )
-from godot_ai.telemetry import TelemetryConfig
+from godot_ai.telemetry import TelemetryConfig, latch_runtime_opt_out
 from tests.conftest import (
     TEST_HTTP_AUTH_HEADERS,
     TEST_TRANSPORT_CAPABILITIES,
@@ -91,7 +91,7 @@ def test_status_route_reports_live_server_version():
 
 def test_status_route_telemetry_enabled_rereads_env(monkeypatch) -> None:
     ## Prove a live env re-read on an already-constructed server, not a
-    ## construction-time snapshot (upstream PR #931 / issue #913).
+    ## construction-time snapshot (#913).
     monkeypatch.delenv("GODOT_AI_DISABLE_TELEMETRY", raising=False)
     monkeypatch.delenv("DISABLE_TELEMETRY", raising=False)
     server = create_server(ws_port=9557)
@@ -111,6 +111,32 @@ def test_status_route_telemetry_enabled_rereads_env(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["telemetry_enabled"] is False
+
+
+def test_status_route_telemetry_enabled_reflects_the_runtime_latch(isolated_data_dir) -> None:
+    ## #913: the dock renders its privacy claim from this field, so it must
+    ## account for a latched opt-out and not just the env vars — otherwise it
+    ## reports "on" for a server that already stopped sending.
+    ## ``isolated_data_dir`` clears the env vars and resets the latch after,
+    ## which a one-way latch needs or every later test loses telemetry.
+    server = create_server(ws_port=9558)
+    app = server.http_app(transport="streamable-http")
+    client = TestClient(
+        app,
+        base_url="http://127.0.0.1",
+        headers=TEST_HTTP_AUTH_HEADERS,
+    )
+
+    assert client.get("/godot-ai/status").json()["telemetry_enabled"] is True
+
+    latch_runtime_opt_out()
+
+    response = client.get("/godot-ai/status")
+    assert response.status_code == 200
+    assert response.json()["telemetry_enabled"] is False
+    ## Reporting an opt-out is not accepting one: the route still 200s
+    ## and serves the same payload.
+    assert response.json()["name"] == "godot-ai"
 
 
 def test_status_route_package_path_points_at_loaded_package_dir():

@@ -89,17 +89,40 @@ spawns). Attach entries written before the toggle changed read as
 `configured_mismatch` — re-run Configure so the client relaunches the bridge
 with the current preference.
 
-Apply & Restart does **not** mutate the environment of a server the plugin
-adopted rather than spawned (a hand-started dev server, CI backend, or
-attach-owned process). That process keeps whatever telemetry state it was born
-with until *its* environment changes or it is replaced. `/godot-ai/status`
-publishes `telemetry_enabled` from a live env re-read so the dock can show when
-the checkbox and the running server disagree; it is a report, not an opt-out
-channel. This behavior was ported from upstream PR #931 (issue #913).
+### Reaching a server the plugin did not spawn
 
-Record/send paths in an already-running Python process re-read
+Spawn-time environment injection only covers servers the plugin started. A
+server it *adopted* — a hand-started dev server, a CI backend, an attach-owned
+process — never saw the env var, and the editor cannot write another process's
+environment. Applying the checkbox therefore also sends a `telemetry_opt_out`
+event over the WebSocket the plugin is already authenticated on (issue #913).
+The receiving server stops sending immediately.
+
+Four properties of that channel, since it is a privacy contract:
+
+- **Authenticated and instance-bound.** It rides the mutually authenticated
+  per-backend WebSocket, after a completed handshake, and only from a session
+  the server has registered. The loopback `/godot-ai/status` and lease routes
+  stay strictly read-only — no opt-out is accepted there.
+- **Opt-out only.** The event is field-free. There is no "enable" message on
+  the wire and no un-latch on the server, so on a backend shared by several
+  editors the most restrictive preference wins: one editor can never turn
+  telemetry back on for another.
+- **Latching, not persistent.** The opt-out holds for the rest of that
+  process's life and is written nowhere. Re-checking the box takes effect when
+  the server is replaced; a replacement reads the env var / EditorSetting at
+  spawn as it always has.
+- **Re-asserted on every connect,** so a reconnect after a plugin reload — or a
+  fresh editor attaching to an already-running server — re-delivers it.
+
+`/godot-ai/status` publishes `telemetry_enabled` from a live read of the env
+vars *and* the runtime latch, so the dock reports what the running server will
+actually send. A server too old to publish the field omits it, and the dock
+shows nothing rather than guessing.
+
+Record/send paths in an already-running Python process also re-read
 `GODOT_AI_DISABLE_TELEMETRY` / `DISABLE_TELEMETRY` on each event, so a later
-in-process opt-out takes effect without reconstructing the collector.
+in-process env change takes effect without reconstructing the collector.
 
 ### Via environment variable
 
@@ -128,6 +151,13 @@ no UUID is generated, no worker thread is spawned, and no data directory
 is created. Existing local telemetry files (`customer_uuid.txt`,
 `milestones.json`) are deleted on the next server startup. The plugin-side
 helper honors the same variables and stops buffering events.
+
+A *runtime* opt-out — a later in-process env change, or the latched
+`telemetry_opt_out` event — arrives after those startup decisions were already
+made, so it is narrower: records and sends stop immediately, but an already-
+spawned worker thread stays idle rather than exiting and local files already on
+disk are left alone. They are cleaned up the next time that server starts with
+telemetry disabled.
 
 ## Endpoint configuration
 

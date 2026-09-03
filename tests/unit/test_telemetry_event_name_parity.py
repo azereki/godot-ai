@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from godot_ai.transport.websocket import _PLUGIN_EVENT_NAMES
+from godot_ai.transport.websocket import _PLUGIN_EVENT_NAMES, TELEMETRY_OPT_OUT_EVENT
 
 TELEMETRY_GD = (
     Path(__file__).resolve().parents[2]
@@ -32,6 +32,7 @@ _ALLOWLIST_BLOCK_RE = re.compile(
     r"const\s+_ALLOWED_EVENTS\s*:=\s*\[(?P<body>.*?)\]", re.DOTALL
 )
 _NAME_RE = re.compile(r'"([a-z0-9_]+)"')
+_OPT_OUT_CONST_RE = re.compile(r'const\s+OPT_OUT_EVENT\s*:=\s*"([a-z0-9_]+)"')
 
 
 def _parse_gdscript_allowlist() -> frozenset[str]:
@@ -67,3 +68,33 @@ def test_dev_transport_env_twin_matches_asgi() -> None:
     from godot_ai import asgi, orphan_reaper
 
     assert orphan_reaper.DEV_TRANSPORT_ENV == asgi.DEV_TRANSPORT_ENV
+
+
+def test_runtime_opt_out_event_name_twins_match() -> None:
+    """#913: the opt-out event name is a twin like the allowlist above.
+
+    Both sides drop unknown event names silently, so a rename on one side
+    alone would stop delivering opt-outs to adopted servers with nothing
+    failing — the exact silent-privacy-regression shape this contract test
+    exists to prevent.
+    """
+    text = TELEMETRY_GD.read_text(encoding="utf-8")
+    match = _OPT_OUT_CONST_RE.search(text)
+    assert match is not None, (
+        "Could not find `const OPT_OUT_EVENT := \"...\"` in telemetry.gd — "
+        "if the declaration moved or was renamed, update this regex so the "
+        "opt-out contract stays enforced."
+    )
+    assert match.group(1) == TELEMETRY_OPT_OUT_EVENT, (
+        "telemetry.gd OPT_OUT_EVENT (%s) and websocket.py "
+        "TELEMETRY_OPT_OUT_EVENT (%s) have drifted. Update both together."
+        % (match.group(1), TELEMETRY_OPT_OUT_EVENT)
+    )
+
+
+def test_opt_out_event_is_not_in_the_recorded_event_allowlist() -> None:
+    """The opt-out tells the server to stop recording; it is not itself a
+    record. Leaking it into either allowlist would both break the two-way
+    set equality above and turn a privacy signal into a telemetry event."""
+    assert TELEMETRY_OPT_OUT_EVENT not in _PLUGIN_EVENT_NAMES
+    assert TELEMETRY_OPT_OUT_EVENT not in _parse_gdscript_allowlist()

@@ -502,3 +502,96 @@ class TestPluginEventAllowlist:
 
         plugin_events = [r for r in captured if r.record_type is tel.RecordType.PLUGIN_EVENT]
         assert plugin_events == []
+
+
+# --- runtime telemetry opt-out (#913) ------------------------------------
+
+
+class TestRuntimeTelemetryOptOut:
+    """The wire half of #913: how the latch is reached, and how it cannot be.
+
+    ``test_telemetry.py::TestRuntimeOptOutLatch`` owns what the latch means."""
+
+    @staticmethod
+    def _registry_with_session() -> SessionRegistry:
+        reg = SessionRegistry()
+        reg.register(
+            Session(
+                session_id="demo@a3f2",
+                godot_version="4.4.1",
+                project_path="/tmp/demo",
+                plugin_version="0.0.1",
+            )
+        )
+        return reg
+
+    def _dispatch(self, reg: SessionRegistry, session_id: str, event_data) -> None:
+        _run_handle_event(
+            types.SimpleNamespace(registry=reg),  # type: ignore[arg-type]
+            session_id,
+            {"type": "event", "event": "telemetry_opt_out", "data": event_data},
+        )
+
+    def test_event_latches_the_process_off(self, captured) -> None:
+        reg = self._registry_with_session()
+        assert tel.live_telemetry_enabled() is True
+
+        self._dispatch(reg, "demo@a3f2", {})
+
+        assert tel.runtime_opt_out_latched() is True
+        assert tel.live_telemetry_enabled() is False
+
+    def test_latched_server_records_nothing_further(self, captured) -> None:
+        ## The point of the exercise: after the opt-out lands, the adopted
+        ## server stops producing records.
+        reg = self._registry_with_session()
+        ## Registering queues a connect record. Drain it *before* latching —
+        ## the fixture swaps ``_send`` for a list append, so the worker can
+        ## still deliver it after a later clear and fail the assert below.
+        _wait_for(captured, 1)
+        captured.clear()
+        self._dispatch(reg, "demo@a3f2", {})
+
+        tel.record_telemetry(tel.RecordType.USAGE, {"x": 1}, session_id="demo@a3f2")
+        _wait_for(captured, 1, timeout=0.3)
+
+        assert captured == []
+
+    def test_unregistered_session_cannot_latch(self, captured) -> None:
+        ## Authentication is what puts a session in the registry, and
+        ## ``_handle_event`` returns early without one — so the opt-out
+        ## inherits that gate rather than being reachable on its own.
+        reg = SessionRegistry()
+
+        self._dispatch(reg, "ghost@0000", {})
+
+        assert tel.runtime_opt_out_latched() is False
+        assert tel.live_telemetry_enabled() is True
+
+    def test_malformed_payload_is_dropped_without_latching(self, captured) -> None:
+        ## Dropped like any other malformed event on this channel, and it
+        ## must not latch on the way out — a garbled frame is not a decision.
+        reg = self._registry_with_session()
+
+        self._dispatch(reg, "demo@a3f2", "not-a-dict")
+
+        assert tel.runtime_opt_out_latched() is False
+        assert tel.live_telemetry_enabled() is True
+
+    def test_extra_payload_fields_cannot_re_enable_telemetry(self, captured) -> None:
+        ## Field-free on purpose: no "enabled" flag for a hostile or stale
+        ## plugin to set. Extras are ignored; the frame means one thing.
+        reg = self._registry_with_session()
+
+        self._dispatch(reg, "demo@a3f2", {"enabled": True, "telemetry_enabled": True})
+
+        assert tel.live_telemetry_enabled() is False
+
+    def test_repeat_events_stay_latched(self, captured) -> None:
+        ## Every reconnect re-asserts it, so a replay must be inert.
+        reg = self._registry_with_session()
+        self._dispatch(reg, "demo@a3f2", {})
+        self._dispatch(reg, "demo@a3f2", {})
+        self._dispatch(reg, "demo@a3f2", {})
+
+        assert tel.live_telemetry_enabled() is False
