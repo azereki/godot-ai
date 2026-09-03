@@ -13,6 +13,9 @@ func _init() -> void:
 	## comments would make the shared JSON strategy much harder to trust. Keep
 	## status checks read-only and give users the exact manual entry instead.
 	automatic_config_edits = false
+	## Reads still have to cope with the `//` header Zed ships, or a stock
+	## install shows a parse error in the row instead of a status.
+	config_allows_comments = true
 	path_template = {
 		"darwin": "~/.config/zed/settings.json",
 		"linux": "$XDG_CONFIG_HOME/zed/settings.json",

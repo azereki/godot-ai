@@ -56,6 +56,13 @@ var config_type: String = ""                     ## "json" | "toml" | "yaml" | "
 ## return the existing manual instructions without touching the file.
 var automatic_config_edits: bool = true
 
+## True when the config file is JSONC (Zed ships a `//` header). Honored by the
+## JSON strategy's reads only — comments are stripped from a throwaway parse
+## copy, so the row shows a real status instead of a permanent parse error
+## (#914). Requires `automatic_config_edits = false`; the strategy ignores it
+## otherwise rather than let a re-serializing Configure drop the comments.
+var config_allows_comments: bool = false
+
 # JSON / TOML clients ------------------------------------------------------
 ## {"darwin": "~/...", "windows": "$APPDATA/...", "linux": "$XDG_CONFIG_HOME/..."}
 ## Keys may also use "unix" as a shorthand for darwin+linux.
