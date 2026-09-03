@@ -17,7 +17,11 @@ Origin: Discord report (SloppyMayor, 2026-07-21/22, Godot 4.7.1 + plugin
 (`test_handler.gd:51` → `test_runner.gd:110-172`). The WebSocket is serviced
 only by `McpConnection._process` (`connection.gd:124-154`); the Python server
 uses `websockets` default heartbeats (20 s ping interval / 20 s timeout, no
-overrides at `websocket.py:140`). Any suite whose synchronous run exceeds
+overrides at `websocket.py:140`). *Since #958 the server pins these
+explicitly — `DEFAULT_KEEPALIVE_PING_INTERVAL_SECONDS` (20 s) and
+`DEFAULT_KEEPALIVE_PING_TIMEOUT_SECONDS` (60 s) in
+`transport/websocket.py` — so the starvation threshold below is now
+~20–80 s rather than ~20–40 s; the servicing design is unchanged.* Any suite whose synchronous run exceeds
 ~20–40 s starves the pong; the server closes the socket (1011), unregisters
 the session (`websocket.py:354-374`), and fails the in-flight `test_run`
 future with `ConnectionError`. The 120 s `TEST_RUN_TIMEOUT_SEC` never fires —
