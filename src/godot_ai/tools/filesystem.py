@@ -54,10 +54,12 @@ Ops:
         Default: OS trash. Known references block unless force=True; force
         never overrides incomplete discovery or protected paths. Permanent
         deletion supports files only. Directory deletion uses trash.
-        Mutations require a direct call, not batch_execute. Directory results
-        set scan_required: call scan afterward. All mutations are non-undoable.
-        Errors report outcome unchanged/rolled_back/partial and actual affected
-        paths. Never blindly retry a partial result.
+
+move/rename/remove contract:
+  Mutations require a direct call, not batch_execute. Directory results set
+  scan_required: call scan afterward. All mutations are non-undoable. Errors
+  report outcome unchanged/rolled_back/partial and actual affected paths.
+  Never blindly retry a partial result.
 """
 
 

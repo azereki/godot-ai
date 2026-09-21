@@ -489,3 +489,37 @@ func _mutation_wait_import(path: String) -> bool:
 				return true
 		await (Engine.get_main_loop() as SceneTree).create_timer(0.05).timeout
 	return false
+
+
+func test_mutation_binary_owner_blocks_only_when_it_names_the_target() -> void:
+	_mutation_cleanup()
+	var source := MUTATION_ROOT + ".gd"
+	var destination := MUTATION_ROOT + "_moved.gd"
+	var unrelated := MUTATION_ROOT + "_unrelated.res"
+	var owner := MUTATION_ROOT + "_binary_owner.res"
+	_mutation_uid_script(source)
+	assert_eq(ResourceSaver.save(Gradient.new(), unrelated), OK, "unrelated binary fixture must save")
+	# An unrelated binary resource elsewhere in the project must not disable the op.
+	var moved: Dictionary = await Mutation.new().run({"path": source, "new_path": destination}, "move")
+	assert_has_key(moved, "data", str(moved))
+	assert_true(FileAccess.file_exists(destination), "move must proceed past an unrelated .res")
+	var back: Dictionary = await Mutation.new().run({"path": destination, "new_path": source}, "move")
+	assert_has_key(back, "data", str(back))
+	# A binary owner whose loader-reported dependencies name the target still refuses.
+	var holder := Resource.new()
+	holder.set_script(load(source))
+	assert_eq(ResourceSaver.save(holder, owner), OK, "binary owner fixture must save")
+	var named := false
+	for dependency in ResourceLoader.get_dependencies(owner):
+		named = named or source in dependency
+	assert_true(named, "fixture must actually depend on the script: " + str(ResourceLoader.get_dependencies(owner)))
+	var refused: Dictionary = await Mutation.new().run({"path": source, "new_path": destination}, "move")
+	assert_is_error(refused, "INVALID_PARAMS")
+	assert_contains(refused.error.message, "Binary owner")
+	assert_contains(refused.error.message, owner)
+	assert_true(FileAccess.file_exists(source), "refusal must leave the source in place")
+	assert_false(FileAccess.file_exists(destination))
+	for path in [unrelated, owner]:
+		DirAccess.remove_absolute(path)
+		EditorInterface.get_resource_filesystem().update_file(path)
+	_mutation_cleanup()

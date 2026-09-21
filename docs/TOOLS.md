@@ -247,8 +247,8 @@ fail-closed resource-group mutations. Moves carry `.uid`/`.import` sidecars and
 preserve verified UID references; they refuse literal-path dependencies,
 project-setting references, affected open scene tabs and missing destination
 parents. Automatic dependency rewriting is not supported. Discovery includes
-literal relative, `res://` and `uid://` references in .gd, .cs, .gdshader, .gdshaderinc, .tscn and .tres owners. Binary
-ownership, unreadable/oversized inputs and linked paths are refused, including
+literal relative, `res://` and `uid://` references in .gd, .cs, .gdshader, .gdshaderinc, .tscn and .tres owners. A binary
+`.res`/`.scn` owner that names a target, unreadable/oversized inputs and linked paths are refused, including
 when `force=true`; computed runtime paths are outside static owner discovery.
 Engine metadata, VCS internals and the loaded plugin implementation are excluded.
 

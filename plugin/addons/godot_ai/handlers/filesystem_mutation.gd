@@ -21,6 +21,7 @@ var _bytes := 0
 var _directories: Dictionary = {}
 var _fingerprints: Dictionary = {}
 var _fault := ""
+var _binary_dependencies: Dictionary = {}
 var _io: Callable
 
 ## Dispatch stays synchronous; the retained job owns work across frame yields.
@@ -261,7 +262,22 @@ func _read_bounded(path: String) -> Variant:
 func _references(path: String, bytes: PackedByteArray, targets: Dictionary) -> Array[Dictionary]:
 	var hits: Array[Dictionary] = []
 	if path.get_extension().to_lower() in ["res", "scn"]:
-		_fault = "Binary dependency discovery is unsupported for safe mutations: %s" % path
+		# Binary owners cannot be scanned for literals, so ask the loader what
+		# they depend on. Only one that names a target blocks the mutation; an
+		# unrelated exported .scn elsewhere in the project must not.
+		if not _binary_dependencies.has(path):
+			var named := {}
+			for dependency in ResourceLoader.get_dependencies(path):
+				for segment in dependency.split("::", false):
+					named[segment.to_lower()] = true
+			_binary_dependencies[path] = named
+		var named_dependencies: Dictionary = _binary_dependencies[path]
+		for target: String in targets:
+			var target_uid: int = targets[target].uid
+			var names_uid := target_uid != ResourceUID.INVALID_ID and named_dependencies.has(ResourceUID.id_to_text(target_uid).to_lower())
+			if names_uid or named_dependencies.has(target.to_lower()):
+				_fault = "Binary owner %s depends on %s; binary dependency discovery is unsupported for safe mutations" % [path, target]
+				return hits
 		return hits
 	# Compare paths conservatively across case-insensitive project volumes.
 	# A case-only false positive on a sensitive volume is a safe refusal.

@@ -23,7 +23,7 @@ const IMPORT_SIDECAR_SUFFIX := ".import"
 ## Shared single-flight latch for scan_filesystem. `is_scanning()` alone can't
 ## enforce single-flight: `EditorFileSystem.scan()` doesn't flip `is_scanning()`
 ## for a frame or two (hence _SCAN_START_GRACE_MSEC), so a second request landing
-## in that window would observe `false` and stack another scan() â€” the exact
+## in that window would observe `false` and stack another scan() — the exact
 ## stacked-worker SIGABRT this op exists to avoid (dsarno/godot#6). The latch is
 ## set before the first scan() and cleared when its settle coroutine finishes;
 ## concurrent requests coalesce onto the running scan instead of starting one.
@@ -81,7 +81,7 @@ func write_file(params: Dictionary) -> Dictionary:
 	if write_failure != null:
 		return write_failure
 
-	# Single-file register, not a full scan() â€” a scan() per write stacks
+	# Single-file register, not a full scan() — a scan() per write stacks
 	# filesystem WorkerThreadPool tasks under concurrent writes and can SIGABRT
 	# in the global-class update (see dsarno/godot#6 and create_script in
 	# script_handler.gd). update_file() is what reimport()/material/theme use.
@@ -97,7 +97,7 @@ func write_file(params: Dictionary) -> Dictionary:
 	}
 	var is_gdscript := path.ends_with(".gd")
 	## A .gd written through the filesystem tool used to skip the parse
-	## diagnostics create_script attaches (#714) â€” the agent's broken
+	## diagnostics create_script attaches (#714) — the agent's broken
 	## script reported plain success and the parse error surfaced only in
 	## later editor logs. Same shared check, same response fields. A bare
 	## ScriptHandler works here: the diagnostics path touches no instance
@@ -113,7 +113,7 @@ func write_file(params: Dictionary) -> Dictionary:
 	## #261): reply only once ResourceLoader can see the new resource (or the
 	## bounded window elapses), so write_file -> script_attach back-to-back
 	## can't 404 on the not-yet-imported script. This CHANGES write_file's
-	## response timing for that case â€” the reply lands up to
+	## response timing for that case — the reply lands up to
 	## McpResourceIO.IMPORT_SETTLE_MAX_MSEC later instead of immediately.
 	## Scoped to .gd: ResourceLoader never learns plain text files, so an
 	## unconditional wait would burn the full window on every fresh .txt.
@@ -173,7 +173,7 @@ func reimport(params: Dictionary) -> Dictionary:
 	if not skipped_non_imported.is_empty():
 		data["skipped_non_imported_hint"] = (
 			"%d path(s) are not imported resources. Their editor filesystem entry was "
-			+ "refreshed, but no import ran â€” a success here is not evidence that a "
+			+ "refreshed, but no import ran — a success here is not evidence that a "
 			+ "script parsed or that diagnostics were produced. Use script_patch/"
 			+ "script_create for GDScript diagnostics, or filesystem_manage(op=\"scan\") "
 			+ "for an asset the editor has not imported yet."
@@ -193,7 +193,7 @@ func reimport(params: Dictionary) -> Dictionary:
 ##
 ## Known edge: an asset the editor has never imported (just written, no scan
 ## yet) has no sidecar and reports as non-imported. That is accurate at the
-## moment of the call â€” `update_file()` did not import it either â€” and the
+## moment of the call — `update_file()` did not import it either — and the
 ## hint names `scan` as the way through.
 ##
 ## Behaviour is unchanged for every path: `update_file()` still runs on all of
@@ -223,7 +223,7 @@ func scan_filesystem(params: Dictionary) -> Dictionary:
 	var request_id: String = params.get("_request_id", "")
 	# Async path: a scan can't be awaited on the calling frame without freezing
 	# the editor, so hand control back to the dispatcher (DEFERRED_RESPONSE) and
-	# push the real reply from a static coroutine once the scan settles â€” by
+	# push the real reply from a static coroutine once the scan settles — by
 	# which point new class_names are registered.
 	if _connection != null and not request_id.is_empty():
 		_finish_scan_deferred(_connection, request_id, efs)
@@ -233,7 +233,7 @@ func scan_filesystem(params: Dictionary) -> Dictionary:
 	# (no connection) can't await, so kick a single-flight scan and return
 	# immediately without the settle confirmation. Respect the latch so we don't
 	# stack onto a deferred scan; don't set it (there's no coroutine here to
-	# clear it â€” the brief is_scanning() window covers the rest).
+	# clear it — the brief is_scanning() window covers the rest).
 	var already := _scan_in_flight or efs.is_scanning()
 	if not already:
 		efs.scan()
@@ -276,7 +276,7 @@ static func _settle_scan(
 		return
 	var classes_before := ProjectSettings.get_global_class_list().size()
 	# Single-flight via the shared `_scan_in_flight` latch (NOT is_scanning(),
-	# which lags scan() by a frame or two â€” see the latch declaration). Only the
+	# which lags scan() by a frame or two — see the latch declaration). Only the
 	# request that sets the latch calls scan(); concurrent requests coalesce and
 	# just await the running scan. This is what actually prevents the stacked
 	# scan() SIGABRT (dsarno/godot#6), even within the start-grace window.
