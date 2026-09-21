@@ -424,6 +424,8 @@ def test_main_preserves_failure_artifacts_and_never_replays_writes(smoke, monkey
 
     def tool(session, name, args, request_id, **kwargs):
         calls.append(name)
+        if name == "test_run":
+            return {"passed": 2}
         if name == phase:
             raise TimeoutError(f"{name} expired")
         return {}
@@ -432,6 +434,8 @@ def test_main_preserves_failure_artifacts_and_never_replays_writes(smoke, monkey
         clock.now = kwargs["deadline"] + 0.1
         return [], b"late image"
 
+    monkeypatch.setattr(module, "_check_editor_capture", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_check_game_rendering", lambda *a, **k: None)
     monkeypatch.setattr(module, "_initialize_session", initialize)
     monkeypatch.setattr(module, "_tool_call", tool)
     monkeypatch.setattr(module, "_wait_for_godot_session", lambda *a, **k: 0)
@@ -653,12 +657,14 @@ def test_cancelled_response_keeps_artifacts_and_single_stop(real_http_smoke, mon
         calls.append(name)
         if name == "project_manage":
             assert args == {"op": "stop"}
-        return {}
+        return {"passed": 2} if name == "test_run" else {}
     monkeypatch.setattr(module, "_tool_call", tool_call)
     def capture(*args, deadline):
         module._post("session", {}, deadline=deadline)
         raise AssertionError("dripping response must expire")
     monkeypatch.setattr(module, "_capture_attempt", capture)
+    monkeypatch.setattr(module, "_check_editor_capture", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_check_game_rendering", lambda *a, **k: None)
     assert module.main() == 1
     assert calls.count("project_run") == 1
     assert calls.count("scene_open") == 1

@@ -6,16 +6,14 @@ Drives a running Godot editor (launched separately by CI with a real
 rendering driver, typically under xvfb-run on Linux) through the MCP
 streamable-HTTP transport:
 
-  1. wait for the plugin's WebSocket session to register, streaming the
-     editor's own stdout (GODOT_EDITOR_LOG, default godot-editor.log) into
-     this log as it boots so a slow or stuck editor leaves a timeline
-  2. open res://capture_smoke.tscn (four colored quadrants)
+  1. wait for the plugin's WebSocket session to register
+  2. open res://capture_smoke.tscn (color quadrants and a midgray patch)
   3. run the project in that scene
   4. poll editor_state until is_playing=true AND game_capture_ready=true
   5. capture-and-check loop until CAPTURE_BUDGET_SEC elapses:
      call editor_screenshot(source="game"), decode the returned PNG,
      sample the centre of each quadrant, and pass when every sample
-     matches red / green / blue / white within tolerance
+     matches its expected sRGB color within tolerance
   6. stop the project
 
 The retry loop (not a fixed settle sleep) is deliberate: on GitHub's
@@ -71,18 +69,16 @@ HEADERS = {
 }
 
 SCENE_PATH = "res://capture_smoke.tscn"
-## (label, sample fraction x, sample fraction y, expected RGB)
+## The gray patch detects linear HDR pixels encoded directly as sRGB (#1058).
+## Broad primary-color tolerance catches wrong-source images; midgray tests gamma.
+## (label, sample fraction x, sample fraction y, expected RGB, tolerance)
 QUADRANTS = [
-    ("red", 0.25, 0.25, (255, 0, 0)),
-    ("green", 0.75, 0.25, (0, 255, 0)),
-    ("blue", 0.25, 0.75, (0, 0, 255)),
-    ("white", 0.75, 0.75, (255, 255, 255)),
+    ("red", 0.25, 0.25, (255, 0, 0), 40),
+    ("green", 0.75, 0.25, (0, 255, 0), 40),
+    ("blue", 0.25, 0.75, (0, 0, 255), 40),
+    ("white", 0.75, 0.75, (255, 255, 255), 40),
+    ("gray", 0.5, 0.5, (127, 127, 127), 1),
 ]
-## Generous tolerance: default Godot 2D rendering is gamma-correct and the
-## "pure red/green/blue" ColorRects come back as slightly darkened sRGB after
-## the framebuffer's linear → sRGB conversion. 40/255 easily covers that
-## while still catching "returned editor UI instead of game pixels".
-COLOR_TOLERANCE = 40
 ## Total wall-clock budget for the capture-and-check retry loop, and the
 ## pause between attempts. Sized against the macOS runner evidence: first
 ## presents have been observed lagging tens of seconds behind the helper's
@@ -98,21 +94,8 @@ DIAG_DIR = os.environ.get("CAPTURE_DIAG_DIR", "capture-smoke-diag")
 ## editor bridge is gone and the remaining minutes of ready-wait can only
 ## end in a misleading "never registered" timeout (#675).
 SESSION_LOSS_GRACE_SEC = 45.0
-## Editor-registration wait: how long the editor may take from launch to
-## its WebSocket session appearing in session_manage(op="list"). The poll
-## exits the moment the session registers, so the ceiling only costs time
-## when something is genuinely wrong.
-##
-## 240s, not 120 (2026-09-08, runs 34268748773 and 34270440762): the macOS
-## job failed twice in 39 runs with "Godot session never registered; last
-## err: None". Every poll got a clean count=0 reply, godot-editor.log held
-## only the engine banner and the Metal driver line, and mcp-server.log
-## showed no WebSocket attempt — the editor was still booting when the
-## budget ran out. Launch→registered measured over the preceding 41 passing
-## macOS runs: median 60s, p90 73s, max 90s (Linux 8–25s, Windows 20–57s)
-## against an effective ~125s budget, so the failures are the tail of that
-## distribution on a busy paravirtualized runner, not a connection bug.
-## 240s is ~2.7× the observed maximum; the CI step timeout covers it.
+
+
 SESSION_WAIT_SEC = float(os.environ.get("SESSION_WAIT_SEC", "240"))
 SESSION_POLL_DELAY_SEC = 2.0
 ## Cadence of the "[session-wait +Ns]" progress line. New editor-log lines
@@ -137,118 +120,6 @@ def _remaining_timeout(cap: float, deadline: float | None) -> float:
     if remaining <= 0:
         raise TimeoutError("Smoke phase deadline expired")
     return min(cap, remaining)
-
-
-async def _request_body(headers: dict, body: bytes, timeout: float, deadline: float | None):
-    network_deadline = time.monotonic() + _remaining_timeout(timeout, deadline)
-    try:
-        async with asyncio.timeout(_remaining_timeout(timeout, network_deadline)):
-            async with httpx.AsyncClient(follow_redirects=False) as client:
-                response = await client.post(
-                    SERVER_URL, headers=headers, content=body,
-                    timeout=_remaining_timeout(timeout, network_deadline),
-                )
-                response.raise_for_status()
-                return response.content, response.headers.get("mcp-session-id")
-    except TimeoutError as exc:
-        raise TimeoutError("Smoke HTTP network deadline expired") from exc
-    except httpx.HTTPStatusError as exc:
-        response = exc.response
-        raise urllib.error.HTTPError(
-            str(response.url), response.status_code, response.reason_phrase,
-            response.headers, io.BytesIO(response.content),
-        ) from exc
-    except httpx.TimeoutException as exc:
-        raise TimeoutError(str(exc)) from exc
-    except httpx.RequestError as exc:
-        raise urllib.error.URLError(str(exc)) from exc
-
-
-def _post(
-    session_id: str | None, body: dict, timeout: float = 10.0, *, deadline: float | None = None
-) -> dict:
-    headers = dict(HEADERS)
-    headers["Authorization"] = authorization_header(SERVER_URL)
-    if session_id:
-        headers["Mcp-Session-Id"] = session_id
-    # Async cancellation bounds network waits, including continuously arriving SSE
-    # pings; synchronous setup/parsing still relies on the late-result check.
-    payload, new_session = asyncio.run(_request_body(
-        headers, json.dumps(body).encode("utf-8"), timeout, deadline,
-    ))
-    raw = payload.decode("utf-8")
-    result = {"_session_id": new_session, "_raw": raw}
-    for line in raw.splitlines():
-        if line.startswith("data: "):
-            result.update(json.loads(line[6:]))
-            break
-    else:
-        try:
-            result.update(json.loads(raw))
-        except json.JSONDecodeError:
-            pass
-    _remaining_timeout(timeout, deadline)
-    return result
-
-
-def _tool_call(
-    session_id: str,
-    name: str,
-    args: dict,
-    request_id: int,
-    timeout: float = 30.0,
-    *,
-    deadline: float | None = None,
-) -> dict:
-    body = {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "tools/call",
-        "params": {"name": name, "arguments": args},
-    }
-    resp = _post(session_id, body, timeout=timeout, deadline=deadline)
-    if "error" in resp:
-        return {"error": resp["error"]}
-    ## Prefer structuredContent; fall back to the text block the transport
-    ## wraps around dict/list results.
-    result = resp.get("result", {})
-    if not isinstance(result, dict):
-        return {"unexpected_result": result}
-    value = result.get("structuredContent")
-    if not value:
-        value = {"_raw": resp.get("_raw", "")}
-        for block in result.get("content") or []:
-            if block.get("type") == "text":
-                try:
-                    value = json.loads(block["text"])
-                except json.JSONDecodeError:
-                    value = {"_text": block["text"]}
-                break
-    if result.get("isError") and not (isinstance(value, dict) and "error" in value):
-        return {"error": value}
-    return value
-
-
-
-def _initialize_session() -> str:
-    deadline = time.monotonic() + 20
-    body = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "ci-game-capture-smoke", "version": "1.0"},
-        },
-    }
-    resp = _post(None, body, deadline=deadline)
-    session_id = resp.get("_session_id")
-    if not session_id:
-        raw = resp.get("_raw", "")[:300]
-        raise RuntimeError(f"No Mcp-Session-Id in initialize response: {raw}")
-    _post(session_id, {"jsonrpc": "2.0", "method": "notifications/initialized"}, deadline=deadline)
-    return session_id
 
 
 class _EditorLogTail:
@@ -375,6 +246,119 @@ def _session_outcome(reply: object) -> dict[str, str]:
         "kind": "empty",
         "detail": "latest reply contained no sessions (count=0); the server answered",
     }
+
+
+
+async def _request_body(headers: dict, body: bytes, timeout: float, deadline: float | None):
+    network_deadline = time.monotonic() + _remaining_timeout(timeout, deadline)
+    try:
+        async with asyncio.timeout(_remaining_timeout(timeout, network_deadline)):
+            async with httpx.AsyncClient(follow_redirects=False) as client:
+                response = await client.post(
+                    SERVER_URL, headers=headers, content=body,
+                    timeout=_remaining_timeout(timeout, network_deadline),
+                )
+                response.raise_for_status()
+                return response.content, response.headers.get("mcp-session-id")
+    except TimeoutError as exc:
+        raise TimeoutError("Smoke HTTP network deadline expired") from exc
+    except httpx.HTTPStatusError as exc:
+        response = exc.response
+        raise urllib.error.HTTPError(
+            str(response.url), response.status_code, response.reason_phrase,
+            response.headers, io.BytesIO(response.content),
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise TimeoutError(str(exc)) from exc
+    except httpx.RequestError as exc:
+        raise urllib.error.URLError(str(exc)) from exc
+
+
+def _post(
+    session_id: str | None, body: dict, timeout: float = 10.0, *, deadline: float | None = None
+) -> dict:
+    headers = dict(HEADERS)
+    headers["Authorization"] = authorization_header(SERVER_URL)
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    # Async cancellation bounds network waits, including continuously arriving SSE
+    # pings; synchronous setup/parsing still relies on the late-result check.
+    payload, new_session = asyncio.run(_request_body(
+        headers, json.dumps(body).encode("utf-8"), timeout, deadline,
+    ))
+    raw = payload.decode("utf-8")
+    result = {"_session_id": new_session, "_raw": raw}
+    for line in raw.splitlines():
+        if line.startswith("data: "):
+            result.update(json.loads(line[6:]))
+            break
+    else:
+        try:
+            result.update(json.loads(raw))
+        except json.JSONDecodeError:
+            pass
+    _remaining_timeout(timeout, deadline)
+    return result
+
+
+def _tool_call(
+    session_id: str,
+    name: str,
+    args: dict,
+    request_id: int,
+    timeout: float = 30.0,
+    *,
+    deadline: float | None = None,
+) -> dict:
+    body = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": args},
+    }
+    resp = _post(session_id, body, timeout=timeout, deadline=deadline)
+    if "error" in resp:
+        return {"error": resp["error"]}
+    ## Prefer structuredContent; fall back to the text block the transport
+    ## wraps around dict/list results.
+    result = resp.get("result", {})
+    if not isinstance(result, dict):
+        return {"unexpected_result": result}
+    value = result.get("structuredContent")
+    if not value:
+        value = {"_raw": resp.get("_raw", "")}
+        for block in result.get("content") or []:
+            if block.get("type") == "text":
+                try:
+                    value = json.loads(block["text"])
+                except json.JSONDecodeError:
+                    value = {"_text": block["text"]}
+                break
+    if result.get("isError") and not (isinstance(value, dict) and "error" in value):
+        return {"error": value}
+    return value
+
+
+
+def _initialize_session() -> str:
+    deadline = time.monotonic() + 20
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "ci-game-capture-smoke", "version": "1.0"},
+        },
+    }
+    resp = _post(None, body, deadline=deadline)
+    session_id = resp.get("_session_id")
+    if not session_id:
+        raw = resp.get("_raw", "")[:300]
+        raise RuntimeError(f"No Mcp-Session-Id in initialize response: {raw}")
+    _post(session_id, {"jsonrpc": "2.0", "method": "notifications/initialized"}, deadline=deadline)
+    return session_id
 
 
 def _wait_for_godot_session(
@@ -532,8 +516,10 @@ def _wait_for_game_capture_ready(
     )
 
 
-def _within_tolerance(a: tuple[int, int, int], b: tuple[int, int, int]) -> bool:
-    return all(abs(x - y) <= COLOR_TOLERANCE for x, y in zip(a, b))
+def _within_tolerance(
+    actual: tuple[int, int, int], expected: tuple[int, int, int], tolerance: int,
+) -> bool:
+    return all(abs(channel - target) <= tolerance for channel, target in zip(actual, expected))
 
 
 def _dump_diagnostics(session_id: str) -> None:
@@ -579,11 +565,12 @@ def _dump_diagnostics(session_id: str) -> None:
 
 
 def _capture_attempt(
-    session_id: str, request_id: int, *, deadline: float | None = None
+    session_id: str, request_id: int, max_resolution: int = 0,
+    *, deadline: float | None = None,
 ) -> tuple[list[str], bytes | None]:
     """One capture-and-check pass. Returns (failures, png_bytes).
 
-    An empty failures list means the frame passed every quadrant check.
+    An empty failures list means the frame passed every color check.
     Bridge errors (screenshot timeouts, not-live replies) come back as
     failure strings rather than raising so the caller's retry loop treats
     them the same as a blank frame — on slow runners they are the same
@@ -597,7 +584,7 @@ def _capture_attempt(
     meta = _tool_call(
         session_id,
         "editor_screenshot",
-        {"source": "game", "include_image": False, "max_resolution": 0},
+        {"source": "game", "include_image": False, "max_resolution": max_resolution},
         request_id,
         timeout=_remaining_timeout(40, deadline), deadline=deadline,
     )
@@ -615,7 +602,9 @@ def _capture_attempt(
         "method": "tools/call",
         "params": {
             "name": "editor_screenshot",
-            "arguments": {"source": "game", "include_image": True, "max_resolution": 0},
+            "arguments": {
+                "source": "game", "include_image": True, "max_resolution": max_resolution,
+            },
         },
     }
     resp = _post(session_id, body, timeout=_remaining_timeout(40, deadline), deadline=deadline)
@@ -638,24 +627,24 @@ def _capture_attempt(
     img = Image.open(io.BytesIO(png)).convert("RGB")
     print(f"Got PNG {img.width}x{img.height} ({len(png)} bytes)")
 
-    if img.width < 64 or img.height < 64:
-        return ([f"image too small to sample: {img.width}x{img.height}"], png)
+    if not _capture_size_valid(img.size, max_resolution):
+        return ([f"unexpected capture size: {img.width}x{img.height} (cap {max_resolution})"], png)
 
     failures: list[str] = []
     samples: list[tuple[int, int, int]] = []
-    for label, fx, fy, expected in QUADRANTS:
+    for label, fx, fy, expected, tolerance in QUADRANTS:
         x = int(img.width * fx)
         y = int(img.height * fy)
         actual = img.getpixel((x, y))
         samples.append(actual)
-        match = _within_tolerance(actual, expected)
+        match = _within_tolerance(actual, expected, tolerance)
         symbol = "OK" if match else "FAIL"
         print(f"  [{symbol}] {label:>6} @ ({x}, {y}): got {actual}, expected ~{expected}")
         if not match:
             failures.append(f"{label} at ({x}, {y}): got {actual}, expected {expected}")
 
     if failures and len(set(samples)) == 1:
-        ## All four quadrants identical: the game presented a frame but the
+        ## All color samples identical: the game presented a frame but the
         ## scene hasn't drawn yet (Godot's clear color) — the signature
         ## pre-first-present blank, worth naming in the log.
         failures.append(
@@ -678,6 +667,91 @@ def _write_diag_artifacts(attempt_log: list[str], last_png: bytes | None) -> Non
         print(f"(diag) failed to write artifacts: {exc}", file=sys.stderr)
 
 
+def _capture_size_valid(size: tuple[int, int], limit: int) -> bool:
+    # Floating-point scale followed by int truncation can leave the long edge 1px short.
+    return min(size) > 0 and (limit - 1 <= max(size) <= limit if limit else max(size) >= 64)
+
+
+def _check_game_rendering(session_id: str, history: list[str], deadline: float) -> None:
+    while True:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Game rendering probe exceeded the capture budget")
+        response = _tool_call(session_id, "editor_manage", {
+            "op": "game_eval", "params": {"code": (
+                'return {"hdr": get_tree().root.use_hdr_2d, '
+                '"renderer": RenderingServer.get_current_rendering_method()}'
+            )},
+        }, 12, timeout=_remaining_timeout(30, deadline), deadline=deadline)
+        history.append(f"Game rendering response: {response}")
+        print(history[-1])
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Game rendering probe exceeded the capture budget: {response}")
+        error = response.get("error")
+        if isinstance(error, dict) and error.get("code") == "EVAL_GAME_NOT_READY":
+            time.sleep(min(CAPTURE_RETRY_DELAY_SEC, max(0, deadline - time.monotonic())))
+            continue
+        rendering = response.get("result")
+        if response.get("error") or not isinstance(rendering, dict):
+            raise RuntimeError(f"Game rendering probe failed: {response}")
+        expected_hdr = os.environ.get("CAPTURE_HDR_2D") == "1"
+        if rendering.get("hdr") is not expected_hdr:
+            raise RuntimeError(f"Expected HDR 2D={expected_hdr}, observed {response}")
+        if rendering.get("renderer") not in {"forward_plus", "mobile", "gl_compatibility"}:
+            raise RuntimeError(f"Unknown game renderer: {response}")
+        if expected_hdr and rendering["renderer"] == "gl_compatibility":
+            raise RuntimeError(f"HDR coverage requires a linear renderer: {response}")
+        return
+
+
+def _check_editor_capture(
+    session_id: str, history: list[str], deadline: float | None = None
+) -> None:
+    if deadline is None:
+        deadline = time.monotonic() + 110
+    properties = _tool_call(session_id, "node_get_properties", {
+        "path": "/Root", "fields": ["capture_metadata"],
+    }, 20, timeout=_remaining_timeout(30, deadline), deadline=deadline)
+    metadata = next((p["value"] for p in properties.get("properties", [])
+                     if p["name"] == "capture_metadata"), {})
+    history.append(f"Editor rendering: {metadata}")
+    print(history[-1])
+    expected_hdr = os.environ.get("CAPTURE_HDR_2D") == "1"
+    if metadata.get("error") or metadata.get("hdr") is not expected_hdr:
+        raise RuntimeError(f"Editor HDR fixture mismatch: {metadata}")
+    linear = metadata.get("renderer") in {"forward_plus", "mobile"}
+    if expected_hdr and not linear:
+        raise RuntimeError(f"Editor HDR coverage requires a linear renderer: {metadata}")
+    expected_raw = 0.214 if expected_hdr and linear else 0.5
+    if abs(metadata.get("raw_gray", -1) - expected_raw) > 0.015:
+        raise RuntimeError(f"Editor gray patch did not render correctly: {metadata}")
+    for limit in (0, 64):
+        response = _post(session_id, {
+            "jsonrpc": "2.0", "id": 21 + limit, "method": "tools/call",
+            "params": {"name": "editor_screenshot", "arguments": {
+                "source": "viewport_2d", "max_resolution": limit,
+            }},
+        }, timeout=_remaining_timeout(40, deadline), deadline=deadline)
+        blocks = response.get("result", {}).get("content", [])
+        image_block = next((b for b in blocks if b.get("type") == "image"), None)
+        if image_block is None:
+            raise RuntimeError(f"Editor screenshot has no image: {response}")
+        png = base64.b64decode(image_block["data"])
+        img = Image.open(io.BytesIO(png)).convert("RGB")
+        if not _capture_size_valid(img.size, limit):
+            raise RuntimeError(f"Unexpected editor screenshot size {img.size} (cap {limit})")
+        sample = (int(metadata["sample_x"] * img.width), int(metadata["sample_y"] * img.height))
+        pixel = img.getpixel(sample)
+        history.append(f"Editor capture limit={limit}: size={img.size}, gray={pixel}")
+        print(history[-1])
+        os.makedirs(DIAG_DIR, exist_ok=True)
+        with open(os.path.join(DIAG_DIR, f"editor-{limit}.png"), "wb") as artifact:
+            artifact.write(png)
+        if not _within_tolerance(pixel, (127, 127, 127), 1):
+            raise RuntimeError(f"Editor screenshot lost display gray: {pixel}")
+
+    _remaining_timeout(40, deadline)
+
+
 def main() -> int:
     print(f"Connecting to MCP server at {SERVER_URL}")
     session_id: str | None = None
@@ -693,13 +767,29 @@ def main() -> int:
         _tool_call(session_id, "scene_open", {"path": SCENE_PATH}, 10,
                    deadline=time.monotonic() + 30)
         time.sleep(1)
+        _check_editor_capture(session_id, attempt_log, time.monotonic() + 110)
+        encoding_tests = _tool_call(session_id, "test_run", {"suite": "screenshot_encode"}, 23,
+                                    deadline=time.monotonic() + 30)
+        attempt_log.append(f"Screenshot encoder suite: {encoding_tests}")
+        print(attempt_log[-1])
+        for failure in encoding_tests.get("failures", []):
+            print(f"{failure['suite']}.{failure['test']}: {failure['message']}")
+        if (
+            encoding_tests.get("failures")
+            or encoding_tests.get("failed", 0)
+            or encoding_tests.get("skipped", 0)
+            or encoding_tests.get("load_errors")
+            or encoding_tests.get("passed", 0) != 2
+        ):
+            raise RuntimeError(f"Screenshot encoder suite did not pass: {encoding_tests}")
         print("Running project (current scene)")
         run_attempted = True
-        _tool_call(session_id, "project_run", {"mode": "current"}, 11,
+        _tool_call(session_id, "project_run", {"mode": "current", "autosave": False}, 11,
                    timeout=60, deadline=time.monotonic() + 60)
         _wait_for_game_capture_ready(session_id, history=attempt_log)
 
         deadline = time.monotonic() + CAPTURE_BUDGET_SEC
+        _check_game_rendering(session_id, attempt_log, deadline)
         attempt = 0
         last_failures: list[str] = ["capture budget expired before an attempt"]
         while time.monotonic() < deadline:
@@ -707,6 +797,10 @@ def main() -> int:
             print(f"Capturing source='game' (attempt {attempt})")
             try:
                 failures, png = _capture_attempt(session_id, 100 + attempt * 10, deadline=deadline)
+                if not failures:
+                    failures, png = _capture_attempt(
+                        session_id, 102 + attempt * 10, 64, deadline=deadline
+                    )
                 _remaining_timeout(40, deadline)
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 failures, png = ([f"transport error: {exc}"], None)
