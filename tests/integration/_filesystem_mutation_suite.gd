@@ -525,3 +525,23 @@ func test_mutation_binary_string_owner_is_not_cleared_by_dependencies() -> void:
 			DirAccess.remove_absolute(path)
 	EditorInterface.get_resource_filesystem().update_file(owner)
 	_mutation_cleanup()
+
+
+func test_mutation_owner_scan_checks_cancellation_between_relative_hits() -> void:
+	var job := Mutation.new()
+	job._deadline = Time.get_ticks_msec() + 25000
+	job._yield_at = Time.get_ticks_usec()
+	var checks := [0]
+	job._alive = func() -> bool:
+		checks[0] += 1
+		return checks[0] <= 2
+	var targets := {}
+	var owner := ""
+	for index in 256:
+		var path := "res://target_%03d.gd" % index
+		targets[path] = {"uid": ResourceUID.INVALID_ID}
+		owner += '\"target_%03d.gd\"\n' % index
+	var hits: Array = await job._references("res://owner.gd", owner.to_utf8_buffer(), targets)
+	assert_eq(checks[0], 3, "check cancellation before each target, including relative-path continue branches")
+	assert_eq(hits.size(), 1, "cancelled owner scan must stop before processing the next target")
+	assert_true(job._fault.contains("cancelled"), "cancellation must be reported to the mutation owner")

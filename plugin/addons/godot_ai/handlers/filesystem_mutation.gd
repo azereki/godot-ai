@@ -113,6 +113,10 @@ func _run(params: Dictionary, operation: String) -> Dictionary:
 		return _unchanged("Mutation exceeds the %d-resource limit; use smaller groups" % MAX_TARGETS)
 	for path in files:
 		if path == source or (directory and path.begins_with(source + "/")) or path in [source + ".uid", source + ".import"]:
+			# Owner-extension targets are read and fingerprinted by the owner
+			# pass below; reading them here too would charge the byte budget twice.
+			if path.get_extension().to_lower() in OWNER_EXTENSIONS:
+				continue
 			if await _read_bounded(path) == null:
 				return _unchanged(_fault)
 	var owners := []
@@ -122,13 +126,13 @@ func _run(params: Dictionary, operation: String) -> Dictionary:
 		var content: Variant = await _read_bounded(path)
 		if content == null:
 			return _unchanged(_fault)
-		var hits: Array[Dictionary] = []
-		for target: String in targets:
-			hits.append_array(_references(path, content, {target: targets[target]}))
-			if not _fault.is_empty():
-				return _unchanged(_fault)
-			if not await _yield_if_needed():
-				return _unchanged(_fault)
+		# One call per owner: _references lowercases and regex-scans the whole
+		# file, so a per-target loop repeated that up to MAX_TARGETS times.
+		var hits := await _references(path, content, targets)
+		if not _fault.is_empty():
+			return _unchanged(_fault)
+		if not await _yield_if_needed():
+			return _unchanged(_fault)
 		if not hits.is_empty() and not (operation == "remove" and targets.has(path)):
 			owners.append({"path": path, "references": hits})
 	var editor_guard := _editor_state_guard(targets)
@@ -278,6 +282,9 @@ func _references(path: String, bytes: PackedByteArray, targets: Dictionary) -> A
 			# ResourceLoader.load uses the project root for bare paths.
 			relative_paths["res://".path_join(value).simplify_path().to_lower()] = true
 	for target: String in targets:
+		# Keep cancellation and frame progress even when a path match continues.
+		if not await _yield_if_needed():
+			return hits
 		var target_text := target.to_lower()
 		var uid: int = targets[target].uid
 		var uid_text := ResourceUID.id_to_text(uid) if uid != ResourceUID.INVALID_ID else ""

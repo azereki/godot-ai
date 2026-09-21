@@ -383,10 +383,12 @@ func test_mutation_uid_and_path_owner_classification() -> void:
 	ResourceUID.add_id(uid, path)
 	var targets := {path: {"uid": uid}}
 	var job := Mutation.new()
+	job._deadline = Time.get_ticks_msec() + 25000
+	job._yield_at = Time.get_ticks_usec()
 	var uid_source := "const Target = preload(\"%s\")" % ResourceUID.id_to_text(uid)
-	assert_eq(job._references("res://owner.gd", uid_source.to_utf8_buffer(), targets), [{"path": path, "kind": "uid"}])
+	assert_eq(await job._references("res://owner.gd", uid_source.to_utf8_buffer(), targets), [{"path": path, "kind": "uid"}])
 	var path_source := "const Target = preload(\"%s\")" % path
-	assert_eq(job._references("res://owner.gd", path_source.to_utf8_buffer(), targets), [{"path": path, "kind": "path"}])
+	assert_eq(await job._references("res://owner.gd", path_source.to_utf8_buffer(), targets), [{"path": path, "kind": "path"}])
 	ResourceUID.remove_id(uid)
 
 
@@ -397,7 +399,9 @@ func test_mutation_scene_fallback_requires_matching_uid_header() -> void:
 	var targets := {path: {"uid": uid}}
 	var header := "[ext_resource type=\"Script\" uid=\"%s\" path=\"%s\" id=\"1\"]" % [ResourceUID.id_to_text(uid), path]
 	var job := Mutation.new()
-	assert_eq(job._references("res://owner.tscn", header.to_utf8_buffer(), targets), [{"path": path, "kind": "uid"}])
+	job._deadline = Time.get_ticks_msec() + 25000
+	job._yield_at = Time.get_ticks_usec()
+	assert_eq(await job._references("res://owner.tscn", header.to_utf8_buffer(), targets), [{"path": path, "kind": "uid"}])
 	var with_property := header + "\n[node name=\"Root\" type=\"Node\"]\npath = \"%s\"" % path
-	assert_eq(job._references("res://owner.tscn", with_property.to_utf8_buffer(), targets), [{"path": path, "kind": "path"}])
+	assert_eq(await job._references("res://owner.tscn", with_property.to_utf8_buffer(), targets), [{"path": path, "kind": "path"}])
 	ResourceUID.remove_id(uid)
