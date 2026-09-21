@@ -489,3 +489,39 @@ func _mutation_wait_import(path: String) -> bool:
 				return true
 		await (Engine.get_main_loop() as SceneTree).create_timer(0.05).timeout
 	return false
+
+
+func test_mutation_binary_string_owner_is_not_cleared_by_dependencies() -> void:
+	_mutation_cleanup()
+	var source := MUTATION_ROOT + ".gd"
+	var destination := MUTATION_ROOT + "_moved.gd"
+	var owner_script := MUTATION_ROOT + "_owner.gd"
+	var owner := MUTATION_ROOT + "_binary_owner.res"
+	var uid := _mutation_uid_script(source)
+	_mutation_write(owner_script, "@tool\nextends Resource\n@export var file_path: String = \"\"\n@export var file_uid: String = \"\"\n")
+	var holder: Resource = load(owner_script).new()
+	holder.set("file_path", source)
+	holder.set("file_uid", ResourceUID.id_to_text(uid))
+	assert_eq(ResourceSaver.save(holder, owner), OK, "binary String owner must save")
+	var loaded: Resource = ResourceLoader.load(owner, "", ResourceLoader.CACHE_MODE_IGNORE)
+	assert_true(loaded != null, "binary owner must load")
+	if loaded != null:
+		assert_eq(loaded.get("file_path"), source, "binary really stores the literal path")
+		assert_eq(loaded.get("file_uid"), ResourceUID.id_to_text(uid), "binary really stores the literal UID")
+	var names_target := false
+	for dependency in ResourceLoader.get_dependencies(owner):
+		for segment in dependency.split("::", false):
+			names_target = names_target or segment == source or segment == ResourceUID.id_to_text(uid)
+	assert_false(names_target, "dependency enumeration omits serialized String paths and UIDs")
+	var refused: Dictionary = await Mutation.new().run({"path": source, "new_path": destination}, "move")
+	assert_is_error(refused, "INVALID_PARAMS")
+	if refused.has("error"):
+		assert_contains(refused.error.message, "Binary dependency discovery is unsupported")
+		assert_eq(refused.error.data.outcome, "unchanged")
+	assert_true(FileAccess.file_exists(source), "unknown binary ownership must preserve source")
+	assert_false(FileAccess.file_exists(destination), "unknown binary ownership must not move")
+	for path in [owner, owner + ".uid"]:
+		if FileAccess.file_exists(path):
+			DirAccess.remove_absolute(path)
+	EditorInterface.get_resource_filesystem().update_file(owner)
+	_mutation_cleanup()

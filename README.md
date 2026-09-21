@@ -28,6 +28,15 @@ animation, particles, cameras, and environments.
   `uvx` for the Python server
 - An MCP client
 
+**Script languages.** GDScript is fully supported: scripts written through
+the tools are parse-validated, hot-reloaded, attached, and outlined. C# is
+**text-only**: `script_create` / `script_patch` write `.cs` files and
+`script_manage(op="find_symbols")` outlines them, but Godot AI does not build
+.NET or report C# compiler errors. Build in the editor and inspect its Build
+panel, or run `dotnet build` and inspect the terminal output.
+Attaching a `.cs` needs a .NET-enabled editor build.
+Details: [C# support](docs/TOOLS.md#c-support).
+
 ### 1. Install or update
 
 **New project:** choose a published version from
@@ -60,7 +69,8 @@ every detected client. If the client does not notice the new configuration,
 restart that client.
 
 Supported clients include **Claude Code**, **Claude Desktop**, **Codex**,
-**Antigravity**, **Hermes Agent**, **DeepSeek Harness**, **Cursor**, and **VS Code**.
+**Antigravity**, **Hermes Agent**, **DeepSeek Harness**, **Cursor**,
+**VS Code**, and **Oh My Pi** (manual configuration).
 The dock lists all supported clients and provides a **Run this manually**
 fallback where needed.
 
