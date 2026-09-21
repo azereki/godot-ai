@@ -344,7 +344,7 @@ static func _apply_resource_properties(res: Resource, properties: Dictionary, de
 				var loaded := ResourceLoader.load(v)
 				if loaded == null:
 					return ErrorCodes.make(
-						ErrorCodes.INVALID_PARAMS,
+						ErrorCodes.RESOURCE_NOT_FOUND,
 						"Resource not found at path '%s' for property '%s'" % [v, key]
 					)
 				v = loaded

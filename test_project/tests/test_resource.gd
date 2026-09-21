@@ -625,6 +625,22 @@ func test_create_resource_undo_survives_interleaving() -> void:
 
 # ----- regression: properties dict __class__ shortcut for nested Resource slots -----
 
+func test_create_resource_missing_nested_resource_does_not_write() -> void:
+	var missing := "res://tests/_mcp_missing_nested_gradient_963.tres"
+	var output := "res://tests/_mcp_missing_nested_output_963.tres"
+	assert_false(FileAccess.file_exists(missing), "missing-resource fixture must not exist")
+	assert_false(FileAccess.file_exists(output), "output fixture must not exist")
+	var result := _handler.create_resource({
+		"type": "GradientTexture2D",
+		"properties": {"gradient": missing},
+		"resource_path": output,
+	})
+	assert_is_error(result, ErrorCodes.RESOURCE_NOT_FOUND)
+	assert_contains(result.error.message, missing)
+	assert_contains(result.error.message, "gradient")
+	assert_false(FileAccess.file_exists(output), "failed nested load must not create the output")
+
+
 func test_create_resource_nested_class_dict_instantiates_sub_resource() -> void:
 	# resource_create type=GradientTexture2D properties={gradient: {__class__: Gradient}}
 	# should land a real Gradient in .gradient, not leave the slot empty while
