@@ -7,11 +7,13 @@ import errno
 import os
 import socket
 import sys
+import time
 import tomllib
 from collections.abc import Sequence
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
+from typing import Any
 
 
 def _resolve_version(package_file: str | Path) -> str:
@@ -62,8 +64,15 @@ def _is_eaddrinuse(exc: OSError) -> bool:
     )
 
 
-def preflight_check_port(port: int, *, label: str, setting: str, host: str = "127.0.0.1") -> None:
+def preflight_check_port(
+    port: int, *, label: str, setting: str, host: str = "127.0.0.1"
+) -> socket.socket | None:
     """Exit with a distinctive stderr message + exit code when `port` is taken.
+
+    Returns the bound, listening socket when the plugin asked this launch to
+    wait for the port (see below): the caller hands it to the real server so
+    the port is never free between the wait ending and the server listening.
+    Returns ``None`` on the ordinary fail-fast path.
 
     #647: when a foreign process (e.g. a docker container) already owns the
     HTTP or WebSocket port, uvicorn/websockets fail with an opaque bind error
@@ -78,32 +87,88 @@ def preflight_check_port(port: int, *, label: str, setting: str, host: str = "12
     ## bind_host_for_networks(); an AF_INET socket can't bind those, so pick
     ## the family from the host (Copilot review on #647's PR).
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    sock = socket.socket(family, socket.SOCK_STREAM)
-    try:
-        if os.name != "nt":
-            ## Mirror uvicorn/websockets SO_REUSEADDR so a just-stopped
-            ## server's TIME_WAIT socket doesn't false-positive as a
-            ## foreign occupant. Skipped on Windows, where SO_REUSEADDR
-            ## means "hijack the active listener".
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ## The plugin sets this only when it launches this server to replace a
+    ## godot-ai backend that still holds the port and kills that backend
+    ## right after: the port then goes from the old backend to this process
+    ## within one retry, before an attach bridge that is polling for a free
+    ## port can spawn another backend of its own. Every other launch keeps
+    ## the fail-fast contract below (#647).
+    wait_seconds = _wait_for_port_seconds()
+    wait_deadline = time.monotonic() + wait_seconds
+    if wait_seconds > 0:
+        ## Tell the plugin the bind loop is running before the first attempt:
+        ## it kills the occupant only now, and a launch that took seconds to
+        ## get here (uvx installing the new version) no longer leaves the
+        ## port free for a bridge to spawn into.
+        from godot_ai.runtime_info import STARTUP_PHASE_WAITING_FOR_PORT, report_startup_phase
+
+        report_startup_phase(
+            STARTUP_PHASE_WAITING_FOR_PORT,
+            port=port,
+            label=label,
+            ## The plugin names each launch; a phase from another launch's
+            ## report must never pass for this one.
+            launch_id=os.environ.get(LAUNCH_ID_ENV, "").strip(),
+        )
+    while True:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        keep = False
         try:
-            sock.bind((host, port))
+            if os.name != "nt":
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((host, port))
+                if wait_seconds <= 0:
+                    return None
+                ## Hold the port from this instant: a bridge polling for a
+                ## free port to spawn its own backend never sees one.
+                sock.listen(128)
+                keep = True
+                return sock
+            except OSError as exc:
+                if _is_eaddrinuse(exc) and time.monotonic() < wait_deadline:
+                    continue
+                raise
         except OSError as exc:
-            if _is_eaddrinuse(exc):
-                print(
-                    f"godot-ai: {label} port {port} is already in use by another "
-                    f"process. Stop it or change the port ({setting} in Godot "
-                    "Editor Settings).",
-                    file=sys.stderr,
-                )
-                raise SystemExit(EXIT_PORT_IN_USE) from exc
-            ## Any other bind failure (EACCES, EADDRNOTAVAIL, winnat
-            ## exclusion ranges, exotic address families) is NOT the
-            ## condition this preflight exists to catch — let the real
-            ## server startup produce its existing failure mode instead
-            ## of the probe inventing a new earlier crash.
-    finally:
-        sock.close()
+            if not _is_eaddrinuse(exc):
+                ## Any other bind failure (EACCES, EADDRNOTAVAIL, winnat
+                ## exclusion ranges, exotic address families) is NOT the
+                ## condition this preflight exists to catch: let the real
+                ## server startup produce its existing failure mode.
+                return
+            text = (
+                f"godot-ai: {label} port {port} is already in use by another "
+                f"process. Stop it or change the port ({setting} in Godot "
+                "Editor Settings)."
+            )
+            print(text, file=sys.stderr)
+            from godot_ai.runtime_info import report_startup_failure
+
+            report_startup_failure(OSError(errno.EADDRINUSE, text))
+            raise SystemExit(EXIT_PORT_IN_USE) from exc
+        finally:
+            if not keep:
+                sock.close()
+                if time.monotonic() < wait_deadline:
+                    time.sleep(WAIT_FOR_PORT_RETRY_SECONDS)
+
+
+WAIT_FOR_PORT_ENV = "GODOT_AI_WAIT_FOR_PORT_MS"
+LAUNCH_ID_ENV = "GODOT_AI_LAUNCH_ID"
+WAIT_FOR_PORT_RETRY_SECONDS = 0.05
+# Match the plugin's bounded replacement wait. Windows identity checks and
+# termination have taken over 25 seconds after this process entered the wait.
+WAIT_FOR_PORT_MAX_SECONDS = 60.0
+
+
+def _wait_for_port_seconds() -> float:
+    raw = os.environ.get(WAIT_FOR_PORT_ENV, "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return min(max(int(raw), 0) / 1000.0, WAIT_FOR_PORT_MAX_SECONDS)
+    except ValueError:
+        return 0.0
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -156,6 +221,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--startup-report",
+        default=None,
+        help=(
+            "When startup fails before the capability record is published, "
+            "write the failure (type, message, hint) as JSON to this path. The "
+            "Godot plugin passes it beside --pid-file and shows the content in "
+            "the dock instead of a bare proof timeout."
+        ),
+    )
+    parser.add_argument(
         "--owner-pid",
         type=int,
         default=None,
@@ -177,8 +252,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         help=(
             "Expose the server to a named LAN range for remote agents (issue "
             "#421). Takes a CIDR or bare IP (repeatable, or comma-separated), "
-            "e.g. --allow-host 192.168.1.0/24. When set, both transports bind "
-            "off loopback and access is gated on the real socket peer address "
+            "e.g. --allow-host 192.168.1.0/24. When set, HTTP binds "
+            "off loopback; the editor WebSocket remains loopback-only. HTTP access "
+            "is gated on the real socket peer address "
             "(unforgeable) falling inside these networks ONLY — the Host header "
             "is range-checked too but is not the authority, and browser Origin "
             "/ Sec-Fetch-Site checks stay on. Omit for the default loopback-only "
@@ -208,7 +284,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     ## #421: parse --allow-host CIDRs. A typo here fails loudly at startup
     ## rather than silently binding loopback-only (or worse, wide open).
-    from godot_ai.transport.origin_guard import bind_host_for_networks, parse_allow_hosts
+    from godot_ai.transport.origin_guard import parse_allow_hosts
 
     try:
         allow_host_networks = parse_allow_hosts(args.allow_host or [])
@@ -227,6 +303,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             parser.error("--owner-pid requires an HTTP transport")
         if args.pid_file is not None:
             parser.error("--pid-file requires an HTTP transport")
+        if args.startup_report is not None:
+            parser.error("--startup-report requires an HTTP transport")
         from godot_ai.attach.main import main as attach_main
 
         attach_args = ["--port", str(args.port), "--ws-port", str(args.ws_port)]
@@ -242,6 +320,28 @@ def main(argv: Sequence[str] | None = None) -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
+    from godot_ai.runtime_info import install_startup_report, report_startup_failure
+
+    install_startup_report(args.startup_report)
+    try:
+        _serve(args, capabilities, exclude_domains, allow_host_networks)
+    except BaseException as exc:
+        ## Anything that escapes before the capability record is published is
+        ## invisible to the editor otherwise (the report is disarmed once the
+        ## record exists, so runtime faults are not misreported as startup).
+        if not isinstance(exc, KeyboardInterrupt):
+            report_startup_failure(exc)
+        raise
+
+
+def _serve(
+    args: argparse.Namespace,
+    capabilities: Any,
+    exclude_domains: Any,
+    allow_host_networks: Any,
+) -> None:
+    from godot_ai.transport.origin_guard import bind_host_for_networks
+
     ## Widen the HTTP bind off loopback only when an allowlist is named. The
     ## DNS-rebinding guard still gates every request by the CIDR(s); binding
     ## off loopback without the guard would be the footgun this flag avoids.
@@ -253,12 +353,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     ## #647: fail fast — with a recognizable message and exit code — when a
     ## foreign process holds a port we need, instead of uvicorn's opaque bind
     ## error (HTTP) or a half-ready HTTP process without its editor bridge.
+    held_http = held_ws = None
     if args.transport in ("sse", "streamable-http"):
         http_host = (
             bind_host_for_networks(allow_host_networks) if allow_host_networks else "127.0.0.1"
         )
-        preflight_check_port(args.port, label="HTTP", setting="godot_ai/http_port", host=http_host)
-        preflight_check_port(args.ws_port, label="WebSocket", setting="godot_ai/ws_port")
+        held_http = preflight_check_port(
+            args.port, label="HTTP", setting="godot_ai/http_port", host=http_host
+        )
+        held_ws = preflight_check_port(args.ws_port, label="WebSocket", setting="godot_ai/ws_port")
 
     from godot_ai.runtime_info import install_pid_file
 
@@ -298,9 +401,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         exclude_domains=exclude_domains,
         owner_pid=owner_pid,
         allow_host_networks=allow_host_networks,
+        ws_socket=held_ws,
     )
 
     transport_kwargs = {}
+    if held_http is not None:
+        transport_kwargs["sockets"] = [held_http]
     if args.transport in ("sse", "streamable-http"):
         from godot_ai.asgi import hardened_uvicorn_config, http_access_log_enabled
 

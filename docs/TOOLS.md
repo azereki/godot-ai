@@ -202,18 +202,18 @@ Calls take the form:
 | `session_manage` | `list` |
 | `test_manage` | `results_get` |
 | `animation_manage` | `player_create`, `delete`, `validate`, `add_property_track`, `add_method_track`, `set_autoplay`, `play`, `stop`, `list`, `get`, `create_simple`, `preset_fade`, `preset_slide`, `preset_shake`, `preset_pulse` |
-| `material_manage` | `create`, `set_param`, `set_shader_param`, `get`, `list`, `assign`, `apply_to_node`, `apply_preset` |
+| `material_manage` | `create`, `set_param`, `set_shader_param`, `get`, `list`, `assign`, `apply_to_node`, `apply_preset`, `visual_shader_create_graph`, `visual_shader_get`, `visual_shader_node_catalog`, `visual_shader_edit`, `shader_create`, `shader_get`, `shader_validate`, `shader_patch` |
 | `audio_manage` | `player_create`, `player_set_stream`, `player_set_playback`, `play`, `stop`, `list` |
 | `particle_manage` | `create`, `set_main`, `set_process`, `set_draw_pass`, `restart`, `get`, `apply_preset` |
 | `camera_manage` | `create`, `configure`, `set_limits_2d`, `set_damping_2d`, `follow_2d`, `get`, `list`, `apply_preset` |
 | `signal_manage` | `list`, `connect`, `disconnect` |
 | `input_map_manage` | `list`, `add_action`, `ensure_action`, `remove_action`, `bind_event`, `ensure_binding` |
-| `game_manage` | `get_scene_tree`, `get_node_info`, `get_ui_elements`, `input_key`, `input_mouse`, `input_gamepad`, `input_action`, `input_sequence`, `input_state` |
+| `game_manage` | `get_scene_tree`, `get_node_info`, `get_ui_elements`, `suspend`, `resume`, `next_frame`, `debug_status`, `input_key`, `input_mouse`, `input_gamepad`, `input_action`, `input_sequence`, `input_state` |
 | `autoload_manage` | `list`, `add`, `remove` |
 | `filesystem_manage` | `read_text`, `write_text`, `reimport`, `scan`, `search`, `move`, `rename`, `remove` |
 | `theme_manage` | `create`, `set_color`, `set_constant`, `set_font_size`, `set_stylebox_flat`, `apply` |
 | `ui_manage` | `set_anchor_preset`, `set_text`, `build_layout`, `draw_recipe` |
-| `resource_manage` | `search`, `load`, `assign`, `get_info`, `create`, `curve_set_points`, `environment_create`, `physics_shape_autofit`, `gradient_texture_create`, `noise_texture_create` |
+| `resource_manage` | `search`, `load`, `assign`, `get_info`, `create`, `curve_set_points`, `environment_create`, `physics_shape_autofit`, `physics_shape_generate`, `gradient_texture_create`, `noise_texture_create` |
 | `api_manage` | `get_class` |
 | `client_manage` | `status`, `configure`, `remove` |
 | `tilemap_manage` | `tilemap_set_cell`, `tilemap_set_cells_rect`, `tilemap_clear`, `tilemap_get_cells` |
@@ -230,32 +230,41 @@ schema (capped; overflow stays behind `custom_manage`). The dock's Tools tab
 lists registered custom tools with per-tool enable/disable that applies
 immediately.
 
+Composed motion effects that are not built-in presets — bounce, orbit, sweep,
+drift — are documented as keyframe recipes in
+[animation-recipes.md](animation-recipes.md), including a custom-tool addon
+example for wrapping project-specific recipes.
+
 `filesystem_manage.reimport` is intended for imported assets such as textures,
 models, and audio. Godot scripts (`.gd`) are not imported resources: a successful
 `.gd` entry only refreshes its editor filesystem cache entry and does not prove the
 script was parsed or diagnostics were produced. Use `script_patch` or
 `script_create` to save scripts and receive fresh diagnostics.
 
-`filesystem_manage(op="move"|"rename"|"remove")` reorganize the project the
-way the editor's FileSystem dock does, rather than touching the OS filesystem
-behind the editor's back (#907). Godot exposes no public move/delete API to
-GDScript, so the plugin mirrors the dock's own steps: the `.uid` and `.import`
-sidecars move with the file, `ResourceUID` is re-pointed so `uid://` references
-keep resolving, dependent `.tscn`/`.tres` files get their `path=` references
-rewritten, autoloads and file-typed project settings are updated, and the
-editor filesystem cache is refreshed. Owners are found by walking the project
-on disk (not the editor's filesystem tree, which does not know files written
-into a new folder until the next scan): resources answer through
-`ResourceLoader.get_dependencies`, scripts through a search for the quoted
-path, since the loader reports nothing for a `.gd` that `preload()`s a path.
-Two limits mirror the editor: GDScript string paths are not rewritten (they
-are listed under `script_references_unfixed` for a follow-up `script_patch`),
-and binary `.scn`/`.res` owners are not rewritten textually (they resolve
-through the preserved `uid`, and are listed under `binary_owners_unresolved`).
-`remove` refuses a target that another resource or script still references
-unless `force=true`, and defaults to the OS trash like the editor's Delete;
-pass `permanent=true` for a hard delete. None of the three is undoable via
-editor undo.
+`filesystem_manage(op="move"|"rename"|"remove")` performs bounded,
+fail-closed resource-group mutations. Moves carry `.uid`/`.import` sidecars and
+preserve verified UID references; they refuse literal-path dependencies,
+project-setting references, affected open scene tabs and missing destination
+parents. Automatic dependency rewriting is not supported. Discovery includes
+literal relative, `res://` and `uid://` references in .gd, .cs, .gdshader, .gdshaderinc, .tscn and .tres owners. Binary
+ownership, unreadable/oversized inputs and linked paths are refused, including
+when `force=true`; computed runtime paths are outside static owner discovery.
+Engine metadata, VCS internals and the loaded plugin implementation are excluded.
+
+Remove defaults to OS trash. `force=true` permits known dangling references,
+not unknown ownership. `permanent=true` supports files only; permanent directory
+removal is refused. None of these operations participates in editor undo.
+Call directly rather than through `batch_execute`. Directory mutations return
+`scan_required=true`; follow with `filesystem_manage(op="scan")` to refresh the
+editor tree. Discovery yields between bounded work units and refuses operations
+exceeding 10,000 project entries, 256 affected resources, 256 KiB per inspected file
+or 64 MiB of inspected bytes, including revalidation.
+
+Required fixups never fail silently: errors include `data.outcome` (`unchanged`,
+`rolled_back` or `partial`) and actual affected/unrestored paths. A partial result
+has `retry_safe=false`; inspect it before taking further action. File and sidecar
+moves attempt rollback on failure, but multi-file disk operations and separate
+OS trash calls are not claimed to be atomic against crashes or external writers.
 
 `api_manage(op="get_class")` inspects Godot API/ClassDB metadata for a class
 without creating an instance. By default it returns **only `properties`**
@@ -278,6 +287,13 @@ the running game in a single call — the frame-accurate, multi-step form of
 network round-trip happens to complete on, so the timing drifts and the run
 isn't reproducible. The game applies each step's action on its scheduled frame,
 awaits `settle_frames` more, then replies once.
+
+`game_manage(op="suspend"|"resume"|"next_frame")` uses Godot's native debugger
+control path. Successful mutations report `path="embed_signal"` when Embedded
+Game View accepted the shortcut, or `path="direct_session"` when the plugin
+sent the native scene debugger message directly. The direct fallback works for
+standalone/non-embedded runs, but `game_view_ui_synced=false` warns that the
+Game View suspend button's visual pressed state was not updated.
 
 Each step is `{at_frame, action, pressed=True, strength=1.0}`. Steps must be
 ordered by non-decreasing `at_frame`; two steps sharing a frame is a valid
@@ -338,6 +354,15 @@ don't, and the only path that supports `session_id` pinning.
 | `godot://project/info` | Active project metadata |
 | `godot://project/settings` | Common project settings subset |
 | `godot://materials` | All Material resources under res:// |
+| `godot://visual_shader/{path}` | VisualShader graph: stages, nodes, params, connections, varyings |
+| `godot://shader/{path}` | Raw `.gdshader` / `.gdshaderinc` source + parsed metadata |
 | `godot://input_map` | Project input actions and their bound events |
 | `godot://performance` | Performance singleton snapshot |
 | `godot://test/results` | Most recent `test_run` results |
+
+### Test-run cache warning
+
+`test_run` and `test_manage(op="results_get")` include `cache_warning` because
+preloaded GDScript dependencies can remain stale after edits in the same
+editor. Restart the editor before validating dependency changes; see the
+[freshness contract](tool-surface.md#test-run-freshness-after-dependency-edits).

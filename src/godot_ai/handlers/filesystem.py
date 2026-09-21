@@ -40,20 +40,15 @@ async def filesystem_scan(runtime: DirectRuntime) -> dict:
     return await runtime.send_command("scan_filesystem", {}, timeout=35.0)
 
 
-## Move/rename/remove walk the whole editor filesystem tree calling
-## ``ResourceLoader.get_dependencies`` on every resource file to find owners
-## of the affected paths (the same owner search the FileSystemDock runs). On
-## a large project that can exceed the default command timeout, so give it
-## the same headroom as ``filesystem_scan``.
-_REORGANIZE_TIMEOUT = 30.0
+# Deferred discovery has a 25-second budget; leave response headroom.
+_REORGANIZE_TIMEOUT = 35.0
 
 
 async def filesystem_move(runtime: DirectRuntime, path: str, new_path: str) -> dict:
-    """Move a file or directory inside ``res://`` with editor-side fixups.
+    """Move a resource group without unsupported dependency rewrites.
 
-    Routes through the plugin so ``.uid``/``.import`` sidecars travel with the
-    file, ``uid://`` references keep resolving, and dependent ``.tscn``/
-    ``.tres`` files get their ``path=`` references rewritten (#907).
+    Sidecars and proven UID references are preserved. Literal path owners,
+    project-setting references, links and incomplete discovery are refused.
     """
     await require_writable_async(runtime)
     return await runtime.send_command(
@@ -82,7 +77,8 @@ async def filesystem_remove(
     """Remove a file or directory, refusing referenced targets unless forced.
 
     Defaults to the OS trash (what the editor's own Delete does) so a mistaken
-    removal is recoverable; ``permanent=True`` deletes outright.
+    removal is recoverable; ``permanent=True`` deletes files only. Permanent
+    directory removal is refused.
     """
     await require_writable_async(runtime)
     return await runtime.send_command(

@@ -20,8 +20,15 @@ from godot_ai.transport.capability import (
     WS_CAPABILITY_ENV,
     write_capabilities,
 )
+from script import release_support
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+class _LoopbackServer(release_support.LoopbackBind, ThreadingHTTPServer):
+    """No FQDN lookup of 127.0.0.1: that stalls ~35 s per process on macOS."""
+
+
 RUNNER = ROOT / "script" / "ci-godot-tests"
 HTTP_CAPABILITY = "ci-runner-http-capability-0123456789abcdef"
 WS_CAPABILITY = "0123456789abcdef" * 4
@@ -92,6 +99,7 @@ def _handler(
     state: _RunnerState,
     project_path: Path,
     response_shape: str,
+    runner_name: str = "ci-godot-tests",
 ) -> type[BaseHTTPRequestHandler]:
     suite_names = sorted(
         path.stem.removeprefix("test_") for path in project_path.glob("tests/test_*.gd")
@@ -182,14 +190,16 @@ def _handler(
                         else []
                     ),
                 }
+            elif tool == "filesystem_manage":
+                content = {"scanned": True}
             elif tool == "scene_open":
                 content = {"path": "res://main.tscn"}
             elif tool == "test_run":
                 content = {
-                    "passed": 2200,
+                    "passed": 25 if runner_name == "ci-slow-suite-smoke" else 2200,
                     "failed": 0,
                     "skipped": 0,
-                    "total": 2200,
+                    "total": 25 if runner_name == "ci-slow-suite-smoke" else 2200,
                     "failures": [],
                     "load_errors": [],
                     "suite_count": len(suite_names),
@@ -210,15 +220,17 @@ def _handler(
     return Handler
 
 
+@pytest.mark.parametrize("runner_name", ("ci-godot-tests", "ci-slow-suite-smoke"))
 @pytest.mark.parametrize("response_shape", ("json", "sse"))
 def test_runner_reuses_one_mcp_session_and_accepts_both_response_shapes(
     tmp_path: Path,
     response_shape: str,
+    runner_name: str,
 ) -> None:
     state = _RunnerState()
-    server = ThreadingHTTPServer(
+    server = _LoopbackServer(
         ("127.0.0.1", 0),
-        _handler(state, ROOT / "test_project", response_shape),
+        _handler(state, ROOT / "test_project", response_shape, runner_name),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -242,7 +254,7 @@ def test_runner_reuses_one_mcp_session_and_accepts_both_response_shapes(
                     'export -f sleep python3; exec bash "$1" "$2"'
                 ),
                 "ci-godot-tests-regression",
-                str(RUNNER),
+                str(ROOT / "script" / runner_name),
                 sys.executable,
             ],
             cwd=ROOT,
@@ -264,4 +276,8 @@ def test_runner_reuses_one_mcp_session_and_accepts_both_response_shapes(
     assert state.sessions_created == 1
     assert state.session_list_calls == 3
     assert state.deleted_sessions == ["ci-session-1"]
-    assert "Godot tests: 2200/2200 passed, 0 failed, 0 skipped" in result.stdout
+    if runner_name == "ci-godot-tests":
+        assert "Godot tests: 2200/2200 passed, 0 failed, 0 skipped" in result.stdout
+    else:
+        assert "PASS: slow suite completed" in result.stdout
+        assert not (ROOT / "test_project/tests/test_mcp_slow_smoke.gd").exists()

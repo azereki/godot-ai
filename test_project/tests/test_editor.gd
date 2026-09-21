@@ -6,6 +6,7 @@ const ErrorCodes := preload("res://addons/godot_ai/utils/error_codes.gd")
 const DiagnosticsCapture := preload("res://addons/godot_ai/utils/diagnostics_capture.gd")
 const EditorHandler := preload("res://addons/godot_ai/handlers/editor_handler.gd")
 const StubBacktrace := preload("res://tests/stub_backtrace.gd")
+const StubSessionPlugin := preload("res://tests/stub_debugger_session_plugin.gd")
 
 ## Tests for EditorHandler — editor state, selection, and logs.
 
@@ -63,12 +64,14 @@ func test_editor_state_game_capture_ready_false_without_debugger_plugin() -> voi
 
 
 func test_editor_state_game_capture_ready_tracks_debugger_plugin_flag() -> void:
-	var plugin := McpDebuggerPlugin.new()
+	var plugin := StubSessionPlugin.new()
 	var handler := EditorHandler.new(McpLogBuffer.new(), null, plugin)
 	var result := handler.get_editor_state({})
 	assert_eq(result.data.game_capture_ready, false, "starts false before mcp:hello")
 	plugin.begin_game_run()
 	plugin._setup_session(101)
+	assert_eq(plugin.stopped_connections, [101])
+	assert_eq(plugin.break_connections, [101])
 	plugin._capture("mcp:hello", [], 101)
 	result = handler.get_editor_state({})
 	assert_eq(result.data.game_capture_ready, true, "flips true once beacon arrives")
@@ -226,6 +229,42 @@ func test_screenshot_game_not_playing() -> void:
 	assert_eq(result.error.data.sub_code, ErrorCodes.SUB_EDITOR_GAME_NOT_RUNNING)
 
 
+# ----- game debug control (#939) -----
+
+func test_game_debug_verification_requires_exact_tick() -> void:
+	var before := {"process_ticks": 10, "suspended": true}
+	var pending := McpDebuggerPlugin.game_debug_verification(
+		"next_frame", before, {"process_ticks": 10, "suspended": true})
+	assert_eq(pending.status, "pending")
+	assert_eq(pending.ticks_advanced, 0)
+	var exact := McpDebuggerPlugin.game_debug_verification(
+		"next_frame", before, {"process_ticks": 11, "suspended": true})
+	assert_eq(exact.status, "verified")
+	assert_eq(exact.ticks_advanced, 1)
+	var not_resuspended := McpDebuggerPlugin.game_debug_verification(
+		"next_frame", before, {"process_ticks": 11, "suspended": false})
+	assert_eq(not_resuspended.status, "pending")
+	var too_many := McpDebuggerPlugin.game_debug_verification(
+		"next_frame", before, {"process_ticks": 12, "suspended": true})
+	assert_eq(too_many.status, "failed")
+	assert_eq(too_many.reason, "multiple_process_ticks")
+
+
+func test_game_debug_verification_suspend_resume_state() -> void:
+	var before := {"process_ticks": 3, "suspended": false}
+	var suspended := McpDebuggerPlugin.game_debug_verification(
+		"suspend", before, {"process_ticks": 3, "suspended": true})
+	assert_eq(suspended.status, "verified")
+	var resumed := McpDebuggerPlugin.game_debug_verification(
+		"resume", {"process_ticks": 3, "suspended": true},
+		{"process_ticks": 3, "suspended": false})
+	assert_eq(resumed.status, "verified")
+	var still_suspended := McpDebuggerPlugin.game_debug_verification(
+		"resume", {"process_ticks": 3, "suspended": true},
+		{"process_ticks": 3, "suspended": true})
+	assert_eq(still_suspended.status, "pending")
+
+
 # ----- game_command -----
 
 func test_game_command_missing_op() -> void:
@@ -235,7 +274,7 @@ func test_game_command_missing_op() -> void:
 
 func test_game_command_not_playing() -> void:
 	var plugin := McpDebuggerPlugin.new()
-	var handler := EditorHandler.new(McpLogBuffer.new(), McpConnection.new(), plugin)
+	var handler := EditorHandler.new(McpLogBuffer.new(), track(McpConnection.new()), plugin)
 	var result := handler.game_command({"op": "get_scene_tree"})
 	assert_is_error(result, ErrorCodes.EDITOR_NOT_READY)
 	## #651 stage 1: attribute the block to its concrete state.
@@ -248,7 +287,7 @@ func test_game_eval_not_playing_carries_sub_code() -> void:
 	## Same gate as game_command — the harness editor is never playing
 	## while the suite runs, so this exercises the real branch.
 	var plugin := McpDebuggerPlugin.new()
-	var handler := EditorHandler.new(McpLogBuffer.new(), McpConnection.new(), plugin)
+	var handler := EditorHandler.new(McpLogBuffer.new(), track(McpConnection.new()), plugin)
 	var result := handler.game_eval({"code": "return 1"})
 	assert_is_error(result, ErrorCodes.EDITOR_NOT_READY)
 	assert_eq(result.error.data.sub_code, ErrorCodes.SUB_EDITOR_GAME_NOT_RUNNING)
@@ -437,6 +476,53 @@ class _StubConnection:
 
 	func send_deferred_response(request_id: String, payload: Dictionary) -> void:
 		captured.append({"request_id": request_id, "payload": payload})
+
+
+func test_game_debug_direct_session_message_mapping() -> void:
+	var suspend := McpDebuggerPlugin.direct_game_debug_message("suspend", true)
+	assert_eq(suspend.message, "scene:suspend_changed")
+	assert_eq(suspend.data, [true])
+	var resume := McpDebuggerPlugin.direct_game_debug_message("resume", false)
+	assert_eq(resume.message, "scene:suspend_changed")
+	assert_eq(resume.data, [false])
+	var step := McpDebuggerPlugin.direct_game_debug_message("next_frame", false)
+	assert_eq(step.message, "scene:next_frame")
+	assert_eq(step.data, [])
+	assert_true(McpDebuggerPlugin.direct_game_debug_message("bad", false).is_empty())
+
+
+func test_game_debug_control_rejects_overlapping_mutation() -> void:
+	var plugin := McpDebuggerPlugin.new()
+	var conn := _StubConnection.new()
+	_mark_game_live(plugin)
+	plugin._pending["rid-active-suspend"] = {
+		"kind": "game_debug_control",
+		"action": "suspend",
+	}
+	plugin._begin_game_debug_control("resume", "rid-overlap", conn, 5.0)
+	assert_eq(conn.captured.size(), 1, "overlapping mutation must fail before another native toggle")
+	assert_eq(conn.captured[0].payload.error.code, ErrorCodes.EDITOR_NOT_READY)
+	assert_eq(conn.captured[0].payload.error.data.active_action, "suspend")
+	assert_eq(conn.captured[0].payload.error.data.action, "resume")
+	assert_true(conn.captured[0].payload.error.data.retryable)
+	plugin._pending.erase("rid-active-suspend")
+	conn.free()
+
+
+func test_game_debug_control_guard_reply_waits_for_deferred_registration() -> void:
+	var tree := Engine.get_main_loop() as SceneTree
+	if tree == null:
+		skip("No SceneTree available")
+		return
+	var plugin := McpDebuggerPlugin.new()
+	var conn := _StubConnection.new()
+	plugin.request_game_debug_control("not_an_action", "rid-debug-guard", conn)
+	assert_eq(conn.captured.size(), 0, "guard reply must not race the dispatcher registration")
+	await tree.process_frame
+	assert_eq(conn.captured.size(), 1, "deferred guard should reply on a later editor turn")
+	assert_eq(conn.captured[0].request_id, "rid-debug-guard")
+	assert_eq(conn.captured[0].payload.error.code, ErrorCodes.VALUE_OUT_OF_RANGE)
+	conn.free()
 
 
 ## Records the positive liveness transition without requiring a real debugger
@@ -2353,6 +2439,7 @@ func test_get_logs_source_invalid_message_lists_editor() -> void:
 ## have an empty label. Frame text uses the file *name*, not the res:// path.
 func _make_debugger_errors_tree() -> Tree:
 	var tree := Tree.new()
+	track(tree)
 	tree.set_columns(2)
 	tree.set_hide_root(true)
 	var root := tree.create_item()
@@ -2666,7 +2753,7 @@ func test_debugger_plugin_begin_game_run_rotates_run_id() -> void:
 
 
 func test_debugger_plugin_readiness_is_scoped_to_current_run() -> void:
-	var plugin := McpDebuggerPlugin.new()
+	var plugin := StubSessionPlugin.new()
 	plugin.begin_game_run()
 	plugin._setup_session(11)
 	plugin._capture("mcp:hello", [], 11)
@@ -3068,7 +3155,7 @@ func test_surfaced_error_tracker_record_synthetic_error_promotes_and_repromotes(
 
 func test_debugger_plugin_ignores_hello_from_stale_session() -> void:
 	var game_buf := McpGameLogBuffer.new()
-	var plugin := McpDebuggerPlugin.new(null, game_buf)
+	var plugin := StubSessionPlugin.new(null, game_buf)
 	plugin.begin_game_run()
 	var run_id := game_buf.run_id()
 	plugin._setup_session(22)
@@ -3112,7 +3199,7 @@ func test_debugger_plugin_mcp_run_self_quit_ends_run() -> void:
 	## signal — no stop op performs the bookkeeping, and game_status stayed
 	## "live" until the next run rewrote it.
 	var tracker := McpSurfacedErrorTracker.new()
-	var plugin := McpDebuggerPlugin.new(
+	var plugin := StubSessionPlugin.new(
 		McpLogBuffer.new(), McpGameLogBuffer.new(), McpEditorLogBuffer.new(), tracker)
 	plugin.begin_game_run(0, true)
 	plugin._setup_session(31)
@@ -3139,7 +3226,7 @@ func test_debugger_plugin_mcp_run_self_quit_ends_run() -> void:
 func test_debugger_plugin_note_editor_play_stopped_ends_run() -> void:
 	## Fallback for self-quit when the session stopped signal never fires:
 	## the connection's play-state poll reports the playing→stopped edge.
-	var plugin := McpDebuggerPlugin.new(
+	var plugin := StubSessionPlugin.new(
 		McpLogBuffer.new(), McpGameLogBuffer.new(), McpEditorLogBuffer.new(),
 		McpSurfacedErrorTracker.new())
 	plugin.begin_game_run(0, true)

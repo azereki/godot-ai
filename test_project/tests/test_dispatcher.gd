@@ -3,6 +3,17 @@ extends McpTestSuite
 
 const ErrorCodes := preload("res://addons/godot_ai/utils/error_codes.gd")
 const ProjectHandler := preload("res://addons/godot_ai/handlers/project_handler.gd")
+const ScriptWork := preload("res://addons/godot_ai/utils/script_work.gd")
+const PluginReload := preload("res://addons/godot_ai/utils/plugin_reload.gd")
+
+class _ReloadFilesystem extends RefCounted:
+	signal filesystem_changed
+	var scans := 0
+	func scan() -> void:
+		scans += 1
+
+class _ReloadDeadline extends RefCounted:
+	signal timeout
 
 ## Tests for McpDispatcher — specifically the crash-detection guardrail
 ## that catches handlers returning malformed results (null, empty dict,
@@ -19,6 +30,17 @@ class _FakeErrorTracker:
 			"debugger_promoted": 2,
 			"game_error_warn": 3,
 		}
+
+
+class _UntrackedHandler:
+	extends RefCounted
+	var owner
+
+
+class _RefusingHandler:
+	extends RefCounted
+	func quiesce_for_script_swap() -> Dictionary:
+		return {"ok": false, "error": "busy"}
 
 
 func suite_name() -> String:
@@ -231,6 +253,15 @@ func test_run_project_has_deferred_timeout_budget() -> void:
 	)
 
 
+func test_game_debug_control_deferred_timeout_outlives_editor_timer() -> void:
+	assert_has_key(McpDispatcher.DEFERRED_TIMEOUT_MS_BY_COMMAND, "game_debug_control")
+	assert_gt(
+		int(McpDispatcher.DEFERRED_TIMEOUT_MS_BY_COMMAND.game_debug_control),
+		int(McpDebuggerPlugin.GAME_DEBUG_CONTROL_TIMEOUT_SEC * 1000.0),
+		"dispatcher timeout must outlive the editor-side runtime-control timer",
+	)
+
+
 func test_client_status_has_30_second_deferred_timeout_budget() -> void:
 	assert_has_key(McpDispatcher.DEFERRED_TIMEOUT_MS_BY_COMMAND, "check_client_status")
 	assert_eq(
@@ -292,6 +323,81 @@ func test_tick_suppresses_deferred_response_and_threads_request_id() -> void:
 
 
 # ----- envelope-level readiness stamp (server-side stale-cache self-heal) -----
+
+
+func test_nested_tick_cannot_repeat_or_reorder_queued_commands() -> void:
+	var d := _make_dispatcher()
+	d.mcp_logging = false
+	var calls: Array[String] = []
+	var nested: Array[Dictionary] = []
+	d.register("pumps_editor", func(_p):
+		calls.append("first")
+		if calls.size() == 1:
+			d.enqueue({"request_id": "third", "command": "later", "params": {"value": "third"}})
+			nested.assign(d.tick(100.0))
+		return {"data": {"value": "first"}}
+	)
+	d.register("later", func(p):
+		calls.append(p.value)
+		return {"data": {"value": p.value}}
+	)
+	d.enqueue({"request_id": "first", "command": "pumps_editor", "params": {}})
+	d.enqueue({"request_id": "second", "command": "later", "params": {"value": "second"}})
+	var responses := d.tick(100.0)
+	assert_eq(nested.size(), 0, "a reentered tick must not dispatch or emit responses")
+	assert_eq(calls, ["first", "second", "third"], "queued commands execute once in order")
+	var returned_ids: Array[String] = []
+	var returned_values: Array[String] = []
+	for response in responses:
+		returned_ids.append(response.request_id)
+		returned_values.append(response.data.value)
+	assert_eq(returned_ids, ["first", "second", "third"])
+	assert_eq(returned_values, ["first", "second", "third"])
+	d.enqueue({"request_id": "fourth", "command": "later", "params": {"value": "fourth"}})
+	responses = d.tick(100.0)
+	assert_eq(responses.size(), 1, "the outer tick releases the guard for later frames")
+	assert_eq(responses[0].data.value, "fourth")
+	assert_eq(d.tick(100.0).size(), 0, "all commands are consumed")
+	d.release_after_teardown()  # Break the handler's captured dispatcher reference.
+
+
+func test_reload_reservation_holds_later_commands_until_scan_timeout() -> void:
+	var d := _make_dispatcher()
+	d.mcp_logging = false
+	var work := [0]
+	var calls: Array[String] = []
+	d.register("reserve_reload", func(_p):
+		work[0] = PluginReload.reserve_reload()
+		calls.append("reload")
+		return {"data": {"status": "reloading"}}
+	)
+	d.register("write_after_reload", func(_p):
+		calls.append("write")
+		return {"data": {"written": true}}
+	)
+	d.enqueue({"request_id": "reload", "command": "reserve_reload", "params": {}})
+	d.enqueue({"request_id": "write", "command": "write_after_reload", "params": {}})
+	var responses := d.tick(100.0)
+	assert_eq(responses.size(), 1, "reload response still returns before the deferred scan")
+	assert_eq(responses[0].request_id, "reload")
+	assert_eq(calls, ["reload"], "no later handler starts in the reservation frame")
+	assert_eq(d.tick(100.0).size(), 0, "later frames remain gated before scan starts")
+	assert_eq(PluginReload.reserve_reload(), 0, "a duplicate cannot replace the reservation")
+	var filesystem := _ReloadFilesystem.new()
+	var timer := _ReloadDeadline.new()
+	PluginReload._start_scan(filesystem, timer, work[0])
+	assert_eq(filesystem.scans, 1)
+	assert_eq(d.tick(100.0).size(), 0, "an unfinished scan retains the gate")
+	timer.timeout.emit()
+	assert_false(PluginReload.is_reload_pending(), "timeout releases the reservation")
+	assert_false(ScriptWork._active.has(work[0]), "timeout settles the same work entry")
+	PluginReload._finish_scan(work[0], false)  # A late completion cannot restart the reload.
+	responses = d.tick(100.0)
+	assert_eq(calls, ["reload", "write"], "timeout resumes the untouched queued command once")
+	assert_eq(responses.size(), 1)
+	assert_eq(responses[0].request_id, "write")
+	assert_true(responses[0].data.written)
+	d.release_after_teardown()
 
 
 func test_tick_stamps_envelope_readiness_on_success_response() -> void:
@@ -534,6 +640,86 @@ func test_clear_quiesces_lazy_handlers_before_release() -> void:
 	assert_true(d._lazy_handler_cache.is_empty())
 
 
+func test_teardown_releases_cycle_without_authorizing_script_swap() -> void:
+	var d := _make_dispatcher()
+	d.register_lazy_handler("batch", "res://addons/godot_ai/handlers/batch_handler.gd", [d, null])
+	d.register_lazy("batch_execute", "batch", &"batch_execute")
+	assert_true(d._materialize_lazy_command("batch_execute").is_empty())
+	var handler_ref: WeakRef = weakref(d._lazy_handler_cache["batch"])
+	var dispatcher_ref: WeakRef = weakref(d)
+	d.enqueue({"command": "batch_execute", "request_id": "queued", "params": {}})
+	d._pending_deferred["waiting"] = {"command": "batch_execute"}
+	var result := d.clear()
+	assert_false(result.ok, "an unanswered request must still block hot replacement")
+	assert_true(d.has_command("batch_execute"), "failed hot-swap quiescence must retain the graph")
+	assert_true(handler_ref.get_ref() != null)
+	d.release_after_teardown()
+	assert_false(d.has_command("batch_execute"))
+	assert_true(d._command_queue.is_empty())
+	assert_eq(d.pending_deferred_count(), 0)
+	assert_eq(d._log_buffer, null)
+	assert_eq(handler_ref.get_ref(), null, "ordinary teardown must release cached handler cycles")
+	d = null
+	assert_eq(dispatcher_ref.get_ref(), null, "constructor args must not retain the dispatcher")
+
+
+func test_untracked_handler_still_refuses_hot_swap_but_can_be_released() -> void:
+	var d := _make_dispatcher()
+	var handler := _UntrackedHandler.new()
+	handler.owner = d
+	d._lazy_handler_cache["untracked"] = handler
+	var result := d.clear()
+	assert_false(result.ok)
+	assert_contains(result.error, "cannot prove quiescence")
+	d.release_after_teardown()
+	assert_true(d._lazy_handler_cache.is_empty())
+	handler.owner = null
+
+
+func test_handler_refusal_leaves_references_intact() -> void:
+	var d := _make_dispatcher()
+	d._lazy_handler_cache["busy"] = _RefusingHandler.new()
+	assert_false(d.clear().ok)
+	assert_true(d._lazy_handler_cache.has("busy"))
+	d.release_after_teardown()
+
+
+func test_work_ledger_outlives_response_timeout_and_ordinary_teardown() -> void:
+	var first := _make_dispatcher()
+	var second := _make_dispatcher()
+	var work := ScriptWork.begin("test-owned coroutine")
+	first._pending_deferred["request"] = {"command": "open_scene"}
+	first.clear_deferred_responses()
+	assert_false(first.quiesce_for_script_swap().ok)
+	first.release_after_teardown()
+	assert_false(second.quiesce_for_script_swap().ok,
+		"a new composition must not forget work in the old scripts")
+	ScriptWork.finish(work)
+	assert_true(second.quiesce_for_script_swap().ok)
+	ScriptWork.finish(work)
+	assert_true(ScriptWork.quiescence().ok, "completion is idempotent")
+
+
+func test_completed_builtin_handler_can_be_cleared_for_hot_swap() -> void:
+	var d := _make_dispatcher()
+	d.register_lazy_handler("batch", "res://addons/godot_ai/handlers/batch_handler.gd", [d, null])
+	d.register_lazy("batch_execute", "batch", &"batch_execute")
+	assert_true(d._materialize_lazy_command("batch_execute").is_empty())
+	var handler_ref: WeakRef = weakref(d._lazy_handler_cache["batch"])
+	assert_true(d.clear().ok)
+	assert_eq(handler_ref.get_ref(), null)
+	assert_false(d.has_command("batch_execute"))
+
+
+func test_coroutine_early_return_releases_its_work_entry() -> void:
+	var scene_script := load("res://addons/godot_ai/handlers/scene_handler.gd")
+	scene_script._finish_open_scene_deferred(null, "unused", "res://main.tscn", 0, {})
+	var filesystem_script := load("res://addons/godot_ai/handlers/filesystem_handler.gd")
+	filesystem_script._finish_scan_deferred(null, "unused", null)
+	McpResourceIO.finish_text_write_deferred(null, "unused", "res://unused.gd", {})
+	assert_true(ScriptWork.quiescence().ok)
+
+
 func test_lazy_command_dispatches_via_queue_tick() -> void:
 	var d := _make_lazy_dispatcher()
 	d.enqueue({"request_id": "r-lazy", "command": "lazy_echo", "params": {"value": 5}})
@@ -616,7 +802,7 @@ func test_live_dispatcher_materializes_every_lazy_command() -> void:
 		skip("live dispatcher not exposed in ctx (old test_handler fixture)")
 		return
 	var specs: Dictionary = _live_dispatcher._lazy_handler_specs
-	assert_eq(specs.size(), 30, "every plugin handler should be declared lazily")
+	assert_eq(specs.size(), 32, "every plugin handler should be declared lazily")
 	var commands: Array = _live_dispatcher._lazy_commands.keys()
 	assert_true(commands.size() > 100,
 		"expected the full plugin command surface registered lazily, got %d" % commands.size())

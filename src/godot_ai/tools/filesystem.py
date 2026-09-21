@@ -45,27 +45,19 @@ Ops:
   • search(name="", type="", path="", offset=0, limit=100)
         Find files by name, resource type, or path substring. At least one
         filter must be set. Paginated.
-  • move(path, new_path)
-        Move a file or folder to a new ``res://`` path through the editor,
-        the way the FileSystem dock does it: ``.uid``/``.import`` sidecars
-        travel with the file, ``uid://`` references keep resolving, dependent
-        ``.tscn``/``.tres`` files get their ``path=`` references rewritten,
-        autoloads and file-typed project settings are updated, and the
-        editor filesystem cache is refreshed. Refuses when ``new_path``
-        already exists. Scripts that name the old path as a string
-        (``preload()``/``load()``) are not rewritten (the editor doesn't
-        either) and are listed under ``script_references_unfixed`` — patch
-        those with ``script_patch``. Not undoable.
-  • rename(path, new_name)
-        Rename a file or folder in place. ``new_name`` is a bare name (no
-        ``/``); same fixups and response shape as ``move``.
-  • remove(path, force=false, permanent=false)
-        Delete a file or folder. Refuses (with ``error.data.referenced_by``)
-        when another resource still references it unless ``force=true``.
-        Defaults to the OS trash, like the editor's own Delete, so a mistake
-        is recoverable; ``permanent=true`` deletes outright. Releases the
-        file's ``uid`` and clears autoloads / project settings that pointed
-        at it. Not undoable.
+  • move(path, new_path), rename(path, new_name)
+        Move a resource group with .uid/.import sidecars and preserve proven
+        UID references. Destination parent must exist. Literal-path owners,
+        project settings, open scene tabs, links and incomplete discovery are
+        refused before mutation; dependency rewriting is unsupported.
+  • remove(path, force=False, permanent=False)
+        Default: OS trash. Known references block unless force=True; force
+        never overrides incomplete discovery or protected paths. Permanent
+        deletion supports files only. Directory deletion uses trash.
+        Mutations require a direct call, not batch_execute. Directory results
+        set scan_required: call scan afterward. All mutations are non-undoable.
+        Errors report outcome unchanged/rolled_back/partial and actual affected
+        paths. Never blindly retry a partial result.
 """
 
 

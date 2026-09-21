@@ -2,6 +2,38 @@
 
 This guide is for any AI assistant working in this repository. Keep Claude-specific files such as `.claude/CLAUDE.md` and `.claude/skills/*` as thin pointers to this shared guidance.
 
+## PR activity monitoring
+
+Whenever a PR is created, opened, or identified in the conversation, check its
+state and start monitoring without asking again, unless it is already closed
+or merged. This authorizes read-only monitoring and notifications, not posting
+comments, changing code, rerunning CI, or merging.
+
+- Discover the current environment's tools. Prefer a native PR activity
+  subscription (such as `subscribe_pr_activity`) when actually available;
+  confirm success and retain its subscription identifier. Do not assume a
+  particular tool namespace or that GitHub access includes subscriptions.
+- If subscriptions are unavailable but durable task automations are supported,
+  reuse an existing monitor for the same repository and PR or create a
+  15-minute heartbeat attached to the current task. Poll PR comments, inline
+  review comments, submitted reviews, CI results, merge conflicts, and PR state
+  using the authenticated GitHub connector or `gh`. Keep the last seen state,
+  report existing actionable feedback once, and notify only on new actionable
+  feedback, failures, conflicts, access failures, or closure/merge. Stay quiet
+  otherwise; stop the monitor after closure/merge.
+- If neither capability is available, check current feedback and CI, then
+  explicitly report that persistent monitoring was not started and which
+  capability is missing. A one-time read, shell polling process, GitHub email
+  subscription, or written instruction is not a durable task subscription.
+- Report the confirmed monitoring mechanism when starting it. Never claim
+  monitoring is active without a successful subscription/automation response.
+
+This policy applies to local and cloud sessions. Check capabilities separately
+in each environment: local Codex settings and credentials do not establish
+cloud tool availability. Do not add a guessed MCP endpoint or install an
+integration merely because it has GitHub in its name. A future provider must
+be verified to expose the subscription and deliver events to the task.
+
 ## What this project is
 
 A production-grade MCP server for Godot. Python server (FastMCP v3) communicates over WebSocket with a GDScript editor plugin. AI clients call MCP tools → Python routes commands → Godot plugin executes against the editor API → results flow back.
@@ -32,6 +64,7 @@ directory names say what they hold. The parts the layout does *not* tell you:
 - **Error codes**: Defined in `protocol/errors.py` (Python) and `utils/error_codes.gd` (GDScript). Keep in sync. Use Godot's built-in `error_string(err)` to translate numeric error codes in error messages — do not write a custom lookup table.
 - **Tools return `dict`**: Handlers call `runtime.send_command(command, params)` which returns a dict or raises. Tools create a `DirectRuntime` and delegate to handlers.
 - **Plugin runs on main thread**: All GDScript executes in `_process()` with a 4ms frame budget. Never block. Use `call_deferred` for scene tree mutations.
+- **Reloading the plugin frees the running instance**: the only safe shape is `PluginReload.reload_enabled_plugin.call_deferred()` — the static callable itself, deferred. Never call `reload_enabled_plugin()` from a `plugin.gd` method, including a deferred one: it returns into a freed script and crashes the editor. `tests/unit/test_plugin_reload_deferral.py` locks this.
 - **Scene paths are clean**: `/Main/Camera3D` format, not raw Godot internal paths. Use `McpScenePath.from_node(node, scene_root)` in GDScript.
 - **Class naming**: classes that need a project-wide `class_name` (i.e. used as a type annotation across multiple files or exposed to third-party addons) carry the `Mcp*` prefix to avoid colliding with user-project classes. Internals only used inside the plugin (handlers, presets/values, test stubs) skip `class_name` and load by path. Handlers are registered lazily so `plugin.gd` does not preload their compile closure. V4 is a clean break from pre-v4 updater and wire compatibility, not a silent revocation of published addon APIs: any previously shipped `class_name` needs an explicit API decision before removal and may remain as a tiny path/UID-stable shim.
 - **MCP logging**: Plugin prints `MCP | [recv] command(params)` / `MCP | [send] command -> ok` to Godot console. Controlled by the dock's "Log" toggle, persisted via EditorSetting `godot_ai/mcp_logging` (routes to the dispatcher `mcp_logging` var and `McpLogBuffer.enabled` console echo). High-frequency `[event] readiness -> ...` lines record to the ring buffer only (`log(msg, echo=false)`) and never echo to the console (#626).
@@ -108,6 +141,7 @@ cd ~/godot-ai
 script/setup-dev             # creates .venv, installs deps, applies macOS .pth fix
 source .venv/bin/activate
 pytest -v                    # run tests
+pytest -m "not editor"       # iterate: skip the rows that launch a real editor
 ```
 
 `uv.lock` is intentionally untracked: dependencies resolve from `pyproject.toml`, and CI installs with pip (`pip install -e ".[dev]"`) rather than enforcing a uv lockfile.
@@ -127,11 +161,17 @@ Or in cmd: `mklink /J test_project\addons\godot_ai ..\..\plugin\addons\godot_ai`
 **When troubleshooting any dev-environment / setup / dependency / symlink issue, scan `script/` first** for an existing fixer before doing it by hand. The project ships scripts for a reason — bypassing them re-introduces the bugs they were written to handle.
 
 - Server start/adopt/teardown, discovery tiers, `editor_reload_plugin`: [docs/server-lifecycle.md](docs/server-lifecycle.md)
-- Cutting a release, and the self-update install path: [docs/releasing.md](docs/releasing.md).
-  **Any change touching update discovery, `update_manager.gd`,
-  `update_coordinator.gd`, `update_transaction.py`, `release_verify.py`, plugin
-  disable/enable or startup barriers, or the signed release layout must run
-  `python script/local-self-update-smoke`.**
+- Cutting a release: [docs/releasing.md](docs/releasing.md). The release
+  candidate's source commit carries the release's `CHANGELOG.md` entry; the
+  published notes link to that file at that commit.
+- Self-update, migration capsule, or release verification changes:
+  [docs/self-update.md](docs/self-update.md). **Any change touching update
+  discovery, `update_manager.gd`, `release_verifier.gd`, `update_installer.gd`,
+  `release_verify.py`, the migration bridge, plugin disable/enable, or the
+  signed release layout must pass `test_project/tests/test_update_installer.gd`
+  and the three real-editor scenarios in
+  `tests/integration/test_self_update_upgrade_paths.py` (run with `GODOT_BIN`
+  set).**
 
 ## Testing
 
@@ -175,10 +215,25 @@ A test that passes for the wrong reason is worse than a missing test: it ships a
 
 ## Before you commit
 
-**Always run the full gauntlet before every commit** — `ruff check`, `pytest -v`,
-then `test_run` against a live Godot editor, plus a live smoke of anything you
-changed. Python mocks do not catch GDScript bugs, editor API regressions, or
-undo/redo breakage. Steps: [docs/verification.md](docs/verification.md).
+**Before every commit:** `ruff check`, `pytest -m "not editor"`, then `test_run`
+against a live Godot editor, plus a live smoke of anything you changed. Python
+mocks do not catch GDScript bugs, editor API regressions, or undo/redo
+breakage. Steps: [docs/verification.md](docs/verification.md).
+
+**Turn the real-editor rows on deliberately, not by default.** The tests marked
+`editor` launch a real Godot editor (needs `GODOT_BIN` pointing at a 4.7+
+engine) and take about fifteen minutes. Run the full `pytest -v` with them:
+
+- before a commit that touches the server lifecycle, `update_manager.gd`,
+  `update_installer.gd`, `release_verifier.gd`, `release_verify.py`, the
+  migration bridge, plugin disable/enable, the attach bridge, or client
+  configuration;
+- before cutting a release, on each desktop OS the release claims.
+
+CI runs them nightly and in release qualification on Linux, macOS and
+Windows, so a skipped local run is never the last line of defence; a wrong
+`GODOT_BIN` (an engine below 4.7) is worse than an unset one, because the
+rows then run, fail slowly, and prove nothing.
 
 ## Tool inventory sources
 

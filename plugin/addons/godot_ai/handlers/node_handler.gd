@@ -1,5 +1,5 @@
 @tool
-extends RefCounted
+extends "res://addons/godot_ai/handlers/command_handler.gd"
 
 const ErrorCodes := preload("res://addons/godot_ai/utils/error_codes.gd")
 const VariantSerializer := preload("res://addons/godot_ai/utils/variant_serializer.gd")
@@ -766,6 +766,14 @@ static func _coerce_value(value: Variant, target_type: int) -> Variant:
 		TYPE_FLOAT:
 			if value is int:
 				return float(value)
+			if value is String:
+				## #964: some MCP clients stringify float arguments ("4.0").
+				## Accept strictly-numeric strings; unparseable ones flow
+				## through unchanged so _check_coerced raises the typed
+				## WRONG_TYPE error instead of a silent zero/null write.
+				var parsed: Variant = McpJsonValues.parse_float(value)
+				if parsed != null:
+					return parsed
 		TYPE_STRING_NAME:
 			if value is String:
 				return StringName(value)

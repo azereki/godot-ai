@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import time
 from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
@@ -59,6 +60,9 @@ from godot_ai.resources.project import register_project_resources
 from godot_ai.resources.scenes import register_scene_resources
 from godot_ai.resources.scripts import register_script_resources
 from godot_ai.resources.sessions import register_session_resources
+from godot_ai.resources.shaders import register_shader_resources
+from godot_ai.resources.visual_shaders import register_visual_shader_resources
+from godot_ai.runtime_info import disarm_startup_report, report_startup_failure
 from godot_ai.services.custom_tool_service import CustomToolService
 from godot_ai.services.promoted_tools import PromotedToolRegistrar
 from godot_ai.sessions.registry import SessionRegistry
@@ -242,7 +246,10 @@ _ROLLUP_BLOCKS: tuple[tuple[str | None, str], ...] = (
     (
         "material",
         "  material_manage  create, set_param, set_shader_param, get, list, assign,\n"
-        "                   apply_to_node, apply_preset\n",
+        "                   apply_to_node, apply_preset, shader_create, shader_get,\n"
+        "                   shader_validate, shader_patch, visual_shader_create_graph,\n"
+        "                   visual_shader_get, visual_shader_node_catalog,\n"
+        "                   visual_shader_edit\n",
     ),
     (
         "audio",
@@ -286,7 +293,8 @@ _ROLLUP_BLOCKS: tuple[tuple[str | None, str], ...] = (
         "resource",
         "  resource_manage  search, load, assign, get_info, create,\n"
         "                   curve_set_points, environment_create,\n"
-        "                   physics_shape_autofit, gradient_texture_create,\n"
+        "                   physics_shape_autofit, physics_shape_generate,\n"
+        "                   gradient_texture_create,\n"
         "                   noise_texture_create\n",
     ),
     ("api", "  api_manage       get_class\n"),
@@ -316,9 +324,10 @@ _INSTRUCTIONS_FOOTER = (
     "  godot://logs/recent, godot://scene/current, godot://scene/hierarchy,\n"
     "  godot://node/{path}/properties|children|groups,\n"
     "  godot://class/{class_name},\n"
-    "  godot://script/{path}, godot://project/info, godot://project/settings,\n"
-    "  godot://materials, godot://input_map, godot://performance,\n"
-    "  godot://test/results, godot://custom-tools\n\n"
+    "  godot://script/{path}, godot://shader/{path}, godot://project/info,\n"
+    "  godot://project/settings, godot://materials, godot://input_map,\n"
+    "  godot://performance, godot://test/results, godot://custom-tools,\n"
+    "  godot://visual_shader/{path}\n\n"
     "Code-mode adapters keep server and member names separate: "
     "call('godot-ai', 'editor_state', {}) and "
     "readResource('godot-ai', 'godot://scene/current'). Never prefix the "
@@ -413,6 +422,7 @@ def create_server(
     exclude_domains: Iterable[str] | None = None,
     owner_pid: int | None = None,
     allow_host_networks: Sequence[IPNetwork] | None = None,
+    ws_socket: socket.socket | None = None,
 ) -> FastMCP:
     logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
     capabilities = validate_launch_capabilities(capabilities.http, capabilities.websocket)
@@ -448,6 +458,7 @@ def create_server(
             registry,
             port=ws_port,
             auth_token=capabilities.websocket,
+            **({"sock": ws_socket} if ws_socket is not None else {}),
         )
         client = GodotClient(ws_server)
 
@@ -459,10 +470,17 @@ def create_server(
                 break
             except PortClaimUnavailable as exc:
                 if loop.time() >= claim_deadline:
-                    raise RuntimeError(
+                    claimed = RuntimeError(
                         f"HTTP port {http_port} is already claimed by another godot-ai server"
-                    ) from exc
+                    )
+                    report_startup_failure(claimed)
+                    raise claimed from exc
                 await asyncio.sleep(0.05)
+            except OSError as exc:
+                ## The claim lives in the capability directory; a directory
+                ## this account cannot use fails here, before any listener.
+                report_startup_failure(exc)
+                raise
 
         ws_task = asyncio.create_task(ws_server.start())
         logger.info("WebSocket server starting on port %d", ws_server.port)
@@ -474,7 +492,14 @@ def create_server(
                 capabilities.websocket,
                 instance_nonce=SERVER_INSTANCE_ID,
             )
-        except BaseException:
+            ## Published: from here on a failure is a runtime fault the
+            ## plugin sees through the authenticated status route.
+            disarm_startup_report()
+        except BaseException as exc:
+            ## Uvicorn swallows a lifespan startup failure into a log line and
+            ## an exit code; the report is how the editor learns the cause.
+            if not isinstance(exc, asyncio.CancelledError):
+                report_startup_failure(exc)
             ws_task.cancel()
             try:
                 await ws_task
@@ -885,6 +910,8 @@ def create_server(
     register_project_resources(mcp)
     register_node_resources(mcp)
     register_script_resources(mcp)
+    register_visual_shader_resources(mcp)
+    register_shader_resources(mcp)
     register_library_resources(mcp)
     register_class_resources(mcp)
     register_custom_tools_resources(mcp)

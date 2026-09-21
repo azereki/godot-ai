@@ -26,6 +26,8 @@ var _had_http_port_setting := false
 var _saved_http_port: Variant = null
 var _had_ws_port_setting := false
 var _saved_ws_port: Variant = null
+var _had_v4_endpoint_ports := false
+var _saved_v4_endpoint_ports: Variant = null
 ## Same reason as the ports: these tests drive godot_ai/mcp_client_scope
 ## through its valid and invalid values and must not leave the editor
 ## registering at a scope the user never chose.
@@ -69,6 +71,11 @@ func suite_setup(_ctx: Dictionary) -> void:
 		_had_ws_port_setting = es.has_setting(McpClientConfigurator.SETTING_WS_PORT)
 		if _had_ws_port_setting:
 			_saved_ws_port = es.get_setting(McpClientConfigurator.SETTING_WS_PORT)
+		_had_v4_endpoint_ports = es.has_setting(McpClientConfigurator.SETTING_V4_ENDPOINT_PORTS)
+		if _had_v4_endpoint_ports:
+			_saved_v4_endpoint_ports = es.get_setting(McpClientConfigurator.SETTING_V4_ENDPOINT_PORTS)
+			if _saved_v4_endpoint_ports is Dictionary or _saved_v4_endpoint_ports is Array:
+				_saved_v4_endpoint_ports = _saved_v4_endpoint_ports.duplicate(true)
 		_had_client_scope_setting = es.has_setting(McpSettings.SETTING_CLIENT_SCOPE)
 		if _had_client_scope_setting:
 			_saved_client_scope = es.get_setting(McpSettings.SETTING_CLIENT_SCOPE)
@@ -92,7 +99,7 @@ func test_registry_loads_all_clients() -> void:
 		"Every registered client script must load; got %d of %d" % [ids.size(), McpClientRegistry._CLIENT_SCRIPT_PATHS.size()]
 	)
 	# Each existing client must remain registered for behaviour parity.
-	for required in ["claude_code", "claude_desktop", "codex", "grok", "antigravity", "zoo_code", "hermes", "pi", "deepseek_harness"]:
+	for required in ["claude_code", "claude_desktop", "codex", "grok", "antigravity", "zoo_code", "hermes", "pi", "deepseek_harness", "codebuddy"]:
 		assert_true(McpClientRegistry.has_id(required), "Missing client: %s" % required)
 
 
@@ -273,6 +280,23 @@ func test_kimi_code_client_json_descriptor() -> void:
 	assert_eq(client.server_key_path.size(), 1)
 	assert_eq(String(client.server_key_path[0]), "mcpServers")
 	assert_eq(client.entry_extra_fields.get("transport"), "http")
+
+
+func test_opencode_client_declares_json_then_jsonc_merge_tiers() -> void:
+	var client := McpClientRegistry.get_by_id("opencode")
+	assert_true(client != null, "OpenCode descriptor must be registered")
+	if client == null:
+		return
+	var merge_templates: Dictionary = client.get("config_merge_path_templates")
+	assert_false(merge_templates.is_empty(), "OpenCode must declare its merge tiers (#1011)")
+	var merge_key := McpPathTemplate.platform_key(merge_templates)
+	assert_false(merge_key.is_empty(), "OpenCode merge tiers must support this platform")
+	if not merge_key.is_empty():
+		var merge_paths: PackedStringArray = merge_templates[merge_key]
+		assert_eq(merge_paths.size(), 2)
+		if merge_paths.size() == 2:
+			assert_true(String(merge_paths[0]).ends_with("/opencode.json"))
+			assert_true(String(merge_paths[1]).ends_with("/opencode.jsonc"), "jsonc is the winning tier")
 
 
 func test_pi_client_json_descriptor() -> void:
@@ -1442,55 +1466,6 @@ func test_env_lookup_worker_thread_never_warmed_var_reads_empty() -> void:
 	OS.unset_environment(NEVER_WARMED)
 	assert_eq(worker_value, "",
 		"un-warmed worker read must degrade to \"\", never touch the live env")
-
-
-func test_startup_actor_discovery_warms_home_for_its_worker() -> void:
-	## GUI-launched editors often have a minimal PATH. The startup worker must
-	## still find uvx in the user's well-known home directory without reading
-	## the process environment off-main.
-	var saved_home := OS.get_environment("HOME")
-	var saved_profile := OS.get_environment("USERPROFILE")
-	var fake_home := _scratch_dir.path_join("startup_actor_home")
-	_remove_dir_recursive(fake_home)
-	var bin_dir := fake_home.path_join(".local/bin")
-	DirAccess.make_dir_recursive_absolute(bin_dir)
-	var exe_name := "uvx.exe" if OS.get_name() == "Windows" else "uvx"
-	var expected := bin_dir.path_join(exe_name)
-	var fixture := FileAccess.open(expected, FileAccess.WRITE)
-	assert_true(fixture != null, "must create the well-known uvx fixture")
-	if fixture == null:
-		_remove_dir_recursive(fake_home)
-		return
-	fixture.store_string("fixture")
-	fixture.close()
-
-	if OS.get_name() == "Windows":
-		OS.unset_environment("HOME")
-		OS.set_environment("USERPROFILE", fake_home)
-	else:
-		OS.set_environment("HOME", fake_home)
-	McpClientConfigurator.invalidate_uvx_cli_cache()
-	McpClientConfigurator.warm_update_actor_discovery_env()
-	var thread := Thread.new()
-	var start_err := thread.start(func() -> String:
-		return McpClientConfigurator.find_uvx()
-	)
-	var found := str(thread.wait_to_finish()) if start_err == OK else ""
-
-	if saved_home.is_empty():
-		OS.unset_environment("HOME")
-	else:
-		OS.set_environment("HOME", saved_home)
-	if saved_profile.is_empty():
-		OS.unset_environment("USERPROFILE")
-	else:
-		OS.set_environment("USERPROFILE", saved_profile)
-	McpClientConfigurator.invalidate_uvx_cli_cache()
-	McpClientConfigurator.warm_update_actor_discovery_env()
-	_remove_dir_recursive(fake_home)
-
-	assert_eq(start_err, OK, "startup actor discovery worker must start")
-	assert_eq(found, expected, "worker must use the main-thread-warmed home snapshot")
 
 
 func test_editor_setting_lookup_worker_thread_serves_snapshot() -> void:
@@ -4196,6 +4171,46 @@ func test_claude_desktop_migration_omits_empty_env() -> void:
 	assert_false(entry.has("env"), "an env object emptied by migration must be omitted")
 
 
+func test_consoleless_python_keeps_direct_sibling_without_probe() -> void:
+	var directory := _scratch_dir.path_join("direct_python")
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(directory))
+	var python := ProjectSettings.globalize_path(directory.path_join("python.exe"))
+	var pythonw := ProjectSettings.globalize_path(directory.path_join("pythonw.exe"))
+	_write_text(python, "fixture interpreter")
+	_write_text(pythonw, "fixture GUI interpreter")
+	assert_eq(McpClientConfigurator._consoleless_python_for_interpreter(
+		python, {"exit_code": 1, "stdout": ""}
+	), pythonw, "an installed sibling needs no subprocess")
+
+
+func test_consoleless_python_resolves_uv_launcher_base_interpreter() -> void:
+	var directory := _scratch_dir.path_join("managed_python")
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(directory))
+	var launcher := ProjectSettings.globalize_path(_scratch_dir.path_join("python3.14.exe"))
+	var python := ProjectSettings.globalize_path(directory.path_join("python.exe"))
+	var pythonw := ProjectSettings.globalize_path(directory.path_join("pythonw.exe"))
+	_write_text(launcher, "fixture uv launcher")
+	_write_text(python, "fixture base interpreter")
+	_write_text(pythonw, "fixture GUI interpreter")
+	assert_eq(McpClientConfigurator._consoleless_python_for_interpreter(
+		launcher, {"exit_code": 0, "stdout": python + "\r\n"}
+	), pythonw, "a launcher without a sibling resolves the installed GUI interpreter")
+	for invalid in [
+		{"exit_code": 1, "stdout": python},
+		{"exit_code": 0, "stdout": "relative/python.exe"},
+		{"exit_code": 0, "stdout": python + "\nextra output"},
+		{"exit_code": 0, "stdout": python + ".missing"},
+		{"exit_code": 0, "stdout": 42},
+	]:
+		assert_eq(McpClientConfigurator._consoleless_python_for_interpreter(
+			launcher, invalid
+		), "", "failed or malformed interpreter discovery must not produce a launch")
+	DirAccess.remove_absolute(pythonw)
+	assert_eq(McpClientConfigurator._consoleless_python_for_interpreter(
+		launcher, {"exit_code": 0, "stdout": python}
+	), "", "a missing GUI interpreter must keep discovery unavailable")
+
+
 func test_claude_desktop_missing_launch_is_error_without_write() -> void:
 	var path := _scratch_dir.path_join("claude_attach_missing_launch.json")
 	_remove_if_exists(path)
@@ -5632,6 +5647,7 @@ func _clear_port_settings() -> void:
 	var es := EditorInterface.get_editor_settings()
 	if es == null:
 		return
+	es.erase(McpClientConfigurator.SETTING_V4_ENDPOINT_PORTS)
 	es.set_setting(McpSettings.SETTING_HTTP_PORT, McpClientConfigurator.DEFAULT_HTTP_PORT)
 	es.set_setting(McpClientConfigurator.SETTING_WS_PORT, McpClientConfigurator.DEFAULT_WS_PORT)
 
@@ -5648,6 +5664,13 @@ func _restore_port_settings() -> void:
 		es.set_setting(McpClientConfigurator.SETTING_WS_PORT, _saved_ws_port)
 	elif es.has_setting(McpClientConfigurator.SETTING_WS_PORT):
 		es.erase(McpClientConfigurator.SETTING_WS_PORT)
+	if _had_v4_endpoint_ports:
+		var saved: Variant = _saved_v4_endpoint_ports
+		if saved is Dictionary or saved is Array:
+			saved = saved.duplicate(true)
+		es.set_setting(McpClientConfigurator.SETTING_V4_ENDPOINT_PORTS, saved)
+	else:
+		es.erase(McpClientConfigurator.SETTING_V4_ENDPOINT_PORTS)
 	_restore_client_scope()
 
 
@@ -6397,3 +6420,253 @@ func test_text_remove_server_entry_bom_no_match_returns_unchanged() -> void:
 	var body := "﻿" + '{"mcpServers": {"other": {"command": "x"}}}'
 	var updated: String = helper._text_remove_server_entry(body, PackedStringArray(["mcpServers"]), McpClientConfigurator.SERVER_NAME)
 	assert_eq(updated, body, "no-op must leave file byte-for-byte identical; got: %s" % updated)
+
+
+# ----- post-update migration ownership -----
+
+
+func test_launch_mentions_godot_ai_recognizes_our_launch_shapes_only() -> void:
+	assert_true(McpClient.launch_mentions_godot_ai("uvx --from godot-ai==3.2.4 godot-ai"))
+	assert_true(McpClient.launch_mentions_godot_ai("/x/bin/godot-ai attach"))
+	assert_true(McpClient.launch_mentions_godot_ai("C:\\Tools\\godot-ai.exe attach"))
+	assert_true(McpClient.launch_mentions_godot_ai("python -m godot_ai"))
+	assert_true(McpClient.launch_mentions_godot_ai("uvx godot-ai==4.0.0"))
+	assert_false(McpClient.launch_mentions_godot_ai("/usr/bin/python3 my_server.py"))
+	## Mentions that are not launches: a docs URL, a project directory, a name.
+	assert_false(McpClient.launch_mentions_godot_ai("node server.js https://example.com/godot-ai/docs"))
+	assert_false(McpClient.launch_mentions_godot_ai("/home/me/projects/godot-ai/run.sh"))
+	assert_false(McpClient.launch_mentions_godot_ai("my-godot-ai-proxy --port 1"))
+	assert_false(McpClient.launch_mentions_godot_ai("godot-ai-helper"))
+	assert_false(McpClient.launch_mentions_godot_ai(""))
+	## Structured values: a path with spaces stays whole; a URI is never an executable.
+	assert_true(McpClient.launch_values_mention_godot_ai(
+		PackedStringArray(["C:\\Program Files\\Godot AI\\godot-ai.exe", "attach"])
+	))
+	assert_true(McpClient.launch_values_mention_godot_ai(PackedStringArray(["/opt/godot ai/bin/godot-ai"])))
+	assert_false(McpClient.launch_values_mention_godot_ai(PackedStringArray(["https://example.com/godot-ai"])))
+	assert_false(McpClient.launch_values_mention_godot_ai(PackedStringArray(["curl", "http://x/godot-ai/"])))
+	assert_false(McpClient.launch_mentions_godot_ai("node https://example.com/godot-ai"))
+
+
+func test_json_mismatch_reports_whether_the_existing_entry_is_ours() -> void:
+	## The post-update major migration rewrites a mismatched entry only when it
+	## launches Godot AI; a foreign command under our name must read as not owned.
+	var client := McpClient.new()
+	client.id = "ownership_test"
+	client.display_name = "Ownership Test"
+	client.config_type = "json"
+	client.server_key_path = PackedStringArray(["mcpServers"])
+	client.command_shape = McpClient.CommandShape.FLAT
+	var launch := {"ok": true, "command": "/x/bin/uvx", "args": ["--from", "godot-ai==4.0.0", "godot-ai", "attach"]}
+	var foreign := McpJsonStrategy._entry_status_details(
+		client, {"command": "/usr/bin/python3", "args": ["my_server.py"]}, "http://x", launch
+	)
+	assert_eq(int(foreign.get("status", -1)), McpClient.Status.CONFIGURED_MISMATCH)
+	assert_false(bool(foreign.get("owned", true)), "a foreign command is not ours to rewrite")
+	var stale := McpJsonStrategy._entry_status_details(
+		client, {"command": "/x/bin/uvx", "args": ["--from", "godot-ai==3.2.4", "godot-ai", "attach"]}, "http://x", launch
+	)
+	assert_eq(int(stale.get("status", -1)), McpClient.Status.CONFIGURED_MISMATCH)
+	assert_true(bool(stale.get("owned", false)), "a stale Godot AI pin is ours to repin")
+	var current := McpJsonStrategy._entry_status_details(
+		client, {"command": "/x/bin/uvx", "args": launch["args"]}, "http://x", launch
+	)
+	assert_eq(int(current.get("status", -1)), McpClient.Status.CONFIGURED)
+	## Our own name inside the entry (or as its key) must never count as a launch.
+	var named := McpJsonStrategy._entry_status_details(
+		client, {"name": "godot-ai", "command": "/usr/bin/python3", "args": ["srv.py"]}, "http://x", launch
+	)
+	assert_false(bool(named.get("owned", true)), "the entry name is not a launch")
+	assert_eq(
+		McpClient.entry_launch_values({"name": "godot-ai", "command": "x", "args": ["a", 1]}),
+		PackedStringArray(["x", "a", "1"]),
+	)
+	var url_entry := McpJsonStrategy._entry_status_details(
+		client, {"command": "node", "args": ["https://example.com/godot-ai"]}, "http://x", launch
+	)
+	assert_false(bool(url_entry.get("owned", true)), "a URL ending in our name is not a launch")
+	var spaced := McpJsonStrategy._entry_status_details(
+		client, {"command": "C:\\Program Files\\Godot AI\\godot-ai.exe", "args": ["attach"]}, "http://x", launch
+	)
+	assert_true(bool(spaced.get("owned", false)), "a Windows path with spaces is ours")
+	var docs_link := McpJsonStrategy._entry_status_details(
+		client,
+		{"command": "node", "args": ["server.js", "https://example.com/godot-ai/docs"]},
+		"http://x",
+		launch,
+	)
+	assert_false(bool(docs_link.get("owned", true)), "a URL containing our name is not a launch")
+
+
+func test_codebuddy_descriptor_and_stdio_entry() -> void:
+	var c := McpClientRegistry.get_by_id("codebuddy")
+	assert_true(c != null, "CodeBuddy must be registered")
+	assert_eq(c.display_name, "CodeBuddy")
+	assert_eq(c.config_type, "json")
+	assert_eq(c.path_template.get("unix"), "~/.codebuddy/mcp.json")
+	assert_eq(c.path_template.get("windows"), "$USERPROFILE/.codebuddy/mcp.json")
+	assert_eq(c.server_key_path, PackedStringArray(["mcpServers"]))
+	var launch := _test_attach_launch()
+	var entry := McpJsonStrategy.build_entry(c, "http://unused", {
+		"type": "http", "url": "http://old", "headers": {"Authorization": "old"},
+		"env": {"USER_SENTINEL": "preserved"}, "description": "My tools",
+	}, launch)
+	assert_eq(entry.get("type"), "stdio")
+	assert_eq(entry.get("command"), launch.get("command"))
+	assert_eq(entry.get("args"), launch.get("args"))
+	assert_eq(entry.get("env", {}).get("USER_SENTINEL"), "preserved")
+	assert_eq(entry.get("description"), "My tools")
+	assert_false(entry.has("url"))
+	assert_false(entry.has("headers"))
+	assert_true(McpJsonStrategy.verify_entry(c, entry, "http://unused", launch))
+
+
+func test_toml_crlf_reconfigure_and_remove_keep_complete_newlines() -> void:
+	var path := _scratch_dir.path_join("crlf_lines.toml")
+	var client := _make_test_toml_client(path)
+	var source := "[mcp_servers.godot-ai]\r\nurl = \"old\"\r\nenabled = false\r\n"
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	file.store_string(source)
+	file.close()
+	assert_eq(McpTomlStrategy.configure(client, "godot-ai", "http://127.0.0.1:8000/mcp").get("status"), "ok")
+	var written := FileAccess.get_file_as_bytes(path).get_string_from_utf8()
+	assert_true(written.ends_with("\n"), "reconfigured CRLF file must not end in bare CR")
+	assert_true(written.contains("enabled = false\r\n"), "preserved final assignment keeps CRLF")
+	file = FileAccess.open(path, FileAccess.WRITE)
+	file.store_string(written + "[other]\r\nkeep = true\r\n")
+	file.close()
+	assert_eq(McpTomlStrategy.remove(client, "godot-ai").get("status"), "ok")
+	written = FileAccess.get_file_as_bytes(path).get_string_from_utf8()
+	assert_true(written.ends_with("\n"), "remove keeps a complete final newline")
+	assert_true(written.contains("keep = true\r\n"), "foreign final assignment stays intact")
+	file = FileAccess.open(path, FileAccess.WRITE)
+	file.store_string(source)
+	file.close()
+	assert_eq(McpTomlStrategy.remove(client, "godot-ai").get("status"), "ok")
+	assert_eq(FileAccess.get_file_as_bytes(path).size(), 0, "removing the only section keeps an empty file")
+
+
+func test_zcode_descriptor_and_stdio_entry() -> void:
+	var c := McpClientRegistry.get_by_id("zcode")
+	assert_true(c != null, "ZCode must be registered")
+	assert_false(
+		c.automatic_config_edits,
+		"ZCode must stay manual-only: a native write would shadow ~/.agents/mcp.json",
+	)
+	assert_eq(c.display_name, "ZCode")
+	assert_eq(c.config_type, "json")
+	assert_eq(c.path_template.get("unix"), "~/.zcode/cli/config.json")
+	assert_eq(c.path_template.get("windows"), "$USERPROFILE/.zcode/cli/config.json")
+	## ZCode's user-scope native config nests the server map under `mcp.servers`.
+	assert_eq(c.server_key_path, PackedStringArray(["mcp", "servers"]))
+	assert_true(c.detect_paths.has("~/.zcode"), "ZCode install signal is ~/.zcode")
+	var launch := _test_attach_launch()
+	var entry := McpJsonStrategy.build_entry(c, "http://unused", {
+		"type": "http", "url": "http://old", "headers": {"Authorization": "old"},
+		"env": {"USER_SENTINEL": "preserved"}, "enable": false,
+	}, launch)
+	assert_eq(entry.get("type"), "stdio")
+	assert_eq(entry.get("command"), launch.get("command"))
+	assert_eq(entry.get("args"), launch.get("args"))
+	assert_eq(entry.get("env", {}).get("USER_SENTINEL"), "preserved")
+	assert_eq(entry.get("enable"), false, "`enable` is ZCode user-state and must survive")
+	assert_false(entry.has("url"))
+	assert_false(entry.has("headers"))
+	assert_true(McpJsonStrategy.verify_entry(c, entry, "http://unused", launch))
+
+
+func test_nested_server_map_path_configure_status_remove() -> void:
+	## ZCode is the first client whose server map is nested (`mcp.servers`).
+	## Pin the whole JSON-strategy round trip so a single-segment assumption
+	## cannot silently write where ZCode never reads.
+	var path := _scratch_dir.path_join("nested_server_map.json")
+	_remove_if_exists(path)
+	var client := McpClient.new()
+	client.id = "nested_server_map_test"
+	client.display_name = "Nested Server Map Test"
+	client.config_type = "json"
+	client.path_template = {"darwin": path, "windows": path, "linux": path, "unix": path}
+	client.server_key_path = PackedStringArray(["mcp", "servers"])
+	client.command_shape = McpClient.CommandShape.FLAT
+	client.command_transport_key = "type"
+	client.command_transport_value = "stdio"
+	var launch := _test_attach_launch()
+	var configured := McpJsonStrategy.configure(client, "godot-ai", "http://unused", launch)
+	assert_eq(configured.get("status"), "ok", str(configured))
+	var parsed: Variant = JSON.parse_string(FileAccess.get_file_as_string(path))
+	assert_true(parsed is Dictionary, "nested configure must write a JSON object")
+	assert_true(parsed["mcp"] is Dictionary, "configure must create the `mcp` parent")
+	assert_true(parsed["mcp"]["servers"] is Dictionary, "configure must create `mcp.servers`")
+	var written: Dictionary = parsed["mcp"]["servers"].get("godot-ai", {})
+	assert_eq(written.get("type"), "stdio")
+	assert_eq(written.get("command"), launch.get("command"))
+	assert_eq(McpJsonStrategy.check_status(client, "godot-ai", "http://unused", launch), McpClient.Status.CONFIGURED)
+	var removed := McpJsonStrategy.remove(client, "godot-ai")
+	assert_eq(removed.get("status"), "ok", str(removed))
+	var after: Variant = JSON.parse_string(FileAccess.get_file_as_string(path))
+	assert_false(after["mcp"]["servers"].has("godot-ai"), "remove must drop the nested entry")
+
+
+func test_manual_command_names_nested_server_map_path() -> void:
+	## The manual fallback must name the full dotted map path; rendering only
+	## the first segment told ZCode users to add the entry under `mcp`.
+	var path := _scratch_dir.path_join("manual_nested_map.json")
+	var client := McpClient.new()
+	client.id = "manual_nested_map_test"
+	client.display_name = "Nested Manual Test"
+	client.config_type = "json"
+	client.path_template = {"darwin": path, "windows": path, "linux": path, "unix": path}
+	client.server_key_path = PackedStringArray(["mcp", "servers"])
+	client.command_shape = McpClient.CommandShape.FLAT
+	client.command_transport_key = "type"
+	client.command_transport_value = "stdio"
+	var manual := McpManualCommand.build(client, "godot-ai", "http://unused", path, _test_attach_launch())
+	assert_contains(manual, "mcp.servers")
+	assert_false(manual.contains('add under "mcp":'), "a nested map must not be named by its first segment")
+
+
+func test_zcode_configure_is_manual_only_and_preserves_the_agents_fallback() -> void:
+	## ZCode skips a scope's ~/.agents/mcp.json entirely once a native .zcode
+	## server exists, so an automatic write could silently disable the other
+	## servers there. ZCode is manual-only: Configure and Remove return
+	## instructions and never create or modify the native file.
+	var client := McpClientRegistry.get_by_id("zcode")
+	var saved_paths: Dictionary = client.path_template.duplicate(true)
+	var native_path := _scratch_dir.path_join("zcode_manual/cli/config.json")
+	var fallback_path := _scratch_dir.path_join("zcode_manual/agents/mcp.json")
+	var fallback_body := '{\n\t"mcpServers": {\n\t\t"other": {"command": "other-mcp"}\n\t}\n}\n'
+	_write_text(fallback_path, fallback_body)
+	## Redirect the write target so a regression that drops the manual-only gate
+	## edits scratch space instead of the developer's real ~/.zcode config.
+	client.path_template = {
+		"darwin": native_path, "linux": native_path, "windows": native_path, "unix": native_path,
+	}
+
+	var configured := McpClientConfigurator.configure("zcode", "http://127.0.0.1:8000/mcp")
+	var removed := McpClientConfigurator.remove("zcode", "http://127.0.0.1:8000/mcp")
+	var native_exists := FileAccess.file_exists(native_path)
+	var fallback_after := FileAccess.get_file_as_string(fallback_path)
+
+	## An existing empty native map must be left alone too, not seeded.
+	_write_text(native_path, '{\n\t"mcp": {\n\t\t"servers": {}\n\t}\n}\n')
+	var empty_native_body := FileAccess.get_file_as_string(native_path)
+	var configured_again := McpClientConfigurator.configure("zcode", "http://127.0.0.1:8000/mcp")
+	var empty_native_after := FileAccess.get_file_as_string(native_path)
+
+	client.path_template = saved_paths
+	_remove_if_exists(native_path)
+	_remove_if_exists(fallback_path)
+
+	assert_eq(configured.get("status"), "error")
+	assert_contains(str(configured.get("message", "")), "manual edit")
+	assert_eq(removed.get("status"), "error")
+	assert_contains(str(removed.get("message", "")), "manual edit")
+	assert_false(native_exists, "manual-only Configure must not create the native .zcode config")
+	assert_eq(fallback_after, fallback_body, "the .agents fallback must stay byte-for-byte intact")
+	var parsed: Variant = JSON.parse_string(fallback_after)
+	assert_true(
+		parsed is Dictionary and parsed["mcpServers"].has("other"),
+		"the fallback's other server stays effective while no native config exists",
+	)
+	assert_eq(configured_again.get("status"), "error")
+	assert_eq(empty_native_after, empty_native_body, "an existing empty native map must not be seeded")

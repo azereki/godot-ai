@@ -59,8 +59,34 @@ func suite_setup(ctx: Dictionary) -> void:
 	_handler = BatchHandler.new(_dispatcher, _undo_redo)
 
 
+func suite_teardown() -> void:
+	## Registered callbacks capture this suite. Break the dispatcher ->
+	## callback -> suite cycle before releasing the suite's handler graph.
+	if _dispatcher != null:
+		_dispatcher.clear()
+	_handler = null
+	_dispatcher = null
+	_node_handler = null
+	_undo_redo = null
+	_call_log.clear()
+
+
 func setup() -> void:
 	_call_log.clear()
+
+
+func test_reload_is_rejected_before_any_batch_command_runs() -> void:
+	_dispatcher.register("reload_plugin", func(_p: Dictionary) -> Dictionary:
+		_call_log.append("reload_plugin")
+		return {"data": {"undoable": false}})
+	var result: Dictionary = _handler.batch_execute({"commands": [
+		{"command": "_ok_pure", "params": {}},
+		{"command": "reload_plugin", "params": {}},
+		{"command": "_ok_pure", "params": {}},
+	]})
+	assert_is_error(result, ErrorCodes.VALUE_OUT_OF_RANGE)
+	assert_contains(str(result.get("error", {}).get("message", "")), "reload_plugin must be called directly")
+	assert_eq(_call_log, [], "reload cannot leave an executing batch behind")
 
 
 func _undo_for_scene(scene_root: Node) -> UndoRedo:

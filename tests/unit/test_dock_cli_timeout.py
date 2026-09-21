@@ -212,7 +212,7 @@ def test_client_owner_persists_unproven_mutation_and_blocks_update_quiescence() 
 
     assert "Engine.get_meta(MUTATION_UNPROVEN_META" in init
     assert "Engine.set_meta(" in mark
-    assert "_mutation_termination_unproven.has(client_id)" in request
+    assert "not _mutation_termination_unproven.is_empty()" in request
     assert "MutationLock.recovery_message()" in request
     assert finalize.index("_record_unproven_action_result(") < finalize.index(
         "_action_threads.erase("
@@ -248,20 +248,20 @@ def test_dock_dispatches_configure_and_remove_to_worker_thread() -> None:
     assert "Thread.new()" in owner_source
     assert "func _poll_actions(" in owner_source
     assert "_client_jobs.request_action(" in plugin_source
-    # The two button handlers should NOT call McpClientConfigurator
-    # directly — that would re-introduce the main-thread block. They
-    # forward to the dispatcher.
     on_configure = get_func_block(
         dock_source, "func _on_configure_client(client_id: String) -> void:"
     )
-    on_remove = get_func_block(dock_source, "func _on_remove_client(client_id: String) -> void:")
+    on_button = get_func_block(
+        dock_source,
+        "func _on_client_action_button_pressed(client_id: String, action: String) -> void:",
+    )
     assert "_dispatch_client_action(" in on_configure
-    assert "_dispatch_client_action(" in on_remove
+    assert "_dispatch_client_action(" in on_button
     assert "McpClientConfigurator.configure(" not in on_configure, (
         "Configure handler must dispatch to a worker, not call the "
         "configurator inline (issue #239)."
     )
-    assert "McpClientConfigurator.remove(" not in on_remove, (
+    assert "McpClientConfigurator.remove(" not in on_button, (
         "Remove handler must dispatch to a worker, not call the configurator inline (issue #239)."
     )
 
@@ -310,9 +310,6 @@ def test_root_owned_workers_quiesce_during_update_and_plugin_exit() -> None:
     assert "_action_threads.values()" in quiesce
     install_block = get_func_block(plugin_source, "func install_downloaded_update(")
     assert "_client_jobs.quiesce(" in install_block
-    assert install_block.index("_client_jobs.quiesce(") < install_block.index(
-        "UpdateCoordinator.new()"
-    )
     prepare = get_func_block(plugin_source, "func prepare_for_update_reload()")
     assert "_vision_routing.shutdown()" in prepare
     assert "_dispatcher.quiesce_for_script_swap()" in prepare
@@ -323,14 +320,23 @@ def test_root_owned_workers_quiesce_during_update_and_plugin_exit() -> None:
         "_dispatcher.clear()"
     )
     assert "var script_quiesced := prepare_for_update_reload()" in install_block
-    assert install_block.index("prepare_for_update_reload()") < install_block.index(
-        "UpdateCoordinator.new()"
+    ## Each main-thread phase names itself in the dock and yields a frame first,
+    ## so the label repaints instead of the dock freezing on "Downloading…".
+    for label, work in (
+        ("Verifying signed update…", "ReleaseVerifier.verify_manifest("),
+        ("Staging the verified tree…", "UpdateInstaller.stage("),
+        ("Waiting for client workers…", "_client_jobs.quiesce("),
+    ):
+        phase = f'await _present_install_phase("{label}")'
+        assert phase in install_block, label
+        assert install_block.index(phase) < install_block.index(work), label
+    present = get_func_block(
+        plugin_source, "func _present_install_phase(status_text: String) -> void:"
     )
+    assert '"install_in_flight": true' in present
+    assert "await tree.process_frame" in present
     exit_block = get_func_block(plugin_source, "func _exit_tree() -> void:")
     assert "_client_jobs.quiesce()" in exit_block
-    assert exit_block.rindex("_release_update_lease()") > exit_block.index(
-        "_lifecycle.teardown_for_editor_exit()"
-    )
 
 
 def test_composition_and_post_update_barriers_precede_every_normal_start_effect() -> None:
@@ -342,19 +348,30 @@ def test_composition_and_post_update_barriers_precede_every_normal_start_effect(
         plugin_source,
         "func _continue_enter_tree_after_update_barrier() -> void:",
     )
+    activation = get_func_block(plugin_source, "func _activate_startup_endpoints() -> void:")
     begin = get_func_block(plugin_source, "func _begin_startup_release() -> void:")
     release = get_func_block(plugin_source, "func _release_normal_startup() -> void:")
 
-    assert "_start_update_startup_barrier()" in enter
     assert "_continue_enter_tree_after_update_barrier()" in enter
-    assert enter.index("warm_update_actor_discovery_env()") < enter.index(
-        "_start_update_startup_barrier()"
+    assert compose.index("add_control_to_dock(") < compose.index("_activate_startup_endpoints()")
+    ordered_activation = (
+        "prepare_major_upgrade_endpoints(",
+        "v4_endpoint_ports_status()",
+        'if not bool(override.get("ok", false)):',
+        "ClientConfigurator.capture_endpoint_policy()",
+        "_resolve_ws_port(",
+        '_set_endpoint_policy(resolved_policy)',
+        "ClientConfigurator.warm_env_snapshot(_endpoint_policy)",
+        "_lifecycle.configure(_capture_lifecycle_plan())",
+        "_begin_startup_release()",
     )
-    assert compose.index("add_control_to_dock(") < compose.index("_resolve_ws_port(")
-    assert compose.index("_resolve_ws_port(") < compose.index("_begin_startup_release()")
-    assert "_client_jobs.activate()" not in compose
-    assert "_start_server()" not in compose
-    assert "check_for_updates" not in compose
+    positions = [activation.index(step) for step in ordered_activation]
+    assert positions == sorted(positions)
+    for effect in ("_client_jobs.activate()", "_start_server()", "check_for_updates"):
+        assert effect not in compose
+        assert effect not in activation
+    assert "_resolve_ws_port(" not in compose
+    assert "_begin_startup_release()" not in compose
     expected_call = """_client_jobs.begin_post_update_repin(
         str(_post_update_outcome.get("from_version", "")),
         str(_post_update_outcome.get("to_version", "")),
@@ -413,229 +430,6 @@ def test_pending_migration_is_a_root_authority_gate_for_every_start_path() -> No
     assert update_buttons.index("elif not normal_start_released:") < update_buttons.index(
         'text = "Server Start Blocked"'
     )
-
-
-def test_actor_spawn_failure_never_runs_unbounded_cleanup_on_the_editor_thread() -> None:
-    coordinator_source = (PLUGIN_ROOT / "utils" / "update_coordinator.gd").read_text(
-        encoding="utf-8"
-    )
-    recover = get_func_block(coordinator_source, "func _recover_spawn_failure() -> void:")
-
-    assert "OS.execute(" not in coordinator_source
-    assert "abort-prepared" in recover
-    assert recover.index("_finish()") < recover.index("_set_plugin_enabled(true)")
-    assert "prepared state blocks future updates" in recover
-
-
-def test_manual_major_marker_is_deny_only_and_removed_before_server_start() -> None:
-    plugin_source = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
-    actor_source = (
-        Path(__file__).resolve().parents[2] / "src" / "godot_ai" / "update_transaction.py"
-    ).read_text(encoding="utf-8")
-    start = get_func_block(plugin_source, "func _start_post_update_completion() -> bool:")
-    process = get_func_block(plugin_source, "func _process(_delta: float) -> void:")
-
-    assert "class ManualMigrationElection:" in actor_source
-    assert "def complete_manual_migration(" in actor_source
-    assert '"complete-manual-migration" if manual else "complete-migration"' in start
-    completion_poll = process.index('job == "migration_completion"')
-    assert process.index('get("ok", false)', completion_poll) < process.index(
-        "_release_normal_startup()", completion_poll
-    )
-
-
-def test_hot_update_migration_is_durably_acknowledged_before_normal_start() -> None:
-    plugin_source = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
-    repin = get_func_block(plugin_source, "func _on_post_update_repin_completed(")
-    complete = get_func_block(plugin_source, "func _complete_post_update_startup() -> void:")
-    present_complete = get_func_block(
-        plugin_source, "func _present_post_update_complete() -> void:"
-    )
-    start = get_func_block(plugin_source, "func _start_post_update_completion() -> bool:")
-    worker = get_func_block(
-        plugin_source,
-        "static func _run_post_update_completion_job(",
-    )
-    process = get_func_block(plugin_source, "func _process(_delta: float) -> void:")
-
-    assert "_complete_post_update_startup()" in repin
-    assert '"continue"' not in repin
-    assert "_start_post_update_completion()" in complete
-    assert "_release_normal_startup()" not in complete
-    assert '"complete-manual-migration" if manual else "complete-migration"' in start
-    assert '"--recovery-root"' in start
-    assert "_migration_completion_matches(" in worker
-    completion_poll = process.index('job == "migration_completion"')
-    assert process.index('get("ok", false)', completion_poll) < process.index(
-        "_release_normal_startup()", completion_poll
-    )
-    assert '"banner_visible": false' in present_complete
-    assert process.index("_present_post_update_complete()", completion_poll) < process.index(
-        "_release_normal_startup()", completion_poll
-    )
-
-
-def test_post_update_terminal_vocabulary_and_failed_quiescence_rebuild_are_explicit() -> None:
-    plugin_source = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
-    fan = get_func_block(plugin_source, "func _fan_post_update_outcome() -> void:")
-    prepare = get_func_block(plugin_source, "func prepare_for_update_reload() -> Dictionary:")
-    install = get_func_block(plugin_source, "func install_downloaded_update(")
-
-    for status in ("success", "failed_clean", "failed_mixed", "unknown"):
-        assert f'"{status}"' in fan
-    assert 'status = "failed"' not in fan
-    assert 'quiesced["reload_required"] = true' in prepare
-    assert "_reload_plugin_after_failed_update.call_deferred()" in install
-
-
-def test_update_downloads_use_one_actor_allocated_private_directory() -> None:
-    plugin_source = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
-    manager_source = (PLUGIN_ROOT / "utils" / "update_manager.gd").read_text(encoding="utf-8")
-    preflight = get_func_block(plugin_source, "func _preflight_update() -> Dictionary:")
-    install = get_func_block(plugin_source, "func install_downloaded_update(")
-
-    assert '"--download-id"' in preflight
-    assert 'data.get("download_root", "")' in preflight
-    assert 'path_join("downloads").path_join(download_id)' in preflight
-    assert "TEMP_DIR" not in manager_source
-    assert 'preflight.get("download_root", "")' in manager_source
-    assert "make_dir_recursive" not in manager_source
-    assert "discard_downloads()" in install
-    assert "func _directory_is_empty(" in manager_source
-    assert "func cancel_install()" in manager_source
-
-
-def test_actorless_editor_fails_closed_before_it_can_offer_updates() -> None:
-    """A mixed-availability twin must not become an invisible live editor."""
-
-    plugin_source = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
-    prepare = get_func_block(plugin_source, "func _prepare_update_startup_barrier() -> Dictionary:")
-    job = get_func_block(plugin_source, "func _run_update_startup_barrier_job(")
-    enter = get_func_block(plugin_source, "func _enter_tree() -> void:")
-    block = get_func_block(plugin_source, "func _block_update_startup() -> void:")
-    disable = get_func_block(plugin_source, "func _disable_after_update_barrier() -> void:")
-
-    assert "ClientConfigurator.get_update_transaction_command()" not in prepare
-    assert "ClientConfigurator.get_update_transaction_command()" in job
-    assert "if command.is_empty():" in job
-    assert "refusing swapped-tree startup" in prepare
-    assert "refusing unleased plugin startup" in job
-    assert "return transaction.is_empty()" not in prepare
-    assert "_start_update_startup_barrier()" in enter
-    assert "_block_update_startup()" in enter
-    assert "_disable_after_update_barrier.call_deferred()" in block
-    assert 'set_plugin_enabled("res://addons/godot_ai/plugin.cfg", false)' in disable
-
-
-def test_headless_export_leases_before_its_early_return_and_releases_on_exit() -> None:
-    """Headless export code must join the same-install editor census."""
-
-    plugin_source = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
-    enter = get_func_block(plugin_source, "func _enter_tree() -> void:")
-    compose = get_func_block(
-        plugin_source,
-        "func _continue_enter_tree_after_update_barrier() -> void:",
-    )
-    exit_block = get_func_block(plugin_source, "func _exit_tree() -> void:")
-    headless_exit = exit_block[exit_block.index("if _headless_disabled:") :]
-
-    assert enter.index("if _mcp_disabled_for_headless_launch():") < enter.index(
-        "_run_update_startup_barrier()"
-    )
-    assert "_continue_enter_tree_after_update_barrier()" in enter
-    assert compose.index("ExportPlugin.new()") < compose.index(
-        "if _mcp_disabled_for_headless_launch():"
-    )
-    assert headless_exit.index("_release_update_lease()") < headless_exit.index("return")
-
-
-def test_reload_startup_uses_the_frozen_old_actor_not_new_version_discovery() -> None:
-    """The swapped tree must not hit uvx/network while the old actor waits."""
-
-    plugin_source = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
-    coordinator_source = (PLUGIN_ROOT / "utils" / "update_coordinator.gd").read_text(
-        encoding="utf-8"
-    )
-    prepare = get_func_block(plugin_source, "func _prepare_update_startup_barrier() -> Dictionary:")
-    job = get_func_block(plugin_source, "func _run_update_startup_barrier_job(")
-    execute = get_func_block(plugin_source, "func _execute_update_command(")
-    execute_value = get_func_block(plugin_source, "static func _execute_update_command_value(")
-    identity = get_func_block(plugin_source, "static func _update_actor_identity_matches(")
-    finish = get_func_block(coordinator_source, "func _finish() -> void:")
-
-    assert "_parse_update_actor_handoff(" in prepare
-    assert 'command.assign(handoff.get("command", []))' in prepare
-    assert 'handoff.get("package_version", "")' in prepare
-    assert '"discover_command": transaction.is_empty()' in prepare
-    assert 'job.get("discover_command", false)' in job
-    assert "_execute_update_command_value(" in job
-    assert "frozen_command.duplicate()" in execute
-    assert "_update_actor_identity_matches(data, expected_package_version)" in execute_value
-    assert 'data.get("protocol_version", 0)' in identity
-    assert 'data.get("package_version", "")' in identity
-    assert '"protocol_version": UPDATE_ACTOR_PROTOCOL_VERSION' in coordinator_source
-    assert '"package_version": str(_prepared.from_version)' in coordinator_source
-    assert "OS.set_environment(UPDATE_ACTOR_HANDOFF_ENV, JSON.stringify({" in coordinator_source
-    assert "OS.unset_environment(UPDATE_ACTOR_HANDOFF_ENV)" in finish
-
-
-def test_startup_rejects_a_preloaded_old_instance_even_after_lock_release() -> None:
-    """Loaded A may pause while disk becomes B; the first barrier check catches it."""
-
-    plugin_source = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
-    enter = get_func_block(plugin_source, "func _enter_tree() -> void:")
-    prepare = get_func_block(plugin_source, "func _prepare_update_startup_barrier() -> Dictionary:")
-
-    assert "_loaded_plugin_version = get_plugin_version()" in enter
-    version_check = prepare.index("_loaded_update_version_matches(")
-    lock_or_handoff_check = prepare.index("OS.get_environment(UPDATE_TRANSACTION_ENV)")
-    assert version_check < lock_or_handoff_check
-    assert '"current_version": _loaded_plugin_version' in prepare
-
-
-def test_update_actor_invocations_are_bounded_and_interactive_startup_is_off_main_thread() -> None:
-    plugin_source = (PLUGIN_ROOT / "plugin.gd").read_text(encoding="utf-8")
-    enter = get_func_block(plugin_source, "func _enter_tree() -> void:")
-    start = get_func_block(plugin_source, "func _start_update_startup_barrier() -> bool:")
-    execute = get_func_block(plugin_source, "func _execute_update_command(")
-    execute_value = get_func_block(plugin_source, "static func _execute_update_command_value(")
-    accept = get_func_block(plugin_source, "func _accept_update_startup_result(")
-    cancel = get_func_block(plugin_source, "func _cancel_update_actor_thread() -> void:")
-    refusal = get_func_block(plugin_source, "static func _update_actor_refusal_message(")
-    process = get_func_block(plugin_source, "func _process(_delta: float) -> void:")
-    exit_block = get_func_block(plugin_source, "func _exit_tree() -> void:")
-    release = get_func_block(plugin_source, "func _release_update_lease() -> void:")
-
-    assert "OS.execute(" not in plugin_source
-    assert "CliExec.run(" in execute_value
-    assert "timeout_ms" in execute_value
-    assert "cancel_check" in execute_value
-    assert "termination_failed" in execute_value
-    assert 'executed.get("stderr", "")' in execute_value
-    assert 'executed.get("output", "")' not in execute_value
-    assert "UPDATE_ACTOR_ERROR_PREFIX" in refusal
-    assert "MAX_UPDATE_ACTOR_ERROR_BYTES" in refusal
-    assert "unicode_at" in refusal
-    assert "Thread.new()" in start
-    assert "_run_update_startup_barrier_job" in start
-    assert "ClientConfigurator.get_update_transaction_command()" not in start
-    assert "_start_update_startup_barrier()" in enter
-    assert enter.index("_mcp_disabled_for_headless_launch()") < enter.index(
-        "_run_update_startup_barrier()"
-    )
-    assert "wait_to_finish()" in process
-    assert "_continue_enter_tree_after_update_barrier()" in process
-    assert execute.index("_update_actor_termination_unproven") < execute.index(
-        "ClientConfigurator.get_update_transaction_command()"
-    )
-    assert '"termination_unproven": true' in execute
-    assert 'checked.get("termination_unproven", false)' in execute
-    assert 'result.get("termination_unproven", false)' in accept
-    assert 'result.get("termination_unproven", false)' in cancel
-    assert exit_block.index("_cancel_update_actor_thread()") < exit_block.rindex(
-        "_release_update_lease()"
-    )
-    assert "_update_actor_termination_unproven" in release
 
 
 def test_dock_action_dispatch_gates_on_self_update_in_progress() -> None:
@@ -708,3 +502,16 @@ def test_dock_emits_endpoint_setting_values_and_root_owns_persistence() -> None:
     )
     assert "ClientConfigurator.apply_endpoint_settings(changes.duplicate(true))" in routed
     assert "func apply_endpoint_settings(changes: Dictionary) -> Dictionary:" in configurator_source
+
+
+def test_post_update_drift_is_deferred_to_configure_not_a_startup_barrier() -> None:
+    """#999: an entry that is not provably ours is left alone and named, never a block."""
+    owner_source = (PLUGIN_ROOT / "utils" / "client_job_owner.gd").read_text(encoding="utf-8")
+    post_update = get_func_block(owner_source, "func _run_post_update_repin(")
+    result = get_func_block(owner_source, "func _post_update_result(")
+
+    assert "automatic migration refused" not in post_update
+    assert post_update.count("deferred.append(") == 2
+    assert "entry_drift_is_version_pin_only(" in post_update
+    assert "ClientConfigurator.configure(" in post_update, "#890 write restriction stays"
+    assert '"deferred": deferred.duplicate(true)' in result

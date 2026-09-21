@@ -109,13 +109,7 @@ var _packet_spillover_total := 0
 
 func _ready() -> void:
 	_session_id = _make_session_id(ProjectSettings.globalize_path("res://"))
-	## Increase outbound buffer for large messages (e.g. screenshot base64).
-	## Default is 64 KB; screenshots can be several MB.
-	_peer.outbound_buffer_size = OUTBOUND_BUFFER_LIMIT_BYTES
-	## Stay under the pre-auth byte ceiling until the server proof validates;
-	## only then may the peer allocate the normal 4 MiB command buffer.
-	_peer.inbound_buffer_size = MAX_HANDSHAKE_FRAME_BYTES
-	_peer.max_queued_packets = MAX_QUEUED_PACKETS
+	_configure_peer_buffers(_peer)
 	if connect_blocked:
 		_log_blocked_notice_once()
 		set_process(false)
@@ -375,10 +369,20 @@ func _attempt_reconnect() -> void:
 	## a quiet reconnect loop after the Python server restarts.
 	_peer = WebSocketPeer.new()
 	_preopen_failure_logged_for_peer = false
-	_peer.outbound_buffer_size = OUTBOUND_BUFFER_LIMIT_BYTES
-	_peer.inbound_buffer_size = MAX_HANDSHAKE_FRAME_BYTES
-	_peer.max_queued_packets = MAX_QUEUED_PACKETS
+	_configure_peer_buffers(_peer)
 	_connect_to_server()
+
+
+## WSLPeer fixes its receive limit during the WebSocket handshake; changing
+## this property after the server proof cannot raise that limit (#1056).
+## The peer buffers use the command budget even before authentication.
+## `_handle_message` separately enforces the smaller handshake message limit.
+static func _configure_peer_buffers(peer: WebSocketPeer) -> void:
+	## Outbound: screenshots are several MB of base64 (default is 64 KiB).
+	peer.outbound_buffer_size = OUTBOUND_BUFFER_LIMIT_BYTES
+	## Inbound: the normal 4 MiB command ceiling, applied before connecting.
+	peer.inbound_buffer_size = OUTBOUND_BUFFER_LIMIT_BYTES
+	peer.max_queued_packets = MAX_QUEUED_PACKETS
 
 
 func pause() -> void:
@@ -647,7 +651,6 @@ func _handle_auth_challenge(parsed: Dictionary) -> void:
 	_server_nonce = str(parsed["server_nonce"])
 	_challenged_server_version = str(parsed["server_version"])
 	_server_verified = true
-	_peer.inbound_buffer_size = OUTBOUND_BUFFER_LIMIT_BYTES
 	_last_readiness = get_readiness()
 	var response := _build_auth_response()
 	if response.is_empty() or not _send_json(response, true):
@@ -959,8 +962,9 @@ const _SERVICE_REJECT_LOG_EVERY := 100
 ## Service the WebSocket transport from inside a long synchronous handler
 ## (an "exclusive run" — the test runner). The editor main thread is
 ## blocked, so `_process` cannot poll; without this the server keepalive
-## (20s ping interval / 20s timeout) closes the session mid-run. See
-## docs/test-run-transport-starvation-plan.md.
+## (`DEFAULT_KEEPALIVE_PING_INTERVAL_SECONDS` / `_PING_TIMEOUT_SECONDS` in
+## `transport/websocket.py` — 20s interval, 60s pong deadline since #958)
+## closes the session mid-run. See docs/test-run-transport-starvation-plan.md.
 ##
 ## Contract — do NOT extend this method to dispatch:
 ## - `WebSocketPeer.poll()` has no heartbeat-only mode; it also buffers

@@ -1,12 +1,24 @@
+"""Real-editor scenarios for the lean self-updater (docs/self-update.md).
+
+Each scenario drives the production entry points inside a real editor and
+proves the state one update leaves behind: a signed current-source update reloads in the same editor
+with preserved scene state and a working server. The final-v3 capsule crosses into
+v4, a tampered tree is rolled back, and the closed-editor installer completes migration.
+"""
+
 from __future__ import annotations
 
 import asyncio
+import configparser
+import contextlib
 import hashlib
 import json
 import os
+import re
+import secrets
 import shutil
 import subprocess
-import zipfile
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -14,24 +26,34 @@ from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
 from godot_ai.transport.capability import CAPABILITY_DIR_ENV, read_capabilities
+from tests._qualification_https_fixture import signed_smoke_https_delivery
 from tests.conftest import allocate_free_ports
 from tests.integration._self_update_fixture import (
     CLEAN_MAJOR_MARKER_RELATIVE,
     CLEAN_MAJOR_STATUS_FILE,
     CLEAN_MAJOR_TOOL_PROBE_FILE,
-    COORDINATOR_DISABLE_MARKER,
+    FOREIGN_CODEX_COMMAND,
     LIVE_HTTP_PORT,
     LIVE_WS_PORT,
     PLUGIN_ROOT,
+    POST_UPDATE_COMPLETE_FILE,
     POST_UPDATE_STATUS_FILE,
     POST_UPDATE_TOOL_PROBE_FILE,
+    PRE_INSTANCE_ID_FILE,
+    REFUSED_SWAP_STATUS_FILE,
+    REFUSED_SWAP_TOOL_PROBE_FILE,
+    RESTARTED_EDITOR_LOG,
+    UPDATE_STATE_RELATIVE,
+    AttachedAgent,
+    _write_fake_uvx_shim,
     append_driver_autoload,
     assert_no_update_parse_errors,
-    clean_major_install_argv,
     godot_bin_or_skip,
     load_smoke_script,
+    patch_restart_diagnostics,
     prepare_clean_major_migration_project,
     prepare_signed_update_project,
+    read_editor_receipts,
     read_plugin_version,
     remove_configure_client_driver,
     run_godot_editor,
@@ -39,82 +61,64 @@ from tests.integration._self_update_fixture import (
     write_configure_client_driver,
     write_driver_support,
     write_install_update_driver,
+    write_post_restart_driver,
+    write_refused_swap_driver,
 )
 
-PRODUCTION_UVX_RESOLUTION_ARGS = [
-    "--isolated",
-    "--no-config",
-    "--no-env-file",
-    "--no-sources",
-    "--no-build",
-    "--index-strategy",
-    "first-index",
-    "--keyring-provider",
-    "disabled",
-    "--index",
-    "https://pypi.org/simple",
-    "--default-index",
-    "https://pypi.org/simple",
-    "--find-links",
-    "https://pypi.org/simple/godot-ai/",
-]
+## Needs a real Godot editor (GODOT_BIN); skipped without one and excluded
+## from the iteration loop by `pytest -m "not editor"`.
+pytestmark = pytest.mark.editor
 
 
-def test_parse_error_window_uses_current_coordinator_boundary() -> None:
-    clean = f"{COORDINATOR_DISABLE_MARKER}\nMCP | plugin loaded\n"
-    assert_no_update_parse_errors(clean)
-    with pytest.raises(AssertionError, match="Parse Error"):
-        assert_no_update_parse_errors(
-            f"{COORDINATOR_DISABLE_MARKER}\nSCRIPT ERROR: Parse Error\nMCP | plugin loaded\n"
-        )
+def _tree_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
-def test_install_update_driver_uses_canonical_root_handoff(tmp_path: Path) -> None:
-    project = tmp_path / "driver-only"
-    project.mkdir()
-    write_install_update_driver(
-        project,
-        http_port=LIVE_HTTP_PORT,
-        base_version="4.0.0",
-        next_version="4.0.1",
-    )
-    text = (project / "_test_runner_driver.gd").read_text(encoding="utf-8")
-    support = (project / "_test_self_update_driver_support.gd").read_text(encoding="utf-8")
-    assert 'plugin.call("_on_dock_update_requested")' in text
-    assert "plugin.install_downloaded_update" not in text
-    assert "ZIP_PATH, TEMP_DIR, null" not in text
-    assert f"const HTTP_PORT := {LIVE_HTTP_PORT}" in text
-    assert "/godot-ai/status" in support
-    assert "res://addons/godot_ai" not in support
-    assert "SELF_UPDATE_TEST | requesting canonical signed install" in text
-    assert "SELF_UPDATE_TEST | pre-update instance_id=" in text
-    assert "ClientConfigurator" not in text
-    assert "DriverSupport.client_config_has_pin(BASE_VERSION)" in text
-    assert 'plugin.call("_on_dock_post_update_action_requested", "continue")' not in text
-    assert "_observe_automatic_repin()" in text
-    assert "authenticated read/write tool probe completed" in text
-    assert "post_id == _pre_instance_id" in text
-    assert "deadline = Time.get_ticks_msec() + 2000" in support
+def _assert_ordered(log: str, markers: list[str] | tuple[str, ...]) -> None:
+    position = -1
+    for marker in markers:
+        next_position = log.find(marker, position + 1)
+        assert next_position > position, f"missing/out-of-order marker {marker!r}:\n{log}"
+        position = next_position
 
 
-def test_clean_major_install_argv_matches_documented_closure_contract(tmp_path: Path) -> None:
-    argv = clean_major_install_argv(
-        Path("python3"),
-        bundle=tmp_path / "release",
-        project_root=tmp_path / "project",
-        recovery_root=tmp_path / "recovery",
-        target_version="4.0.0",
-        source_commit="a" * 40,
-    )
+def _isolated_environment(isolated: Path) -> tuple[dict[str, str], Path]:
+    """A user-mode editor environment whose client configs live under tmp."""
+    home = isolated / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    environment = {
+        "CODEX_HOME": str(isolated / "codex"),
+        "GODOT_AI_MODE": "user",
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+    }
+    ## The editor's own settings (`godot_ai/*` included) live under
+    ## %APPDATA%\Godot on Windows and $XDG_CONFIG_HOME/godot elsewhere; give
+    ## the fixture editor its own so a developer's global settings (a port, MCP
+    ## logging switched off in the dock) cannot change what the row observes.
+    ## macOS derives its path from HOME, which is already isolated above.
+    if os.name == "nt":
+        local_app_data = isolated / "local-app-data"
+        local_app_data.mkdir(exist_ok=True)
+        environment["LOCALAPPDATA"] = str(local_app_data)
+        app_data = isolated / "app-data"
+        app_data.mkdir(exist_ok=True)
+        environment["APPDATA"] = str(app_data)
+        capability_dir = local_app_data / "godot-ai" / "capabilities"
+    else:
+        config_home = isolated / "xdg-config"
+        config_home.mkdir(exist_ok=True)
+        environment["XDG_CONFIG_HOME"] = str(config_home)
+        capability_dir = isolated / "capabilities"
+        environment[CAPABILITY_DIR_ENV] = str(capability_dir)
+    return environment, capability_dir
 
-    assert argv[:3] == ["python3", "script/v4-release", "install"]
-    assert argv[-2:] == ["--editors-closed", "--clients-and-backend-stopped"]
-    assert argv[argv.index("--expected-tag") + 1] == "v4.0.0"
-    assert argv[argv.index("--expected-version") + 1] == "4.0.0"
-    assert argv[argv.index("--expected-source") + 1] == "a" * 40
 
-
-def test_clean_major_driver_waits_for_automatic_marker_migration(tmp_path: Path) -> None:
+def test_clean_major_driver_waits_for_automatic_migration(tmp_path: Path) -> None:
     project = tmp_path / "clean-major-driver"
     project.mkdir()
     write_clean_major_driver(
@@ -126,7 +130,9 @@ def test_clean_major_driver_waits_for_automatic_marker_migration(tmp_path: Path)
     text = (project / "_test_runner_driver.gd").read_text(encoding="utf-8")
 
     assert CLEAN_MAJOR_MARKER_RELATIVE.as_posix() in text
-    assert "migration marker removed automatically" in text
+    assert 'plugin.get("_normal_start_released")' in text
+    assert "update marker does not record success" in text
+    assert "migration completed automatically" in text
     assert "repinned owned Codex command pin=" in text
     assert 'lifecycle.get("episode_state", "")) != "READY"' in text
     assert 'lifecycle.get("ready_kind", "")) != "owned"' in text
@@ -158,48 +164,41 @@ def _install_clean_major_fixture(
     target_version: str,
     http_port: int = LIVE_HTTP_PORT,
     ws_port: int = LIVE_WS_PORT,
-) -> tuple[Path, Path, Path, Path]:
+    fresh: bool = False,
+    foreign_entry: bool = False,
+) -> tuple[Path, Path]:
+    """Run the closed-editor installer over a synthetic pre-v4 project.
+
+    ``fresh`` installs into a project without an add-on: the marker then
+    names no previous version and retains no backup.
+    """
     from_version = "3.2.4"
     project = tmp_path / "clean-major-migration"
-    recovery = tmp_path / "retained-clean-major-recovery"
     isolated = tmp_path / "clean-major-environment"
-    isolated_home = isolated / "home"
-    codex_home = isolated / "codex"
-    isolated_home.mkdir(parents=True)
     argv, verifier_root = prepare_clean_major_migration_project(
         project,
-        recovery_root=recovery,
-        codex_home=codex_home,
+        codex_home=isolated / "codex",
         from_version=from_version,
         target_version=target_version,
         http_port=http_port,
         ws_port=ws_port,
+        fresh=fresh,
+        foreign_entry=foreign_entry,
     )
     write_clean_major_driver(
         project,
         http_port=http_port,
         from_version=from_version,
         target_version=target_version,
+        foreign_entry=foreign_entry,
     )
     old_addon = project / "addons" / "godot_ai"
-    old_tree = {
-        path.relative_to(old_addon).as_posix(): path.read_bytes()
-        for path in old_addon.rglob("*")
-        if path.is_file()
-    }
-    prewarm_log = project / ".clean-major-smoke" / "prewarm.jsonl"
+    old_tree = {} if fresh else _tree_bytes(old_addon)
     install_environment = os.environ.copy()
-    install_environment.update(
-        {
-            "CLEAN_MAJOR_INSTALL_CLAIM": str(project / "addons/.godot-ai-v4-installing"),
-            "CLEAN_MAJOR_OLD_SENTINEL": str(old_addon / "old_only.gd"),
-            "CLEAN_MAJOR_PREWARM_LOG": str(prewarm_log),
-            "PATH": (
-                str(project / ".clean-major-smoke" / "fake-bin")
-                + os.pathsep
-                + install_environment.get("PATH", "")
-            ),
-        }
+    install_environment["PATH"] = (
+        str(project / ".clean-major-smoke" / "fake-bin")
+        + os.pathsep
+        + install_environment.get("PATH", "")
     )
     installed = subprocess.run(
         argv,
@@ -210,100 +209,163 @@ def _install_clean_major_fixture(
         capture_output=True,
         timeout=60,
     )
-    assert installed.stdout.startswith("OK: installed exact v4 tree")
-    assert "retained pre-v4 backup at" in installed.stdout
-    assert argv[-2:] == ["--editors-closed", "--clients-and-backend-stopped"]
-    prewarm_records = [
-        json.loads(line) for line in prewarm_log.read_text(encoding="utf-8").splitlines()
-    ]
-    assert prewarm_records == [
-        {
-            "argv": [
-                *PRODUCTION_UVX_RESOLUTION_ARGS,
-                "--from",
-                f"godot-ai=={target_version}",
-                "godot-ai-update-transaction",
-                "identity",
-            ],
-            "install_claim_present": False,
-            "kind": "install_identity",
-            "old_tree_present": True,
-            "uv_no_progress": "1",
-        }
-    ]
-    assert read_plugin_version(project / "addons" / "godot_ai" / "plugin.cfg") == target_version
-    assert not (project / "addons" / "godot_ai" / "old_only.gd").exists()
-    backup = recovery / "retained-pre-v4-addon"
-    retained_tree = {
-        path.relative_to(backup).as_posix(): path.read_bytes()
-        for path in backup.rglob("*")
-        if path.is_file()
-    }
-    assert retained_tree == old_tree
-    return project, recovery, isolated_home, codex_home
+    assert installed.stdout.startswith("OK: installed exact v4 tree"), installed.stdout
+    assert argv[-2:] == ["--project-root", str(project)]
+    assert read_plugin_version(old_addon / "plugin.cfg") == target_version
+    assert not (old_addon / "old_only.gd").exists()
+    state = project / UPDATE_STATE_RELATIVE
+    marker = json.loads((project / CLEAN_MAJOR_MARKER_RELATIVE).read_text(encoding="utf-8"))
+    assert marker["status"] == "success", marker
+    if fresh:
+        assert not (state / "backup").exists()
+        assert marker["from_version"] == ""
+        assert marker["backup_root"] == ""
+    else:
+        assert _tree_bytes(state / "backup" / from_version) == old_tree
+        assert marker["from_version"] == from_version
+    assert marker["to_version"] == target_version
+    assert marker["replace_owned_mismatches"] is True
+    assert not (state / "lock.json").exists()
+    assert not (state / "stage").exists()
+    return project, isolated
 
 
 def test_clean_major_installer_cli_retains_exact_pre_v4_tree(tmp_path: Path) -> None:
     target_version = read_plugin_version(PLUGIN_ROOT / "plugin.cfg")
-    project, recovery, _home, _codex_home = _install_clean_major_fixture(tmp_path, target_version)
+    project, _isolated = _install_clean_major_fixture(tmp_path, target_version)
 
     assert (project / CLEAN_MAJOR_MARKER_RELATIVE).is_file()
-    assert (recovery / "retained-pre-v4-addon").is_dir()
+    assert (project / UPDATE_STATE_RELATIVE / "backup" / "3.2.4" / "old_only.gd").is_file()
 
 
-def test_clean_major_installer_missing_uvx_fails_before_mutation(tmp_path: Path) -> None:
+def test_closed_editor_install_then_first_start_completes_migration(tmp_path: Path) -> None:
+    """The first editor start after a closed install repins clients, then serves."""
+    project, marker = _first_start_after_closed_install(tmp_path)
+    assert (project / UPDATE_STATE_RELATIVE / "backup" / "3.2.4" / "old_only.gd").is_file()
+    assert marker["from_version"] == "3.2.4"
+
+
+def test_closed_editor_install_into_fresh_project_then_first_start_serves(
+    tmp_path: Path,
+) -> None:
+    """No add-on before the install: the marker names no previous version.
+
+    This is how the release qualification's runtime row installs candidate A;
+    the first start must still repin the stale owned entry and serve.
+    """
+    project, marker = _first_start_after_closed_install(tmp_path, fresh=True)
+    assert not (project / UPDATE_STATE_RELATIVE / "backup").exists()
+    assert marker["from_version"] == ""
+
+
+def test_closed_editor_install_leaves_a_foreign_client_entry_alone(tmp_path: Path) -> None:
+    """A Codex entry under our name that launches the user's own server survives.
+
+    The major migration may only rewrite entries that launch Godot AI; this
+    one is reported in the editor output and left for an explicit Configure.
+    """
+    project, marker = _first_start_after_closed_install(tmp_path, fresh=True, foreign_entry=True)
+    assert marker["from_version"] == ""
+    log = (project / "_test_first_start.log").read_text(encoding="utf-8")
+    assert "CLEAN_MAJOR_TEST | foreign Codex entry left unchanged" in log
+    assert "launches something else; it was left unchanged" in log
+
+
+def _first_start_after_closed_install(
+    tmp_path: Path, *, fresh: bool = False, foreign_entry: bool = False
+) -> tuple[Path, dict]:
+    godot_bin = godot_bin_or_skip()
     target_version = read_plugin_version(PLUGIN_ROOT / "plugin.cfg")
-    project = tmp_path / "missing-actor-project"
-    recovery = tmp_path / "missing-actor-recovery"
-    codex_home = tmp_path / "missing-actor-codex"
-    argv, verifier_root = prepare_clean_major_migration_project(
+    http_port, ws_port = allocate_free_ports(2)
+    project, isolated = _install_clean_major_fixture(
+        tmp_path, target_version, http_port, ws_port, fresh=fresh, foreign_entry=foreign_entry
+    )
+    environment, capability_dir = _isolated_environment(isolated)
+    environment["PATH"] = (
+        str(project / ".clean-major-smoke" / "fake-bin") + os.pathsep + os.environ.get("PATH", "")
+    )
+
+    log = run_godot_editor(
         project,
-        recovery_root=recovery,
-        codex_home=codex_home,
-        from_version="3.2.4",
-        target_version=target_version,
-        http_port=LIVE_HTTP_PORT,
-        ws_port=LIVE_WS_PORT,
+        godot_bin,
+        allow_headless=True,
+        timeout=240,
+        environment=environment,
+        live_probe=lambda: _selected_endpoint_tool_probe(
+            project, CLEAN_MAJOR_STATUS_FILE, capability_dir,
+            legacy_ports=(http_port, ws_port), migrated=not fresh, expected_version=target_version,
+            resource_path="res://_test_clean_major_probe.txt",
+            content="clean major authenticated write\n",
+        ),
+        probe_ready_file=CLEAN_MAJOR_STATUS_FILE,
+        probe_done_file=CLEAN_MAJOR_TOOL_PROBE_FILE,
     )
-    old_addon = project / "addons" / "godot_ai"
-    before = {
-        path.relative_to(old_addon).as_posix(): path.read_bytes()
-        for path in old_addon.rglob("*")
-        if path.is_file()
-    }
-    openssl = shutil.which("openssl")
-    assert openssl is not None
-    actorless_bin = tmp_path / "actorless-bin"
-    actorless_bin.mkdir()
-    if os.name == "nt":
-        (actorless_bin / "openssl.cmd").write_text(
-            f'@echo off\r\n"{openssl}" %*\r\n', encoding="utf-8"
+
+    assert_no_update_parse_errors(log)
+    (project / "_test_first_start.log").write_text(log, encoding="utf-8")
+    config_text = _read_client_toml(isolated / "codex" / "config.toml")
+    if foreign_entry:
+        _assert_ordered(
+            log,
+            (
+                "MCP | client migration completed",
+                "CLEAN_MAJOR_TEST | migration completed automatically",
+                "CLEAN_MAJOR_TEST | foreign Codex entry left unchanged",
+                "CLEAN_MAJOR_TEST | authenticated read/write tool probe completed",
+            ),
         )
+        assert FOREIGN_CODEX_COMMAND in config_text
+        assert "godot-ai==" not in config_text
     else:
-        (actorless_bin / "openssl").symlink_to(openssl)
-    environment = os.environ.copy()
-    environment["PATH"] = str(actorless_bin)
-
-    refused = subprocess.run(
-        argv,
-        cwd=verifier_root,
-        env=environment,
-        text=True,
-        capture_output=True,
-        timeout=60,
+        _assert_ordered(
+            log,
+            (
+                "MCP | client migration completed",
+                "CLEAN_MAJOR_TEST | migration completed automatically",
+                f"CLEAN_MAJOR_TEST | repinned owned Codex command pin={target_version}",
+                "CLEAN_MAJOR_TEST | authenticated read/write tool probe completed",
+            ),
+        )
+        assert f"godot-ai=={target_version}" in config_text
+        assert "godot-ai==3.2.4" not in config_text
+    marker = json.loads((project / CLEAN_MAJOR_MARKER_RELATIVE).read_text(encoding="utf-8"))
+    assert marker["status"] == "success", marker
+    assert marker["clients_migrated"] is True, marker
+    assert not (project / UPDATE_STATE_RELATIVE / "lock.json").exists()
+    assert (project / "_test_clean_major_probe.txt").read_text(encoding="utf-8") == (
+        "clean major authenticated write\n"
     )
+    return project, marker
 
-    assert refused.returncode == 1
-    assert "uvx is required" in refused.stderr
-    after = {
-        path.relative_to(old_addon).as_posix(): path.read_bytes()
-        for path in old_addon.rglob("*")
-        if path.is_file()
-    }
-    assert after == before
-    assert not (project / CLEAN_MAJOR_MARKER_RELATIVE).exists()
-    assert not (project / "addons/.godot-ai-v4-installing").exists()
-    assert not recovery.exists()
+
+def _read_client_toml(path: Path) -> str:
+    # Text-mode newline conversion would hide a writer's lone trailing CR.
+    text = path.read_bytes().decode("utf-8")
+    tomllib.loads(text)
+    return text
+
+
+def _selected_endpoint_tool_probe(
+    project: Path, status_file: str, capability_dir: Path, *,
+    legacy_ports: tuple[int, int], migrated: bool, expected_version: str,
+    resource_path: str, content: str,
+) -> None:
+    receipt = json.loads((project / status_file).read_text(encoding="utf-8"))
+    endpoint = receipt["_test_endpoint"]
+    ports = (endpoint["http_port"], endpoint["ws_port"])
+    assert all(type(port) is int and 1024 <= port <= 65535 for port in ports), endpoint
+    assert ports[0] != ports[1], endpoint
+    assert Path(endpoint["project_path"]).resolve() == project.resolve(), endpoint
+    if migrated:
+        assert set(ports).isdisjoint(legacy_ports), (ports, legacy_ports)
+    else:
+        assert ports == legacy_ports, (ports, legacy_ports)
+    assert receipt["server_version"] == expected_version, receipt
+    assert receipt["ws_port"] == ports[1], receipt
+    _authenticated_tool_probe(
+        ports[0], capability_dir, expected_project=project,
+        expected_instance=receipt["instance_id"], resource_path=resource_path, content=content,
+    )
 
 
 def _authenticated_tool_probe(
@@ -312,21 +374,33 @@ def _authenticated_tool_probe(
     *,
     resource_path: str = "res://_test_authenticated_tool_probe.txt",
     content: str = "signed self-update authenticated write\n",
+    expected_project: Path | None = None,
+    expected_instance: str | None = None,
 ) -> None:
     async def run() -> None:
         record = read_capabilities(http_port, capability_dir)
         assert record is not None
+        if expected_instance is not None:
+            assert record.instance_nonce == expected_instance, (
+                "probe must retain the driver's authenticated instance"
+            )
         transport = StreamableHttpTransport(
             f"http://127.0.0.1:{http_port}/mcp",
             headers={"Authorization": f"Bearer {record.http}"},
         )
         async with Client(transport, timeout=10, init_timeout=10) as client:
             deadline = asyncio.get_running_loop().time() + 90
+            routing = {}
             while True:
-                sessions = await client.call_tool(
-                    "session_manage", {"op": "list", "params": {}}
-                )
-                if int(sessions.data.get("count", 0)) > 0:
+                sessions = await client.call_tool("session_manage", {"op": "list", "params": {}})
+                if expected_project is not None:
+                    matches = [row for row in sessions.data.get("sessions", [])
+                               if Path(row["project_path"]).resolve() == expected_project.resolve()]
+                    assert len(matches) <= 1, "fixture project must have one editor session"
+                    if matches:
+                        routing = {"session_id": matches[0]["session_id"]}
+                        break
+                elif int(sessions.data.get("count", 0)) > 0:
                     break
                 if asyncio.get_running_loop().time() >= deadline:
                     raise AssertionError("editor session stayed unavailable")
@@ -334,7 +408,7 @@ def _authenticated_tool_probe(
                 # WebSocket reconnect and authenticated handshake are pending.
                 await asyncio.sleep(0.2)
             while True:
-                state = await client.call_tool("editor_state", {}, raise_on_error=False)
+                state = await client.call_tool("editor_state", routing, raise_on_error=False)
                 if not state.is_error:
                     break
                 if asyncio.get_running_loop().time() >= deadline:
@@ -343,6 +417,7 @@ def _authenticated_tool_probe(
             written = await client.call_tool(
                 "filesystem_manage",
                 {
+                    **routing,
                     "op": "write_text",
                     "params": {
                         "path": resource_path,
@@ -354,6 +429,7 @@ def _authenticated_tool_probe(
             reread = await client.call_tool(
                 "filesystem_manage",
                 {
+                    **routing,
                     "op": "read_text",
                     "params": {"path": resource_path},
                 },
@@ -363,11 +439,44 @@ def _authenticated_tool_probe(
     asyncio.run(run())
 
 
-def test_signed_update_restarts_matching_live_server_without_parse_errors(
+@pytest.fixture(
+    params=(
+        pytest.param(
+            "local-files",
+            marks=pytest.mark.skipif(
+                os.name == "nt",
+                reason=(
+                    "same signed-update-and-restart scenario as private-https "
+                    "through a different delivery transport; a Windows real-editor "
+                    "run costs ~105 s, Linux and macOS keep both variants"
+                ),
+            ),
+        ),
+        "private-https",
+    )
+)
+def signed_update_delivery(request):
+    with contextlib.ExitStack() as stack:
+
+        def configure(project, version, environment):
+            if request.param == "local-files":
+                return None
+            endpoint, transport_environment = stack.enter_context(
+                signed_smoke_https_delivery(project, version)
+            )
+            environment.update(transport_environment)
+            return endpoint
+
+        yield configure
+
+
+def test_signed_update_loads_matching_live_server_in_same_editor(
     tmp_path: Path,
+    signed_update_delivery,
 ) -> None:
-    """Drive signed verification, actor activation, reload, and server B."""
+    """Click Update on A; the same editor loads B and preserves editing state."""
     godot_bin = godot_bin_or_skip()
+    visible = os.environ.get("GODOT_AI_VISIBLE_SELF_UPDATE") == "1"
     smoke = load_smoke_script()
     project = tmp_path / "signed-self-update"
     http_port, ws_port = allocate_free_ports(2)
@@ -387,32 +496,45 @@ def test_signed_update_restarts_matching_live_server_without_parse_errors(
         http_port=http_port,
         base_version=base_version,
         next_version=next_version,
+        agent_gate=True,
+        native_update=visible,
     )
     base_addon = project / "addons" / "godot_ai"
     isolated = project / ".self-update-integration"
-    isolated_home = isolated / "home"
-    codex_home = isolated / "codex"
-    isolated_home.mkdir(parents=True)
+    environment, capability_dir = _isolated_environment(isolated)
+    codex_home = Path(environment["CODEX_HOME"])
     write_configure_client_driver(
         project,
         http_port=http_port,
         version=base_version,
+        reload_before_quit=True,
     )
-    environment = {
-        "CODEX_HOME": str(codex_home),
-        "GODOT_AI_MODE": "user",
-        "HOME": str(isolated_home),
-        "USERPROFILE": str(isolated_home),
-    }
-    if os.name == "nt":
-        local_app_data = isolated / "local-app-data"
-        local_app_data.mkdir()
-        environment["LOCALAPPDATA"] = str(local_app_data)
-        capability_dir = local_app_data / "godot-ai" / "capabilities"
-    else:
-        capability_dir = isolated / "capabilities"
-        environment[CAPABILITY_DIR_ENV] = str(capability_dir)
 
+    if visible:
+        # Match the native compatibility-rendered fixture that exposed the crash.
+        project_settings = project / "project.godot"
+        text = project_settings.read_text(encoding="utf-8")
+        assert "[rendering]" not in text
+        project_settings.write_text(
+            text + '\n[rendering]\nrenderer/rendering_method="gl_compatibility"\n'
+            'renderer/rendering_method.mobile="gl_compatibility"\n',
+            encoding="utf-8",
+        )
+
+    parsed_project = configparser.ConfigParser(interpolation=None)
+    parsed_project.read_string(
+        "[__project__]\n" + (project / "project.godot").read_text(encoding="utf-8")
+    )
+    assert parsed_project["autoload"]["_SelfUpdateRunnerDriver"] == (
+        '"*res://_test_runner_driver.gd"'
+    )
+    assert parsed_project["autoload"]["_SelfUpdateClientPrep"] == (
+        '"*res://_test_configure_client.gd"'
+    )
+    if visible:
+        assert parsed_project["rendering"]["renderer/rendering_method"] == '"gl_compatibility"'
+
+    delivery = signed_update_delivery(project, next_version, environment)
     prep_environment = dict(environment)
     prep_environment.update(
         {
@@ -429,304 +551,210 @@ def test_signed_update_restarts_matching_live_server_without_parse_errors(
         phase="configure",
     )
     assert f"SELF_UPDATE_TEST | production-configured Codex command pin={base_version}" in prep_log
-    assert f"godot-ai=={base_version}" in (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert (
+        "SELF_UPDATE_TEST | ordinary reload restored backend and persisted enablement" in prep_log
+    )
+    assert f"godot-ai=={base_version}" in _read_client_toml(codex_home / "config.toml")
     remove_configure_client_driver(project)
 
-    log = run_godot_editor(
-        project,
-        godot_bin,
-        allow_headless=True,
-        timeout=180,
-        environment=environment,
-        live_probe=lambda: _authenticated_tool_probe(http_port, capability_dir),
-    )
+    # An agent stays attached through the whole update, exactly as a user's
+    # AI client would be. Its bridge loses server A, spawns a backend of the
+    # old version during the plugin reload, and the new plugin must
+    # replace that backend on its own rather than ask the user to.
+    with AttachedAgent(
+        project, http_port, ws_port, capability_dir=capability_dir, environment=environment
+    ) as agent:
+        def probe_updated_editor() -> None:
+            _selected_endpoint_tool_probe(
+                project, POST_UPDATE_STATUS_FILE, capability_dir,
+                legacy_ports=(http_port, ws_port), migrated=False,
+                expected_version=next_version,
+                resource_path="res://_test_authenticated_tool_probe.txt",
+                content="signed self-update authenticated write\n",
+            )
+            agent.wait_for_post_update(next_version)
 
+        try:
+            log = run_godot_editor(
+                project,
+                godot_bin,
+                allow_headless=not visible,
+                headless=not visible,
+                timeout=360 if visible else 240,
+                environment=environment,
+                live_probe=probe_updated_editor,
+                require_same_editor=True,
+            )
+        except AssertionError as exc:
+            raise AssertionError(
+                f"agent ok={agent.ok} fault={agent.fault!r} errors={agent.errors[:3]}\n{exc}"
+            ) from exc
+    assert not agent.fault, agent.fault
+    assert agent.ok >= 1, agent.errors
+    assert agent.post_update["version"] == next_version
+    assert agent.post_update["session_id"]
+    # The original stdio bridge must recover as well as the separate HTTP probe.
+    print(f"attached agent: ok={agent.ok} errors={len(agent.errors)} last={agent.errors[-1:]}")
+    ## From 4.0.4 on the attached bridge follows the new server (same major);
+    ## an older bridge needs a new MCP connection using the updated configuration.
+    base_tuple = tuple(int(part) for part in base_version.split(".")[:3])
+    if base_tuple >= (4, 0, 4):
+        expected_client_line = (
+            f"MCP | AI clients using v{base_version} can reconnect to v{next_version}; "
+            "relaunch clients still using older versions"
+        )
+    else:
+        expected_client_line = (
+            "MCP | Refresh the Godot AI MCP connection and reload its configuration once "
+            f"to use v{next_version}; relaunch the AI app if it cannot reload the configuration"
+        )
+    assert expected_client_line in log
+
+    initial_editor, restarted_editor = read_editor_receipts(project)
+    assert initial_editor["pid"] == restarted_editor["pid"], (initial_editor, restarted_editor)
+    assert initial_editor["display"] == restarted_editor["display"]
+    assert (initial_editor["display"] == "headless") is (not visible)
+    assert (project / POST_UPDATE_COMPLETE_FILE).is_file()
+    assert ("SELF_UPDATE_TEST | loaded topology, dirty scene, selection and undo/redo preserved"
+            in log)
+    assert f"MCP | update activation completed in editor PID {initial_editor['pid']}" in log
     assert_no_update_parse_errors(log)
-    assert "SELF_UPDATE_TEST | requesting canonical signed install" in log
-    assert "SELF_UPDATE_TEST | signed topology files installed" in log
-    assert "SELF_UPDATE_TEST | authenticated read/write tool probe completed" in log
-    assert f"SELF_UPDATE_TEST | status name=godot-ai server_version={next_version}" in log
-    assert "SELF_UPDATE_TEST | pre-update instance_id=" in log
+    _assert_ordered(
+        log,
+        [
+            "SELF_UPDATE_TEST | pre-update instance_id=",
+            f"SELF_UPDATE_TEST | configured Codex command pin={base_version}",
+            "SELF_UPDATE_TEST | requesting canonical signed install",
+            # The local bundle is staged before the swap. The HTTPS observer is
+            # connected after the plugin's activation listener, but activation
+            # names each phase in the dock and yields a frame before verifying,
+            # staging and quiescing, so the observer's line lands before the
+            # activation announcement. Whether A is stopped or merely detached
+            # before the swap depends on the attached agent holding a lease at
+            # that instant; the new plugin replaces either occupant.
+            *(
+                [
+                    "SELF_UPDATE_TEST | HTTPS canonical triple downloaded",
+                    f"MCP | update to {next_version} swapped in; "
+                    "reloading the plugin in this editor",
+                ]
+                if delivery is not None
+                else [
+                    smoke.SMOKE_STAGED_LOG,
+                    f"MCP | update to {next_version} swapped in; "
+                    "reloading the plugin in this editor",
+                ]
+            ),
+            # Everything below runs in the same editor process. The driver
+            # sees the new server answer /godot-ai/status before the plugin
+            # logs the handshake that follows the spawn.
+            "MCP | client migration completed",
+            "MCP | plugin loaded",
+            f"SELF_UPDATE_TEST | repinned Codex command pin={next_version}",
+            "SELF_UPDATE_TEST | signed topology files installed",
+            f"SELF_UPDATE_TEST | status name=godot-ai server_version={next_version}",
+            "MCP | started server (PID ",
+            "SELF_UPDATE_TEST | authenticated read/write tool probe completed",
+        ],
+    )
     assert read_plugin_version(base_addon / "plugin.cfg") == next_version
     assert (base_addon / "utils" / "self_update_smoke_child.gd").is_file()
     assert (base_addon / "utils" / "self_update_smoke_child.gd.uid").is_file()
-    client_config = (codex_home / "config.toml").read_text(encoding="utf-8")
+    client_config = _read_client_toml(codex_home / "config.toml")
     assert f"godot-ai=={next_version}" in client_config
     assert f"godot-ai=={base_version}" not in client_config
     assert (project / "_test_authenticated_tool_probe.txt").read_text(encoding="utf-8") == (
         "signed self-update authenticated write\n"
     )
-    transaction, backup = smoke.verify_transaction_recovery(project, next_version)
-    assert backup.is_dir()
-    paths = smoke.TransactionPaths.for_transaction(backup.parent, transaction)
-    intent = smoke.load_intent(paths)
-    claim = smoke.validate_terminal(paths.claim, intent)
-    completion = smoke.validate_migration_complete(paths, intent)
+    marker, backup = smoke.verify_lean_update_state(project, next_version)
+    assert marker["from_version"] == base_version
+    assert marker["replace_owned_mismatches"] is False
+    assert read_plugin_version(backup / "plugin.cfg") == base_version
 
-    def record_sha256(record: dict[str, object]) -> str:
-        canonical = (
-            json.dumps(
-                record,
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            + "\n"
-        ).encode()
-        return hashlib.sha256(canonical).hexdigest()
-
-    assert paths.migration_complete.is_file()
-    assert claim["outcome"] == "success"
-    assert completion["transaction"] == transaction
-    assert completion["claim_sha256"] == record_sha256(claim)
-    assert completion["intent_sha256"] == record_sha256(intent.record())
-    assert completion["live_tree"] == intent.new_tree.record()
-    assert smoke.hash_tree(base_addon) == intent.new_tree
-    downloads = backup.parent / "downloads"
-    assert not downloads.exists() or not any(downloads.iterdir())
-
-    ordered_markers = [
-        f"SELF_UPDATE_TEST | configured Codex command pin={base_version}",
-        "SELF_UPDATE_TEST | requesting canonical signed install",
-        "MCP | self-update smoke: staged signed local bundle",
-        "MCP | stopped server",
-        COORDINATOR_DISABLE_MARKER,
-        "MCP | update coordinator enabling verified plugin",
-        f"SELF_UPDATE_TEST | repinned Codex command pin={next_version}",
-        "MCP | client migration durably completed",
-        "MCP | plugin loaded",
-        "SELF_UPDATE_TEST | signed topology files installed",
-        "SELF_UPDATE_TEST | status name=godot-ai",
-        "MCP | started server (PID ",
-        "SELF_UPDATE_TEST | authenticated read/write tool probe completed",
-    ]
-    position = -1
-    for marker in ordered_markers:
-        next_position = log.find(marker, position + 1)
-        assert next_position > position, f"missing/out-of-order marker {marker!r}:\n{log}"
-        position = next_position
-
-    status_path = project / POST_UPDATE_STATUS_FILE
-    assert status_path.is_file(), log
-    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    payload = json.loads((project / POST_UPDATE_STATUS_FILE).read_text(encoding="utf-8"))
     assert payload.get("name") == "godot-ai"
     assert payload.get("server_version") == next_version
     post_id = payload.get("instance_id")
-    assert isinstance(post_id, str) and post_id
-    pre_line = next(
-        line
-        for line in log.splitlines()
-        if line.startswith("SELF_UPDATE_TEST | pre-update instance_id=")
-    )
-    pre_id = pre_line.split("=", 1)[1]
+    pre_id = (project / PRE_INSTANCE_ID_FILE).read_text(encoding="utf-8").strip()
+    assert isinstance(post_id, str) and post_id and pre_id
     assert post_id != pre_id
+    if delivery is not None:
+        assert delivery.downloads == [
+            smoke.SMOKE_ARCHIVE_NAME,
+            smoke.SMOKE_MANIFEST_NAME,
+            smoke.SMOKE_SIGNATURE_NAME,
+        ]
+        # B is the canonical tree; A (the backup) carried the fixture signing key.
+        canonical_manager = (PLUGIN_ROOT / "utils/update_manager.gd").read_bytes()
+        assert (base_addon / "utils/update_manager.gd").read_bytes() == canonical_manager
+        assert (backup / "utils/update_manager.gd").read_bytes() != canonical_manager
+        for retained in (
+            prep_log,
+            log,
+            client_config,
+            json.dumps(marker),
+            (project / "project.godot").read_text(encoding="utf-8"),
+        ):
+            assert delivery.token not in retained
+            assert "https://release.qualification.invalid" not in retained
 
 
+# The v3 versions the installed fleet runs (telemetry, 30 days to 2026-09-04,
+# every version above ~100 installs). Each crosses into v4 through its own
+# updater and the capsule. Every pull request proves the two newest; the
+# whole fleet runs nightly and wherever GODOT_AI_FLEET_CROSSINGS=1 is set.
+V3_FLEET_VERSIONS = (
+    "3.0.7",
+    "3.1.1",
+    "3.1.2",
+    "3.1.3",
+    "3.1.4",
+    "3.1.5",
+    "3.2.0",
+    "3.2.1",
+    "3.2.2",
+    "3.2.3",
+    "3.2.4",
+    "3.2.5",
+)
+V3_NEWEST_VERSIONS = V3_FLEET_VERSIONS[-2:]
+FLEET_CROSSINGS_ENABLED = os.environ.get("GODOT_AI_FLEET_CROSSINGS", "") == "1"
+
+
+@pytest.mark.parametrize(
+    "from_version",
+    [
+        pytest.param(
+            version,
+            marks=pytest.mark.skipif(
+                not FLEET_CROSSINGS_ENABLED and version not in V3_NEWEST_VERSIONS,
+                reason="older fleet crossings run nightly (GODOT_AI_FLEET_CROSSINGS=1)",
+            ),
+        )
+        for version in V3_FLEET_VERSIONS
+    ],
+)
 def test_final_v3_capsule_automatically_replaces_tree_repins_and_starts(
     tmp_path: Path,
+    from_version: str,
 ) -> None:
-    """Click Update in exact final v3 and prove the rest is automatic."""
+    """Click Update in an exact fleet v3 and prove the rest is automatic."""
     godot_bin = godot_bin_or_skip()
     smoke = load_smoke_script()
     target_version = read_plugin_version(PLUGIN_ROOT / "plugin.cfg")
-    from_version = "3.2.4"
     http_port, ws_port = allocate_free_ports(2)
     project = tmp_path / "v3-bridge-update"
-    project.mkdir()
-    smoke.write_project_files(project)
-    append_driver_autoload(project / "project.godot")
-    work = project / ".godot-ai-self-update-smoke"
-    work.mkdir()
-    (work / "marker.txt").write_text("v3 bridge integration fixture\n", encoding="utf-8")
-
-    server_command, runtime_source = smoke.prepare_local_server_runtime(
-        work, "bridge-server", target_version
-    )
-    actor_command, private_key, public_key = smoke.prepare_smoke_actor(work, runtime_source)
-    client_command = smoke.prepare_isolated_client_environment(
+    prepared = smoke.prepare_v3_crossing_project(
         project,
-        base_version=from_version,
+        from_version=from_version,
+        target_version=target_version,
         http_port=http_port,
         ws_port=ws_port,
+        restart_log=project / RESTARTED_EDITOR_LOG,
     )
-    release_tree = work / "release-tree"
-    shutil.copytree(PLUGIN_ROOT, release_tree, ignore=smoke.copy_ignore)
-    smoke.patch_fixture_plugin(
-        release_tree,
-        version=target_version,
-        server_version=target_version,
-        http_port=http_port,
-        ws_port=ws_port,
-        force_local_update=False,
-        next_version=target_version,
-        server_command=server_command,
-        actor_command=actor_command,
-        isolate_client_migration=True,
-        client_launch_command=client_command,
-    )
-    bundle = work / "release"
-    bundle.mkdir()
-    smoke.create_signed_v4_bundle(
-        release_tree, bundle, target_version, private_key, public_key
-    )
-
-    capsule_tree = work / "capsule-tree" / "addons" / "godot_ai"
-    shutil.copytree(PLUGIN_ROOT.parents[2] / "migration_bridge", capsule_tree)
-    capsule_config = capsule_tree / "plugin.cfg"
-    capsule_config.write_text(
-        capsule_config.read_text(encoding="utf-8").replace("@VERSION@", target_version),
-        encoding="utf-8",
-    )
-    payload = capsule_tree / "migration_payload"
-    payload.mkdir()
-    for name in (
-        smoke.SMOKE_ARCHIVE_NAME,
-        smoke.SMOKE_MANIFEST_NAME,
-        smoke.SMOKE_SIGNATURE_NAME,
-    ):
-        shutil.copy2(bundle / name, payload / name)
-    bridge_exec = capsule_tree / "bridge_exec.gd"
-    bridge_exec.write_text(
-        smoke.replace_function(
-            bridge_exec.read_text(encoding="utf-8"),
-            "static func actor_command(version: String) -> Array[String]:",
-            "static func actor_command(_version: String) -> Array[String]:\n"
-            f"\treturn {json.dumps(actor_command)}",
-        ),
-        encoding="utf-8",
-    )
-    bridge = capsule_tree / "migration_bridge.gd"
-    bridge.write_text(
-        smoke.replace_function(
-            bridge.read_text(encoding="utf-8"),
-            "static func _previous_version() -> String:",
-            "static func _previous_version() -> String:\n"
-            f"\treturn {json.dumps(from_version)}",
-        ),
-        encoding="utf-8",
-    )
-    capsule = work / "godot-ai-plugin.zip"
-    with zipfile.ZipFile(capsule, "w", compression=zipfile.ZIP_STORED) as package:
-        for path in sorted(capsule_tree.rglob("*")):
-            if path.is_file():
-                package.write(path, path.relative_to(capsule_tree.parents[1]).as_posix())
-    checksum = work / "godot-ai-plugin.zip.sha256"
-    checksum.write_text(
-        f"{hashlib.sha256(capsule.read_bytes()).hexdigest()}  {capsule.name}\n",
-        encoding="ascii",
-    )
-    signature = work / "godot-ai-plugin.zip.sha256.sig"
-    subprocess.run(
-        [
-            "openssl",
-            "dgst",
-            "-sha256",
-            "-sign",
-            str(private_key),
-            "-out",
-            str(signature),
-            str(checksum),
-        ],
-        check=True,
-        capture_output=True,
-    )
-    private_key.unlink()
-
-    archived = work / "v3.2.4.zip"
-    archived.write_bytes(
-        subprocess.run(
-            ["git", "archive", "--format=zip", "v3.2.4", "plugin/addons/godot_ai"],
-            cwd=PLUGIN_ROOT.parents[2],
-            check=True,
-            capture_output=True,
-        ).stdout
-    )
-    extracted = work / "v3-source"
-    with zipfile.ZipFile(archived) as package:
-        assert all(
-            not Path(info.filename).is_absolute() and ".." not in Path(info.filename).parts
-            for info in package.infolist()
-        )
-        assert all(
-            info.is_dir() or info.filename.startswith("plugin/addons/godot_ai/")
-            for info in package.infolist()
-        )
-        package.extractall(extracted)
-    live = project / "addons" / "godot_ai"
-    shutil.copytree(extracted / "plugin/addons/godot_ai", live)
-    old_plugin = live / "plugin.gd"
-    old_plugin.write_text(
-        smoke.replace_function(
-            old_plugin.read_text(encoding="utf-8"),
-            "func _start_server() -> void:",
-            "func _start_server() -> void:\n\tpass",
-        ),
-        encoding="utf-8",
-    )
-    old_manager = live / "utils" / "update_manager.gd"
-    manager_text = old_manager.read_text(encoding="utf-8")
-    manager_text = smoke.subn_once(
-        old_manager,
-        manager_text,
-        r'const RELEASE_SIGNING_PUBLIC_KEY_PEM := """[\s\S]*?"""',
-        (
-            'const RELEASE_SIGNING_PUBLIC_KEY_PEM := """'
-            + public_key.strip()
-            + '"""'
-        ),
-        "v3 fixture signing key",
-    )
-    manager_text = smoke.replace_once(
-        old_manager,
-        manager_text,
-        'const UPDATE_TEMP_ZIP := "user://godot_ai_update/update.zip"\n',
-        (
-            'const UPDATE_TEMP_ZIP := "user://godot_ai_update/update.zip"\n'
-            f'const CLICK_FIXTURE_ARCHIVE := {json.dumps(str(capsule))}\n'
-            f'const CLICK_FIXTURE_CHECKSUM := {json.dumps(str(checksum))}\n'
-            f'const CLICK_FIXTURE_SIGNATURE := {json.dumps(str(signature))}\n'
-            f'const CLICK_FIXTURE_VERSION := {json.dumps(target_version)}\n'
-        ),
-        "v3 click fixture assets",
-    )
-    manager_text = smoke.replace_function(
-        manager_text,
-        "func check_for_updates() -> void:",
-        """func check_for_updates() -> void:
-\t_latest_download_url = (
-\t\t"https://github.com/hi-godot/godot-ai/releases/download/v%s/" % CLICK_FIXTURE_VERSION
-\t\t+ "godot-ai-plugin.zip"
-\t)
-\t_latest_checksum_url = _latest_download_url + ".sha256"
-\t_latest_signature_url = _latest_checksum_url + ".sig"
-\t_latest_remote_version = CLICK_FIXTURE_VERSION
-\tupdate_check_completed.emit({
-\t\t"has_update": true,
-\t\t"version": CLICK_FIXTURE_VERSION,
-\t\t"label_text": "Update available: v%s" % CLICK_FIXTURE_VERSION,
-\t})""",
-    )
-    manager_text = smoke.replace_function(
-        manager_text,
-        "func start_install() -> void:",
-        """func start_install() -> void:
-\tprint("V3_BRIDGE_TEST | clicked final-v3 Update button")
-\tvar global_zip := ProjectSettings.globalize_path(UPDATE_TEMP_ZIP)
-\tDirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(UPDATE_TEMP_DIR))
-\tif DirAccess.copy_absolute(CLICK_FIXTURE_ARCHIVE, global_zip) != OK:
-\t\t_fail_verification("fixture archive copy failed")
-\t\treturn
-\tvar sidecar := FileAccess.get_file_as_bytes(CLICK_FIXTURE_CHECKSUM)
-\tvar signature := FileAccess.get_file_as_bytes(CLICK_FIXTURE_SIGNATURE)
-\tif not _verify_sidecar_signature(RELEASE_SIGNING_PUBLIC_KEY_PEM, sidecar, signature):
-\t\t_fail_verification("fixture signature failed")
-\t\treturn
-\tprint("MCP | self-update release signature verified")
-\tvar expected := _parse_sha256_digest(sidecar.get_string_from_utf8())
-\t_finish_digest_check_and_install(expected)""",
-    )
-    old_manager.write_text(manager_text, encoding="utf-8")
+    append_driver_autoload(project / "project.godot")
+    live = prepared["live"]
+    v3_source = prepared["v3_source"]
 
     write_driver_support(project)
     (project / "_test_runner_driver.gd").write_text(
@@ -737,19 +765,37 @@ const TARGET_VERSION := "{target_version}"
 const HTTP_PORT := {http_port}
 const STATUS_PATH := "res://{POST_UPDATE_STATUS_FILE}"
 const PROBE_DONE_PATH := "res://{POST_UPDATE_TOOL_PROBE_FILE}"
-const COMPLETE_PATH := "res://_test_v3_bridge_complete.done"
+const COMPLETE_PATH := "res://{POST_UPDATE_COMPLETE_FILE}"
+const INITIAL_RECEIPT := "res://_test_initial_editor.json"
+const RESTARTED_RECEIPT := "res://_test_restarted_editor.json"
 const DriverSupport := preload("res://_test_self_update_driver_support.gd")
 const DEADLINE_MSEC := 180000
 
 var _deadline := 0
 var _migration_ready := false
 var _clicked := false
+var _scene_state: Dictionary = {{}}
+var _old_plugin_id := 0
 
 
 func _ready() -> void:
 \tif not Engine.is_editor_hint():
 \t\tqueue_free()
 \t\treturn
+\tvar restarted := FileAccess.file_exists(INITIAL_RECEIPT)
+\tif restarted:
+\t\tpush_error("V3_BRIDGE_TEST | migration unexpectedly restarted the editor")
+\t\tget_tree().quit(44)
+\t\treturn
+\tvar receipt_path := INITIAL_RECEIPT
+\tvar receipt := FileAccess.open(receipt_path, FileAccess.WRITE)
+\tif receipt == null:
+\t\tget_tree().quit(43)
+\t\treturn
+\treceipt.store_string(JSON.stringify({{
+\t\t"pid": OS.get_process_id(), "display": DisplayServer.get_name(),
+\t}}))
+\treceipt.close()
 \t_deadline = Time.get_ticks_msec() + DEADLINE_MSEC
 \tset_process(true)
 
@@ -766,6 +812,15 @@ func _process(_delta: float) -> void:
 \t\tvar dock: Variant = old_plugin.get("_dock")
 \t\tif dock == null or not dock.has_method("_on_update_pressed"):
 \t\t\treturn
+\t\tif EditorInterface.get_edited_scene_root() == null:
+\t\t\tEditorInterface.open_scene_from_path("res://empty.tscn")
+\t\t\treturn
+\t\t_old_plugin_id = old_plugin.get_instance_id()
+\t\t_scene_state = DriverSupport.capture_scene_state(old_plugin)
+\t\tif _scene_state.is_empty():
+\t\t\tpush_error("V3_BRIDGE_TEST | could not capture scene continuity state")
+\t\t\tget_tree().quit(46)
+\t\t\treturn
 \t\tdock.call("_on_update_pressed")
 \t\t_clicked = true
 \t\treturn
@@ -781,11 +836,28 @@ func _process(_delta: float) -> void:
 \tvar plugin := DriverSupport.find_godot_ai_plugin()
 \tif plugin == null or not bool(plugin.call("has_managed_server")):
 \t\treturn
+\tif (plugin.get_instance_id() == _old_plugin_id
+\t\t\tor str(plugin.get("_loaded_plugin_version")) != TARGET_VERSION):
+\t\treturn
 \tif not DriverSupport.client_config_has_pin(TARGET_VERSION):
 \t\treturn
-\tvar status := DriverSupport.fetch_status(HTTP_PORT)
+\tvar status := DriverSupport.fetch_selected_status(plugin)
 \tif str(status.get("server_version", "")) != TARGET_VERSION:
 \t\treturn
+\tvar continuity_error := DriverSupport.verify_scene_state(plugin, _scene_state)
+\tif not continuity_error.is_empty():
+\t\tpush_error("V3_BRIDGE_TEST | " + continuity_error)
+\t\tget_tree().quit(45)
+\t\treturn
+\tvar receipt := FileAccess.open(RESTARTED_RECEIPT, FileAccess.WRITE)
+\tif receipt == null:
+\t\tget_tree().quit(43)
+\t\treturn
+\treceipt.store_string(JSON.stringify({{
+\t\t"pid": OS.get_process_id(), "display": DisplayServer.get_name(),
+\t}}))
+\treceipt.close()
+\tprint("V3_BRIDGE_TEST | dirty scene, selection and undo/redo preserved")
 \tvar file := FileAccess.open(STATUS_PATH, FileAccess.WRITE)
 \tif file == null:
 \t\tget_tree().quit(42)
@@ -804,181 +876,468 @@ func _process(_delta: float) -> void:
         project,
         godot_bin,
         allow_headless=True,
-        timeout=240,
+        timeout=360 if os.name == "nt" else 240,
         environment=environment,
-        live_probe=lambda: _authenticated_tool_probe(
-            http_port,
-            capability_dir,
+        require_same_editor=True,
+        live_probe=lambda: _selected_endpoint_tool_probe(
+            project, POST_UPDATE_STATUS_FILE, capability_dir,
+            legacy_ports=(http_port, ws_port), migrated=True, expected_version=target_version,
             resource_path="res://_test_v3_bridge_probe.txt",
             content="v3 bridge authenticated write\n",
         ),
-        restart_completion_file="_test_v3_bridge_complete.done",
     )
 
-    disable = log.find("MCP | v3 bridge disabling transition plugin")
-    assert disable >= 0, log
+    initial_editor, restarted_editor = read_editor_receipts(project)
+    assert initial_editor["pid"] == restarted_editor["pid"], (initial_editor, restarted_editor)
+    assert initial_editor["display"] == restarted_editor["display"] == "headless", (
+        initial_editor,
+        restarted_editor,
+    )
+    assert (project / POST_UPDATE_COMPLETE_FILE).is_file()
+    assert "V3_BRIDGE_TEST | dirty scene, selection and undo/redo preserved" in log
+    assert f"MCP | update activation completed in editor PID {initial_editor['pid']}" in log
     assert "Failed to create an autoload" not in log, log
-    transition_window = log[disable:]
-    parse_errors = (
-        "SCRIPT ERROR: Parse Error",
+    disable = log.find("MCP | update runner disabling old plugin")
+    assert disable >= 0, log
+    for pattern in (
+        "SCRIPT ERROR:",
+        "ERROR: Attempt to open script",
         "ERROR: Failed to load script",
         "Could not resolve script",
+    ):
+        assert pattern not in log[disable:], log[disable:]
+    _assert_ordered(
+        log,
+        (
+            "V3_BRIDGE_TEST | clicked final-v3 Update button",
+            "MCP | self-update release signature verified",
+            "MCP | update runner disabling old plugin",
+            "MCP | v3 bridge verifying and staging the signed v4 tree",
+            "MCP | v3 bridge activating canonical v4 tree",
+            "MCP | v3 bridge handing verified tree to in-editor activation",
+            f"MCP | update to {target_version} swapped in; reloading the plugin in this editor",
+            # The original editor now runs the loaded v4 plugin.
+            "MCP | client migration completed",
+            "V3_BRIDGE_TEST | v4 server and client pin ready",
+            "V3_BRIDGE_TEST | authenticated tool probe completed",
+        ),
     )
-    for pattern in parse_errors:
-        assert pattern not in transition_window, transition_window
-    ordered_markers = (
-        "V3_BRIDGE_TEST | clicked final-v3 Update button",
-        "MCP | self-update release signature verified",
-        "MCP | update runner disabling old plugin",
-        "MCP | v3 bridge preparing signed v4 tree",
-        "MCP | v3 bridge activating canonical v4 tree",
-        "MCP | v3 bridge disabling transition plugin",
-        "MCP | v3 bridge restarting editor into canonical v4 tree",
-    )
-    position = -1
-    for marker in ordered_markers:
-        position = log.find(marker, position + 1)
-        assert position >= 0, f"missing/out-of-order {marker!r}:\n{log}"
     assert read_plugin_version(live / "plugin.cfg") == target_version
     assert not (live / "migration_payload").exists()
     assert not (live / "update_reload_runner.gd").exists()
+    # Signed canonical compatibility shims are intentional; capsule payload is not.
+    for shim in ("migration_bridge.gd", "migration_coordinator.gd", "migration_fallback.gd"):
+        assert (live / shim).read_bytes() == (PLUGIN_ROOT / shim).read_bytes()
     codex_home = smoke.fixture_environment_paths(project)["codex_home"]
-    config_text = (codex_home / "config.toml").read_text(encoding="utf-8")
+    config_text = _read_client_toml(codex_home / "config.toml")
     assert f"godot-ai=={target_version}" in config_text
     assert f"godot-ai=={from_version}" not in config_text
-    transaction, backup = smoke.verify_transaction_recovery(project, target_version)
-    intent = smoke.load_intent(
-        smoke.TransactionPaths.for_transaction(backup.parent, transaction)
-    )
-    assert intent.from_version == from_version
+    marker, backup = smoke.verify_lean_update_state(project, target_version)
+    assert marker["from_version"] == from_version
+    assert marker["replace_owned_mismatches"] is True
+    assert backup == project / UPDATE_STATE_RELATIVE / "backup" / from_version
     assert (backup / "migration_payload" / smoke.SMOKE_ARCHIVE_NAME).is_file()
     assert (backup / "update_reload_runner.gd").is_file()
     # The supported v3 updater overlays the capsule; it retains the old
     # autoload until the canonical tree replaces it. The capsule is not a
     # standalone add-on and must not grow a second game-helper implementation.
     assert (backup / "runtime/game_helper.gd").read_bytes() == (
-        extracted / "plugin/addons/godot_ai/runtime/game_helper.gd"
+        v3_source / "runtime/game_helper.gd"
     ).read_bytes()
+    # The v4 plugin registers its own game-helper autoload on start; what #946
+    # removed was v3's entry dangling through the migration window. After the
+    # crossing the entry must point at a file the live tree actually has.
+    project_settings = (project / "project.godot").read_text(encoding="utf-8")
+    autoload = re.search(r'_mcp_game_helper="\*?(res://[^"]+)"', project_settings)
+    assert autoload is not None, project_settings
+    assert autoload.group(1) == "res://addons/godot_ai/runtime/game_helper.gd"
+    assert (live / "runtime" / "game_helper.gd").is_file()
 
 
-@pytest.mark.parametrize("prewarm_mode", ["cold", "offline", "wedged"])
-def test_clean_major_installer_holds_first_start_until_client_confirmation(
-    tmp_path: Path, prewarm_mode: str
-) -> None:
-    """Exercise the documented synthetic pre-v4 -> v4 clean migration lane."""
+def test_final_v3_fallback_waits_for_an_interactive_editor(tmp_path: Path) -> None:
+    """Below the floor, a headless editor must not restore; the next interactive start does.
+
+    The capsule lands in the tree the moment v3's updater extracts it. A
+    headless import or export that opens the project before the user does
+    must leave every byte alone; the restore belongs to the interactive start.
+    """
     godot_bin = godot_bin_or_skip()
+    smoke = load_smoke_script()
+    target_version = read_plugin_version(PLUGIN_ROOT / "plugin.cfg")
+    http_port, ws_port = allocate_free_ports(2)
+    project = tmp_path / "v3-floor-headless"
+    prepared = smoke.prepare_v3_crossing_project(
+        project,
+        from_version="3.2.4",
+        target_version=target_version,
+        http_port=http_port,
+        ws_port=ws_port,
+    )
+    append_driver_autoload(project / "project.godot")
+    live = prepared["live"]
+    # The state v3's updater leaves behind: the capsule overlaid on the v3 tree.
+    shutil.copytree(
+        prepared["work"] / "capsule-tree" / "addons" / "godot_ai", live, dirs_exist_ok=True
+    )
+    assert read_plugin_version(live / "plugin.cfg") == target_version
+    write_driver_support(project)
+    (project / "_test_runner_driver.gd").write_text(
+        """@tool
+extends Node
+
+const DriverSupport := preload("res://_test_self_update_driver_support.gd")
+const DEADLINE_MSEC := 180000
+
+var _deadline := 0
+var _frames := 0
+
+
+func _ready() -> void:
+\tif not Engine.is_editor_hint():
+\t\tqueue_free()
+\t\treturn
+\t_deadline = Time.get_ticks_msec() + DEADLINE_MSEC
+\tset_process(true)
+
+
+func _process(_delta: float) -> void:
+\t_frames += 1
+\tif OS.get_environment("_FALLBACK_PHASE") == "headless":
+\t\tif _frames >= 150:
+\t\t\tprint("V3_FALLBACK_TEST | headless start observed, quitting")
+\t\t\tget_tree().quit(0)
+\t\treturn
+\tif Time.get_ticks_msec() >= _deadline:
+\t\tpush_error("V3_FALLBACK_TEST | restore timed out")
+\t\tget_tree().quit(41)
+\t\treturn
+\tif FileAccess.file_exists("res://addons/godot_ai/migration_bridge.gd"):
+\t\treturn
+\tvar config := ConfigFile.new()
+\tif config.load("res://addons/godot_ai/plugin.cfg") != OK:
+\t\treturn
+\tif str(config.get_value("plugin", "version", "")) != "3.2.5":
+\t\treturn
+\tif DriverSupport.find_godot_ai_plugin() == null:
+\t\treturn
+\tprint("V3_FALLBACK_TEST | final v3 restored and enabled")
+\tget_tree().quit(0)
+""",
+        encoding="utf-8",
+    )
+    environment = dict(smoke.godot_child_environment(project))
+    environment["GODOT_AI_TEST_GODOT_FLOOR"] = "unmet"
+    bytes_before = _tree_bytes(live)
+
+    headless_log = run_godot_editor(
+        project,
+        godot_bin,
+        allow_headless=False,
+        timeout=180,
+        environment={**environment, "_FALLBACK_PHASE": "headless"},
+        phase="headless",
+    )
+    assert (
+        "MCP | v3 bridge: Godot AI v4 migration needs the interactive Godot editor" in headless_log
+    )
+    assert "v3 bridge restored" not in headless_log
+    assert "V3_FALLBACK_TEST | headless start observed, quitting" in headless_log
+    bytes_after = _tree_bytes(live)
+    # Godot writes a .uid beside any script that lacks one on scan; that is
+    # editor metadata, not the capsule touching the tree.
+    changed = sorted(
+        path
+        for path in set(bytes_before) | set(bytes_after)
+        if bytes_before.get(path) != bytes_after.get(path) and not str(path).endswith(".uid")
+    )
+    assert not changed, f"a headless editor must not touch the tree; changed: {changed}"
+    assert not (project / UPDATE_STATE_RELATIVE).exists()
+
+    interactive_log = run_godot_editor(
+        project, godot_bin, allow_headless=True, timeout=240, environment=environment
+    )
+    _assert_ordered(
+        interactive_log,
+        (
+            "Godot AI v4 migration requires Godot 4.7 or newer; bridge remains inactive.",
+            "MCP | v3 bridge restored Godot AI v3.2.5; update again on Godot 4.7 or newer",
+            "V3_FALLBACK_TEST | final v3 restored and enabled",
+        ),
+    )
+    assert read_plugin_version(live / "plugin.cfg") == "3.2.5"
+    assert not (live / "migration_payload").exists()
+    assert not (project / UPDATE_STATE_RELATIVE).exists(), "the restore stage is gone"
+
+
+def test_final_v3_capsule_restores_final_v3_when_godot_is_too_old(tmp_path: Path) -> None:
+    """Below v4's Godot floor the capsule puts the final v3 add-on back, working."""
+    godot_bin = godot_bin_or_skip()
+    smoke = load_smoke_script()
     target_version = read_plugin_version(PLUGIN_ROOT / "plugin.cfg")
     from_version = "3.2.4"
     http_port, ws_port = allocate_free_ports(2)
-    project, _recovery, isolated_home, codex_home = _install_clean_major_fixture(
-        tmp_path, target_version, http_port, ws_port
+    project = tmp_path / "v3-floor-refusal"
+    prepared = smoke.prepare_v3_crossing_project(
+        project,
+        from_version=from_version,
+        target_version=target_version,
+        http_port=http_port,
+        ws_port=ws_port,
     )
-    marker = project / CLEAN_MAJOR_MARKER_RELATIVE
-    assert marker.is_file()
-    isolated = isolated_home.parent
-    prewarm_log = project / ".clean-major-smoke" / "prewarm.jsonl"
-    wedge_started = project / ".clean-major-smoke" / "wedge-started.txt"
-    environment = {
-        "CLEAN_MAJOR_FAKE_UVX_MODE": prewarm_mode,
-        "CLEAN_MAJOR_PREWARM_LOG": str(prewarm_log),
-        "CLEAN_MAJOR_WEDGE_STARTED": str(wedge_started),
-        "CODEX_HOME": str(codex_home),
-        "GODOT_AI_MODE": "user",
-        "HOME": str(isolated_home),
-        "PATH": (
-            str(project / ".clean-major-smoke" / "fake-bin")
-            + os.pathsep
-            + os.environ.get("PATH", "")
+    append_driver_autoload(project / "project.godot")
+    live = prepared["live"]
+    write_driver_support(project)
+    (project / "_test_runner_driver.gd").write_text(
+        f'''@tool
+extends Node
+
+const DriverSupport := preload("res://_test_self_update_driver_support.gd")
+const DEADLINE_MSEC := 180000
+
+var _deadline := 0
+var _clicked := false
+
+
+func _ready() -> void:
+\tif not Engine.is_editor_hint():
+\t\tqueue_free()
+\t\treturn
+\t_deadline = Time.get_ticks_msec() + DEADLINE_MSEC
+\tset_process(true)
+
+
+func _process(_delta: float) -> void:
+\tif Time.get_ticks_msec() >= _deadline:
+\t\tpush_error("V3_FALLBACK_TEST | restore timed out")
+\t\tget_tree().quit(41)
+\t\treturn
+\tif not _clicked:
+\t\tvar old_plugin := DriverSupport.find_godot_ai_plugin()
+\t\tif old_plugin == null:
+\t\t\treturn
+\t\tvar dock: Variant = old_plugin.get("_dock")
+\t\tif dock == null or not dock.has_method("_on_update_pressed"):
+\t\t\treturn
+\t\tdock.call("_on_update_pressed")
+\t\t_clicked = true
+\t\treturn
+\tif FileAccess.file_exists("res://addons/godot_ai/migration_bridge.gd"):
+\t\treturn
+\tvar config := ConfigFile.new()
+\tif config.load("res://addons/godot_ai/plugin.cfg") != OK:
+\t\treturn
+\tif str(config.get_value("plugin", "version", "")) != "{smoke.FINAL_V3_REF.lstrip("v")}":
+\t\treturn
+\tif DriverSupport.find_godot_ai_plugin() == null:
+\t\treturn
+\tprint("V3_FALLBACK_TEST | final v3 restored and enabled")
+\tget_tree().quit(0)
+''',
+        encoding="utf-8",
+    )
+    environment = smoke.godot_child_environment(project)
+    # The restored final v3 is pristine: keep its server launch off the network.
+    shim_root = project / ".floor-smoke"
+    shim_root.mkdir()
+    fake_bin = _write_fake_uvx_shim(shim_root, smoke.smoke_python()).parent
+    environment["PATH"] = str(fake_bin) + os.pathsep + os.environ.get("PATH", "")
+    environment["GODOT_AI_TEST_GODOT_FLOOR"] = "unmet"
+
+    log = run_godot_editor(
+        project, godot_bin, allow_headless=True, timeout=240, environment=environment
+    )
+
+    _assert_ordered(
+        log,
+        (
+            "V3_BRIDGE_TEST | clicked final-v3 Update button",
+            "MCP | update runner disabling old plugin",
+            "Godot AI v4 migration requires Godot 4.7 or newer; bridge remains inactive.",
+            "MCP | v3 bridge restored Godot AI v3.2.5; update again on Godot 4.7 or newer",
+            "V3_FALLBACK_TEST | final v3 restored and enabled",
         ),
-        "USERPROFILE": str(isolated_home),
-    }
-    if os.name == "nt":
-        local_app_data = isolated / "local-app-data"
-        local_app_data.mkdir()
-        environment["LOCALAPPDATA"] = str(local_app_data)
-        capability_dir = local_app_data / "godot-ai" / "capabilities"
-    else:
-        capability_dir = isolated / "capabilities"
-        environment[CAPABILITY_DIR_ENV] = str(capability_dir)
-    probe_resource = "res://_test_clean_major_authenticated_probe.txt"
-    probe_content = "clean-major authenticated write\n"
-    wedged = prewarm_mode == "wedged"
-    # Windows owns and terminates the entire cmd.exe process tree, so a
-    # timed-out prewarm may safely continue once that exact tree is proven
-    # dead. POSIX can kill only the captured launcher PID and must retain the
-    # migration barrier because possible descendants remain unproven.
-    requires_retry = wedged and os.name != "nt"
+    )
+    restored_at = log.index("MCP | v3 bridge restored Godot AI v3.2.5")
+    for pattern in (
+        "SCRIPT ERROR:",
+        "ERROR: Attempt to open script",
+        "ERROR: Failed to load script",
+        "Could not resolve script",
+    ):
+        assert pattern not in log[restored_at:], log[restored_at:]
+    assert read_plugin_version(live / "plugin.cfg") == "3.2.5"
+    assert (live / "update_reload_runner.gd").is_file(), "final v3 keeps its own updater"
+    for capsule_only in (
+        "migration_bridge.gd",
+        "migration_coordinator.gd",
+        "migration_fallback.gd",
+        "migration_payload",
+        "utils/update_installer.gd",
+        "utils/release_verifier.gd",
+    ):
+        assert not (live / capsule_only).exists(), capsule_only
+    assert not (project / UPDATE_STATE_RELATIVE).exists(), "nothing was staged or swapped"
+
+
+def test_refused_swap_restores_the_old_runtime(tmp_path: Path) -> None:
+    """A swap refused after quiescence leaves the old version live and serving.
+
+    Quiescence stops the server and clears the dispatcher before the swap; a
+    refusal (here: a backup directory for the base version already exists)
+    must rebuild the plugin from the unchanged tree, not leave a dead runtime
+    behind a "previous version kept" label.
+    """
+    godot_bin = godot_bin_or_skip()
+    smoke = load_smoke_script()
+    project = tmp_path / "refused-swap"
+    http_port, ws_port = allocate_free_ports(2)
+    base_version = read_plugin_version(PLUGIN_ROOT / "plugin.cfg")
+    next_version = smoke.bump_patch_version(base_version)
+    prepare_signed_update_project(
+        project,
+        base_version=base_version,
+        next_version=next_version,
+        base_server_version=base_version,
+        next_server_version=next_version,
+        http_port=http_port,
+        ws_port=ws_port,
+    )
+    write_refused_swap_driver(project, http_port=http_port, base_version=base_version)
+    live = project / "addons" / "godot_ai"
+    environment, capability_dir = _isolated_environment(project / ".self-update-integration")
+    state = project / UPDATE_STATE_RELATIVE
+    (state / "backup" / base_version).mkdir(parents=True)
+    (state / ".gdignore").write_text("", encoding="utf-8")
+    (state / ".gitignore").write_text("*\n", encoding="utf-8")
+    live_before = _tree_bytes(live)
+
     log = run_godot_editor(
         project,
         godot_bin,
         allow_headless=True,
         timeout=240,
         environment=environment,
-        live_probe=(
-            None
-            if requires_retry
-            else lambda: _authenticated_tool_probe(
-                http_port,
-                capability_dir,
-                resource_path=probe_resource,
-                content=probe_content,
-            )
+        live_probe=lambda: _authenticated_tool_probe(
+            http_port,
+            capability_dir,
+            resource_path="res://_test_refused_swap_probe.txt",
+            content="served by the old version after a refused swap\n",
         ),
-        probe_ready_file=CLEAN_MAJOR_STATUS_FILE,
-        probe_done_file=CLEAN_MAJOR_TOOL_PROBE_FILE,
-        expected_exit_code=23 if requires_retry else 0,
+        probe_ready_file=REFUSED_SWAP_STATUS_FILE,
+        probe_done_file=REFUSED_SWAP_TOOL_PROBE_FILE,
     )
 
-    client_config = (codex_home / "config.toml").read_text(encoding="utf-8")
-    prewarm_records = [
-        json.loads(line) for line in prewarm_log.read_text(encoding="utf-8").splitlines()
-    ]
-    assert prewarm_records[-1] == {
-        "argv": [
-            *PRODUCTION_UVX_RESOLUTION_ARGS,
-            "--from",
-            f"godot-ai=={target_version}",
-            "godot-ai",
-            "--version",
-        ],
-        "kind": "startup_prewarm",
-        "mode": prewarm_mode,
-    }
-    assert len(prewarm_records) == 2
-    if wedged:
-        assert "CLEAN_MAJOR_TEST | editor remained responsive during wedged prewarm" in log
-    if requires_retry:
-        assert "Post-update package pre-warm could not be proven stopped" in log
-        assert "CLEAN_MAJOR_TEST | client migration requested retry" in log
-        assert "MCP | client migration durably completed" not in log
-        assert "MCP | started server (PID " not in log
-        assert marker.is_file()
-        assert not (project / CLEAN_MAJOR_STATUS_FILE).exists()
-        assert not (project / probe_resource.removeprefix("res://")).exists()
-        assert f"godot-ai=={from_version}" in client_config
-        assert f"godot-ai=={target_version}" not in client_config
-        return
+    assert_no_update_parse_errors(log)
+    _assert_ordered(
+        log,
+        (
+            "REFUSED_SWAP_TEST | clicked Update with a backup collision in place",
+            "MCP | plugin unloaded",
+            "MCP | plugin loaded",
+            "MCP | Update swap failed: swap: backup already exists",
+            "REFUSED_SWAP_TEST | old runtime serves again after the refused swap",
+            "REFUSED_SWAP_TEST | authenticated tool probe completed after the refused swap",
+        ),
+    )
+    assert "restarting the editor" not in log
+    assert _tree_bytes(live) == live_before, "the live tree must be untouched"
+    assert not (state / "stage").exists()
+    assert not (state / "lock.json").exists()
+    pending = state / "pending.json"
+    assert (
+        not pending.exists()
+        or json.loads(pending.read_text(encoding="utf-8")).get("status") != "swapped"
+    )
+    assert (project / "_test_refused_swap_probe.txt").read_text(encoding="utf-8") == (
+        "served by the old version after a refused swap\n"
+    )
 
-    assert not marker.exists()
-    assert (project / probe_resource.removeprefix("res://")).read_text(
-        encoding="utf-8"
-    ) == probe_content
-    assert f"godot-ai=={target_version}" in client_config
-    assert f"godot-ai=={from_version}" not in client_config
-    ordered_markers = [
-        "CLEAN_MAJOR_TEST | migration marker removed automatically",
-        f"CLEAN_MAJOR_TEST | repinned owned Codex command pin={target_version}",
-        "MCP | client migration durably completed",
-        "MCP | plugin loaded",
-        "MCP | started server (PID ",
-        f"CLEAN_MAJOR_TEST | status name=godot-ai server_version={target_version}",
-        "CLEAN_MAJOR_TEST | authenticated read/write tool probe completed",
-    ]
-    position = -1
-    for expected in ordered_markers:
-        next_position = log.find(expected, position + 1)
-        assert next_position > position, f"missing/out-of-order marker {expected!r}:\n{log}"
-        position = next_position
-    status = json.loads((project / CLEAN_MAJOR_STATUS_FILE).read_text(encoding="utf-8"))
-    assert status.get("name") == "godot-ai"
-    assert status.get("server_version") == target_version
+
+def test_tampered_tree_after_swap_is_rolled_back_and_restarted(tmp_path: Path) -> None:
+    """A swap whose live tree does not hash as expected restores the backup."""
+    godot_bin = godot_bin_or_skip()
+    smoke = load_smoke_script()
+    project = tmp_path / "rolled-back-update"
+    http_port, ws_port = allocate_free_ports(2)
+    base_version = read_plugin_version(PLUGIN_ROOT / "plugin.cfg")
+    next_version = smoke.bump_patch_version(base_version)
+    prepare_signed_update_project(
+        project,
+        base_version=base_version,
+        next_version=next_version,
+        base_server_version=base_version,
+        next_server_version=next_version,
+        http_port=http_port,
+        ws_port=ws_port,
+    )
+    write_post_restart_driver(project, http_port=http_port, expected_version=base_version)
+    live = project / "addons" / "godot_ai"
+    patch_restart_diagnostics(live, project / RESTARTED_EDITOR_LOG)
+    environment, capability_dir = _isolated_environment(project / ".self-update-integration")
+
+    # Simulate the instant after step 7 of docs/self-update.md: the previous
+    # tree is retained as the backup and the marker says a swap happened, but
+    # the tree now live does not hash to what the manifest promised.
+    state = project / UPDATE_STATE_RELATIVE
+    backup = state / "backup" / base_version
+    shutil.copytree(live, backup)
+    (state / ".gdignore").write_text("", encoding="utf-8")
+    (state / ".gitignore").write_text("*\n", encoding="utf-8")
+    (live / "plugin.gd").write_text(
+        (live / "plugin.gd").read_text(encoding="utf-8") + "\n# tampered after the swap\n",
+        encoding="utf-8",
+    )
+    marker = {
+        "status": "swapped",
+        "from_version": base_version,
+        "to_version": next_version,
+        "manifest_sha256": hashlib.sha256(b"fixture manifest").hexdigest(),
+        "expected_tree_sha256": hashlib.sha256(b"not the tree that is live").hexdigest(),
+        "editor_nonce": secrets.token_hex(16),
+        "replace_owned_mismatches": False,
+        "backup_root": f"res://addons/.godot_ai_update/backup/{base_version}",
+        "live_root": "res://addons/godot_ai",
+        "swapped_unix": 0,
+    }
+    (state / "pending.json").write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
+
+    log = run_godot_editor(
+        project,
+        godot_bin,
+        allow_headless=True,
+        timeout=240,
+        environment=environment,
+        live_probe=lambda: _authenticated_tool_probe(
+            http_port,
+            capability_dir,
+            resource_path="res://_test_rollback_probe.txt",
+            content="rolled back authenticated write\n",
+        ),
+        restart_completion_file=POST_UPDATE_COMPLETE_FILE,
+    )
+
+    initial_editor, restarted_editor = read_editor_receipts(project)
+    assert initial_editor["pid"] != restarted_editor["pid"], (initial_editor, restarted_editor)
+    _assert_ordered(
+        log,
+        (
+            f"MCP | update to {next_version} failed and the previous version was restored",
+            # The restarted editor runs the restored tree and reports the outcome.
+            f"MCP | update to {next_version} failed; the previous version is live",
+            "MCP | plugin loaded",
+            f"POST_RESTART_TEST | live server ready at version {base_version}",
+            "POST_RESTART_TEST | authenticated tool probe completed",
+        ),
+    )
+    assert read_plugin_version(live / "plugin.cfg") == base_version
+    assert "# tampered after the swap" not in (live / "plugin.gd").read_text(encoding="utf-8")
+    quarantine = state / "quarantine" / next_version
+    assert "# tampered after the swap" in (quarantine / "plugin.gd").read_text(encoding="utf-8")
+    assert not backup.exists()
+    assert not (state / "pending.json").exists()
+    assert not (state / "lock.json").exists()
+    payload = json.loads((project / POST_UPDATE_STATUS_FILE).read_text(encoding="utf-8"))
+    assert payload.get("server_version") == base_version
+    assert (project / "_test_rollback_probe.txt").read_text(encoding="utf-8") == (
+        "rolled back authenticated write\n"
+    )

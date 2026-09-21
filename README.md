@@ -114,9 +114,9 @@ MCP client
 ```
 
 Both local hops use independent rotating capabilities; neither falls back to
-unauthenticated access. The editor WebSocket stays loopback-only. For remote
-access, prefer an SSH-launched attach command on the server host rather than
-storing a capability in client configuration.
+unauthenticated access. The editor WebSocket stays loopback-only. An agent in
+a container or on another machine runs the bridge on the editor machine over
+SSH; see [Agents on another machine or in a container](docs/client-configuration.md#agents-on-another-machine-or-in-a-container).
 
 These controls do not protect against a compromised same-user process. Windows
 also does not claim isolation from other local accounts. See the
@@ -135,10 +135,47 @@ Opt-out creates no telemetry UUID, worker, or files.
 
 ## Documentation and help
 
+<details>
+<summary>Bazzite / Fedora Atomic troubleshooting</summary>
+
+On Bazzite and other Fedora Atomic desktops, `/home` is normally a symbolic
+link to `/var/home` (the ostree layout). Godot AI 4.0.2 and earlier refuse
+every capability-directory path that passes through a link, so on such a
+system the server exits with `Last pending: capability_record`
+([#993](https://github.com/hi-godot/godot-ai/issues/993)). In Godot AI 4.0.3 and later,
+the server follows a link when it is root-owned and sits in a root-owned directory that
+other accounts cannot write, which is exactly that layout; no configuration is
+needed there.
+
+On 4.0.2 or earlier, close Godot and your MCP client, then run this in a
+terminal as your normal user:
+
+```bash
+export GODOT_AI_CAPABILITY_DIR="$(
+  realpath -m "${XDG_CONFIG_HOME:-$HOME/.config}/godot-ai/capabilities"
+)"
+install -d -m 700 "$GODOT_AI_CAPABILITY_DIR"
+printf 'Using: %s\n' "$GODOT_AI_CAPABILITY_DIR"
+```
+
+Launch **both Godot and your MCP client from that terminal** so the backend and
+`godot-ai attach` inherit the same directory. A desktop launcher does not
+automatically inherit a terminal's `export`; for persistent use, set the same
+canonical path in the launch environment of both applications. Keep the
+directory private to your user; do not copy capability tokens into client
+configuration. This workaround is for Linux; `GODOT_AI_CAPABILITY_DIR` is not
+supported on Windows.
+
+</details>
+
+### Reference and support
+
 - [Tools, operations, and resources](docs/TOOLS.md)
+- [Community addons and custom tools](docs/community-addons.md)
 - [Write and run tests for your game](docs/testing.md)
 - [Client configuration details](docs/client-configuration.md)
 - [Upgrading from v3 and recovering interrupted migrations](docs/v4-migration.md)
+- [Changelog](CHANGELOG.md)
 - [Contributing and development setup](docs/CONTRIBUTING.md)
 - [Discord](https://discord.gg/FDZ5fr2QkP) for questions and showcases;
   [GitHub Issues](https://github.com/hi-godot/godot-ai/issues) for bug reports

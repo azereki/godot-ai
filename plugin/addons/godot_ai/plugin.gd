@@ -9,20 +9,11 @@ const GAME_HELPER_AUTOLOAD_PATH := "res://addons/godot_ai/runtime/game_helper.gd
 ## `logs_read(source="editor")`.
 const EditorLogger := preload("res://addons/godot_ai/runtime/editor_logger.gd")
 
-const UpdateCoordinator := preload("res://addons/godot_ai/utils/update_coordinator.gd")
-const UPDATE_TRANSACTION_ENV := "GODOT_AI_UPDATE_TRANSACTION"
-const UPDATE_EDITOR_NONCE_ENV := "GODOT_AI_UPDATE_EDITOR_NONCE"
-const UPDATE_ACTOR_HANDOFF_ENV := "GODOT_AI_UPDATE_ACTOR_HANDOFF"
-## Cross-v4 hot-reload contract: the old actor owns all durable records; the
-## swapped GDScript understands only this bounded command/outcome envelope.
-const UPDATE_ACTOR_HANDOFF_SCHEMA := 1
-const UPDATE_ACTOR_PROTOCOL_VERSION := 1
-const UPDATE_ACTOR_COLD_START_TIMEOUT_MS := 120000
-const UPDATE_ACTOR_HANDOFF_TIMEOUT_MS := 45000
-const UPDATE_ACTOR_COMMAND_TIMEOUT_MS := 60000
-const UPDATE_ACTOR_RELEASE_TIMEOUT_MS := 5000
-const UPDATE_ACTOR_ERROR_PREFIX := "update transaction refused: "
-const MAX_UPDATE_ACTOR_ERROR_BYTES := 1024
+const PluginReload := preload("res://addons/godot_ai/utils/plugin_reload.gd")
+const ReleaseVerifier := preload("res://addons/godot_ai/utils/release_verifier.gd")
+const UpdateInstaller := preload("res://addons/godot_ai/utils/update_installer.gd")
+const LIVE_ADDON_ROOT := "res://addons/godot_ai"
+const PLUGIN_CFG := "res://addons/godot_ai/plugin.cfg"
 const MIN_GODOT_MAJOR := 4
 const MIN_GODOT_MINOR := 7
 const UNSUPPORTED_GODOT_MESSAGE := \
@@ -39,7 +30,7 @@ const TransportCapability := preload("res://addons/godot_ai/utils/transport_capa
 ## Plugin-class scripts used by this file. The script-local preload aliases
 ## are ordinary dependency shorthand and keep construction sites compact.
 ## They are not the self-update safety boundary. Whole-tree namespace swaps
-## happen in an external Python actor while an old, detached coordinator owns
+## happen inside the editor; the live tree is renamed, never overlaid, and the
 ## only disable/scan/enable; no script mutates the tree that contains itself.
 const Connection := preload("res://addons/godot_ai/connection.gd")
 const Dispatcher := preload("res://addons/godot_ai/dispatcher.gd")
@@ -104,7 +95,7 @@ const STARTUP_TRACE_COUNTER_NAMES := [
 ##       this entry script's load surface explicit and reviewable.
 ##
 ## Constructors, constants, and static methods on `Mcp*` classes are not the
-## self-update safety metric. The transaction actor publishes one exact tree
+## self-update safety metric. The installer swaps one exact, re-hashed tree
 ## before the resource scan, so the root never observes an extracted-over-live
 ## mixture. In short: preload aliases are not the self-update safety metric.
 ##
@@ -124,26 +115,45 @@ var _custom_tool_registry
 var _custom_tool_service_locator
 ## Plugin-lifetime owners. The Dock only emits intents and receives copied
 ## snapshots/outcomes, so replacing the view cannot abandon a live Thread or
-## an update transaction.
+## a self-update.
 var _client_jobs
 var _update_manager
 ## Process identity continuity and the immutable terminal outcome cross only
 ## as values. The coordinator retains neither this plugin nor its objects.
-static var _update_editor_nonce := ""
 var _post_update_outcome: Dictionary = {}
-var _post_update_actor_command = []
-var _post_update_actor_version := ""
+## The version an update just replaced. An AI client attached through the
+## update may spawn a backend of that version into the restart window; the
+## restarted editor replaces it once instead of asking the user to.
+var _post_update_replaced_version := ""
+## Clients the post-update migration left unchanged (`{id, reason}`), named
+## in the dock's completion banner so the user knows to click Configure.
+## Untyped on purpose: a typed collection field is the hot-reload crash
+## class (#245) the self-update smoke injects to prove the swap survives it.
+var _post_update_deferred := []
+var _last_logged_block := ""
+## Bounded re-probes while that backend is still binding its port: a port
+## that is bound but not yet answering status reads as merely occupied.
+const POST_UPDATE_REPROBE_LIMIT := 10
+var _post_update_reprobes_left := POST_UPDATE_REPROBE_LIMIT
+var _post_update_retry_episode := 0
+## A pre-v4 server left on the port by a still-running v3 attach bridge
+## outlives the fast budget above: its lease lasts 30 s after that client
+## quits and its idle backstop another 120 s. Poll slowly across that
+## window so the editor comes up green once the user has relaunched the
+## client, without any replacement authority over a server we cannot
+## authenticate.
+const POST_UPDATE_STALE_REPROBE_SECONDS := 10.0
+const POST_UPDATE_STALE_REPROBE_LIMIT := 21
+var _post_update_stale_reprobes_left := POST_UPDATE_STALE_REPROBE_LIMIT
+## An old bridge spawns again as soon as the port frees, so one replacement
+## may not be the last; a few are allowed before the dock takes over.
+const POST_UPDATE_REPLACEMENT_LIMIT := 3
+var _post_update_replacements_left := POST_UPDATE_REPLACEMENT_LIMIT
+## Set once the live tree has been renamed; the lock then belongs to the restart.
+var _update_swapped := false
 var _post_update_action := ""
 var _normal_start_released := false
 var _update_barrier_blocked := false
-## One actor worker is sufficient: startup finishes before composition can
-## reach migration completion, so two thread owners would encode impossible
-## concurrency and double the teardown surface.
-var _update_actor_thread
-var _update_actor_job := ""
-var _update_startup_cancel_mutex := Mutex.new()
-var _update_startup_cancelled := false
-var _update_actor_termination_unproven := false
 ## Serialized lifecycle episode owner. Construction is inert; `_enter_tree`
 ## supplies a copied plan and starts it only after composition completes.
 var _lifecycle
@@ -171,45 +181,69 @@ func _init() -> void:
 
 func _enter_tree() -> void:
 	if _unsupported_engine:
-		push_error(UNSUPPORTED_GODOT_MESSAGE)
+		push_error(UNSUPPORTED_GODOT_MESSAGE + _pending_swap_hint())
 		return
 	_startup_trace_begin()
-	## Startup actor discovery runs off-main, where env_lookup intentionally
-	## refuses live getenv access. Publish only its fixed HOME/PATH-adjacent
-	## inputs now; full descriptor/settings warming still belongs at activation.
-	ClientConfigurator.warm_update_actor_discovery_env()
 
 	## Keep main-thread result polling off until the vision worker owner exists.
 	## Unsupported/headless/barrier-blocked startup therefore has no process
 	## callback and constructs no worker-capable object.
 	set_process(false)
 
-	## No plugin-owned object, server, or worker is constructed until the
-	## external transaction record says this exact tree may start. This also
-	## leases headless export/import processes: they execute plugin code and may
-	## not straddle a same-install tree swap merely because no server will start.
 	_loaded_plugin_version = get_plugin_version()
-	## Dev checkouts never offer self-update and commonly mount the add-on by a
-	## symlink the transaction actor deliberately rejects. Installed trees must
-	## acquire the lease even when this headless launch will return below.
+	## An installed tree that was just swapped in by the updater (or by the
+	## v3 migration capsule) proves itself before anything else is built: the
+	## live tree must hash to exactly what the signed manifest promised. A
+	## mismatch restores the retained backup; a missing backup keeps the plugin
+	## inactive with the exact paths. Dev checkouts never self-update.
 	if not ClientConfigurator.is_dev_checkout():
-		_ensure_update_editor_nonce()
-		## Export/import processes have no interactive main thread to protect and
-		## must register the export filter before continuing, so they run the same
-		## bounded command synchronously. An interactive editor returns from
-		## _enter_tree immediately and waits on a worker: a cold/offline uvx resolve
-		## can delay plugin composition, but can never freeze Godot's UI forever.
-		if _mcp_disabled_for_headless_launch():
-			if not _run_update_startup_barrier():
-				_block_update_startup()
+		var was_swapped := str(UpdateInstaller.read_pending().get("status", "")) == "swapped"
+		var outcome: Dictionary = UpdateInstaller.verify_after_restart(LIVE_ADDON_ROOT)
+		if was_swapped and not outcome.is_empty():
+			_warn_if_verified_elsewhere(outcome)
+		if not outcome.is_empty():
+			_post_update_outcome = outcome.duplicate(true)
+			_post_update_outcome["outcome"] = str(outcome.get("status", ""))
+			var status := str(outcome.get("status", ""))
+			if status == "repair_required":
+				_block_update_startup(str(outcome.get("error", "")))
 				return
-		elif not _start_update_startup_barrier():
-			_block_update_startup()
-			return
-		else:
-			return
+			if status == "rolled_back" and was_swapped:
+				## The backup was just restored on disk while this process still
+				## runs the rejected tree. Restart into the restored tree; the next
+				## start presents the failure from the marker.
+				push_error("MCP | update to %s failed and the previous version was restored: %s" % [
+					str(outcome.get("to_version", "")), str(outcome.get("error", ""))
+				])
+				UpdateInstaller.persist_next_start_enabled(PLUGIN_CFG)
+				UpdateInstaller.request_restart.call_deferred()
+				return
 
 	_continue_enter_tree_after_update_barrier()
+
+
+## An update swapped in under one Godot and restarted into another (seen on
+## macOS, where the relaunch goes through LaunchServices by bundle). Say which
+## editor is waiting to verify it instead of refusing blindly.
+static func _pending_swap_hint() -> String:
+	var pending := UpdateInstaller.read_pending()
+	if str(pending.get("status", "")) != "swapped":
+		return ""
+	return (
+		" An update to %s was swapped in under Godot %s and is waiting to be verified;"
+		+ " reopen the project in that Godot."
+	) % [str(pending.get("to_version", "")), str(pending.get("godot_version", "unknown"))]
+
+
+static func _warn_if_verified_elsewhere(outcome: Dictionary) -> void:
+	var swapped_in := str(outcome.get("godot_version", ""))
+	var running := str(Engine.get_version_info().get("string", ""))
+	if swapped_in.is_empty() or swapped_in == running:
+		return
+	push_warning(
+		"MCP | update to %s was swapped in under Godot %s; this editor is Godot %s"
+		% [str(outcome.get("to_version", "")), swapped_in, running]
+	)
 
 
 func _continue_enter_tree_after_update_barrier() -> void:
@@ -241,9 +275,6 @@ func _continue_enter_tree_after_update_barrier() -> void:
 	## is an activation effect on Windows (`netsh`), so it runs only after every
 	## owner and the Dock have been constructed and wired below.
 	_endpoint_policy = ClientConfigurator.capture_endpoint_policy()
-	_endpoint_policy["capability_path"] = TransportCapability.path_for_http_port(
-		int(_endpoint_policy.http_port)
-	)
 	_resolved_ws_port = int(_endpoint_policy.ws_port)
 
 	## Construct plugin-lifetime work owners before attaching the replaceable
@@ -334,10 +365,14 @@ func _continue_enter_tree_after_update_barrier() -> void:
 	_dispatcher.register_lazy_handler("theme", HANDLERS_DIR + "theme_handler.gd", [undo, _connection])
 	_dispatcher.register_lazy_handler("animation", HANDLERS_DIR + "animation_handler.gd", [undo])
 	_dispatcher.register_lazy_handler("material", HANDLERS_DIR + "material_handler.gd", [undo, _connection])
+	_dispatcher.register_lazy_handler("shader", HANDLERS_DIR + "shader_handler.gd", [])
+	_dispatcher.register_lazy_handler("visual_shader", HANDLERS_DIR + "visual_shader_handler.gd", [])
 	_dispatcher.register_lazy_handler("particle", HANDLERS_DIR + "particle_handler.gd", [undo])
 	_dispatcher.register_lazy_handler("camera", HANDLERS_DIR + "camera_handler.gd", [undo])
 	_dispatcher.register_lazy_handler("audio", HANDLERS_DIR + "audio_handler.gd", [undo])
-	_dispatcher.register_lazy_handler("physics_shape", HANDLERS_DIR + "physics_shape_handler.gd", [undo])
+	_dispatcher.register_lazy_handler(
+		"physics_shape", HANDLERS_DIR + "physics_shape_handler.gd", [undo, _connection]
+	)
 	_dispatcher.register_lazy_handler("environment", HANDLERS_DIR + "environment_handler.gd", [undo, _connection])
 	_dispatcher.register_lazy_handler("texture", HANDLERS_DIR + "texture_handler.gd", [undo, _connection])
 	_dispatcher.register_lazy_handler("curve", HANDLERS_DIR + "curve_handler.gd", [undo, _connection])
@@ -377,6 +412,7 @@ func _continue_enter_tree_after_update_barrier() -> void:
 	_dispatcher.register_lazy("quit_editor", "editor", &"quit_editor")
 	_dispatcher.register_lazy("game_eval", "editor", &"game_eval")
 	_dispatcher.register_lazy("game_command", "editor", &"game_command")
+	_dispatcher.register_lazy("game_debug_control", "editor", &"game_debug_control")
 	_dispatcher.register_lazy("get_project_setting", "project", &"get_project_setting")
 	_dispatcher.register_lazy("set_project_setting", "project", &"set_project_setting")
 	_dispatcher.register_lazy("set_main_scene", "project", &"set_main_scene")
@@ -446,6 +482,10 @@ func _continue_enter_tree_after_update_barrier() -> void:
 	_dispatcher.register_lazy("animation_preset_shake", "animation", &"preset_shake")
 	_dispatcher.register_lazy("animation_preset_pulse", "animation", &"preset_pulse")
 	_dispatcher.register_lazy("material_create", "material", &"create_material")
+	_dispatcher.register_lazy("visual_shader_create_graph", "visual_shader", &"create_graph")
+	_dispatcher.register_lazy("visual_shader_get", "visual_shader", &"get_graph")
+	_dispatcher.register_lazy("visual_shader_node_catalog", "visual_shader", &"node_catalog")
+	_dispatcher.register_lazy("visual_shader_edit", "visual_shader", &"edit_graph")
 	_dispatcher.register_lazy("material_set_param", "material", &"set_param")
 	_dispatcher.register_lazy("material_set_shader_param", "material", &"set_shader_param")
 	_dispatcher.register_lazy("material_get", "material", &"get_material")
@@ -453,6 +493,10 @@ func _continue_enter_tree_after_update_barrier() -> void:
 	_dispatcher.register_lazy("material_assign", "material", &"assign_material")
 	_dispatcher.register_lazy("material_apply_to_node", "material", &"apply_to_node")
 	_dispatcher.register_lazy("material_apply_preset", "material", &"apply_preset")
+	_dispatcher.register_lazy("shader_create", "shader", &"create_shader")
+	_dispatcher.register_lazy("shader_get", "shader", &"get_shader")
+	_dispatcher.register_lazy("shader_validate", "shader", &"validate_shader")
+	_dispatcher.register_lazy("shader_patch", "shader", &"patch_shader")
 	_dispatcher.register_lazy("particle_create", "particle", &"create_particle")
 	_dispatcher.register_lazy("particle_set_main", "particle", &"set_main")
 	_dispatcher.register_lazy("particle_set_process", "particle", &"set_process")
@@ -475,6 +519,7 @@ func _continue_enter_tree_after_update_barrier() -> void:
 	_dispatcher.register_lazy("audio_stop", "audio", &"stop")
 	_dispatcher.register_lazy("audio_list", "audio", &"list_streams")
 	_dispatcher.register_lazy("physics_shape_autofit", "physics_shape", &"autofit")
+	_dispatcher.register_lazy("physics_shape_generate", "physics_shape", &"generate")
 	_dispatcher.register_lazy("environment_create", "environment", &"create_environment")
 	_dispatcher.register_lazy("gradient_texture_create", "texture", &"create_gradient_texture")
 	_dispatcher.register_lazy("noise_texture_create", "texture", &"create_noise_texture")
@@ -513,6 +558,7 @@ func _continue_enter_tree_after_update_barrier() -> void:
 	_dock.name = "Godot AI"
 	_dock.update_requested.connect(_on_dock_update_requested)
 	_dock.client_action_requested.connect(_on_dock_client_action_requested)
+	_dock.client_action_cancel_requested.connect(_on_dock_client_action_cancel_requested)
 	_dock.client_status_refresh_requested.connect(_on_dock_client_status_refresh_requested)
 	_dock.status_snapshot_requested.connect(_on_dock_status_snapshot_requested)
 	_dock.live_server_probe_requested.connect(_on_dock_live_server_probe_requested)
@@ -530,13 +576,70 @@ func _continue_enter_tree_after_update_barrier() -> void:
 	_startup_trace_phase("dock_attached")
 	## Activation barrier: no process, socket, or probe effect begins until all
 	## owners and the replaceable Dock have been constructed and wired.
-	var resolved_policy := _endpoint_policy.duplicate(true)
-	resolved_policy["ws_port"] = _resolve_ws_port(int(resolved_policy.ws_port))
+	_activate_startup_endpoints()
+
+
+## Endpoint selection is retryable before the immutable launch policy or any
+## client migration worker exists. An old bridge keeps its own ports.
+func _activate_startup_endpoints() -> void:
+	if str(_post_update_outcome.get("outcome", "")) == "success":
+		var prepared := ClientConfigurator.prepare_major_upgrade_endpoints(
+			str(_post_update_outcome.get("from_version", "")),
+			str(_post_update_outcome.get("to_version", "")),
+		)
+		if not bool(prepared.get("ok", false)):
+			_present_endpoint_setup_failure(str(prepared.get("error", "Endpoint selection failed.")))
+			return
+	var override := ClientConfigurator.v4_endpoint_ports_status()
+	if not bool(override.get("ok", false)):
+		_present_endpoint_setup_failure(str(override.get("error", "Invalid endpoint override.")))
+		return
+	var resolved_policy := ClientConfigurator.capture_endpoint_policy()
+	var http_port := int(resolved_policy.http_port)
+	var configured_ws := int(resolved_policy.ws_port)
+	if (
+		http_port < ClientConfigurator.MIN_PORT or http_port > ClientConfigurator.MAX_PORT
+		or configured_ws < ClientConfigurator.MIN_PORT or configured_ws > ClientConfigurator.MAX_PORT
+		or http_port == configured_ws
+	):
+		_present_endpoint_setup_failure("Choose distinct HTTP and WebSocket ports between %d and %d in Godot AI settings." % [ClientConfigurator.MIN_PORT, ClientConfigurator.MAX_PORT])
+		return
+	var resolved_ws := _resolve_ws_port(configured_ws)
+	if (
+		resolved_ws < ClientConfigurator.MIN_PORT or resolved_ws > ClientConfigurator.MAX_PORT
+		or resolved_ws == http_port
+		or (bool(override.present) and resolved_ws != configured_ws)
+	):
+		_present_endpoint_setup_failure("The configured WebSocket port is unavailable. Choose another endpoint pair in Godot AI settings, then retry.")
+		return
+	resolved_policy["ws_port"] = resolved_ws
+	resolved_policy["capability_path"] = TransportCapability.path_for_http_port(http_port)
 	_set_endpoint_policy(resolved_policy)
+	if _connection != null:
+		_connection.ws_port = resolved_ws
+	if _post_update_action == "retry_endpoints":
+		_post_update_action = ""
+		if _dock != null:
+			_dock.present_update_state({"post_update_action": "", "status_text": "", "label_text": "", "banner_visible": false})
 	## #691: publish every environment/setting value before the first worker.
 	ClientConfigurator.warm_env_snapshot(_endpoint_policy)
 	_lifecycle.configure(_capture_lifecycle_plan())
 	_begin_startup_release()
+
+
+func _present_endpoint_setup_failure(error: String) -> void:
+	_post_update_action = "retry_endpoints"
+	_lifecycle._block_without_effect("endpoint_setup_failed", error)
+	if _dock != null:
+		_dock.present_update_state({
+			"install_in_flight": false,
+			"button_text": "Retry endpoint setup",
+			"status_text": "Client endpoint setup failed",
+			"button_disabled": false,
+			"label_text": error,
+			"banner_visible": true,
+			"post_update_action": "retry_endpoints",
+		})
 
 
 func _client_health_is_blocked() -> bool:
@@ -549,6 +652,14 @@ func _on_dock_client_action_requested(client_id: String, action: String) -> void
 	if _client_jobs == null:
 		return
 	if not _client_jobs.request_action(client_id, action) and _dock != null:
+		_dock.present_client_work_snapshot(_client_jobs.snapshot())
+
+
+func _on_dock_client_action_cancel_requested(client_id: String) -> void:
+	if _client_jobs == null:
+		return
+	_client_jobs.cancel_pending_action(client_id)
+	if _dock != null:
 		_dock.present_client_work_snapshot(_client_jobs.snapshot())
 
 
@@ -625,6 +736,12 @@ func _lifecycle_snapshot_for_dock() -> Dictionary:
 		_normal_start_released and bool(snapshot.get("can_recover_incompatible", false))
 	)
 	snapshot["normal_start_released"] = _normal_start_released
+	if _post_update_retry_episode > 0 and int(snapshot.get("episode_id", 0)) == _post_update_retry_episode:
+		var episode: Dictionary = _lifecycle.episode_snapshot()
+		if str(episode.get("state", "")) == "BLOCKED" and str(episode.get("reason", "")) == "launch_gone" and str(episode.get("proof_pending_reason", "")) == "capability_pair":
+			## Only the presentation changes; transport remains blocked until proof.
+			snapshot["state"] = ServerStateScript.SPAWNING
+			snapshot["handoff_retry_pending"] = true
 	return snapshot
 
 
@@ -704,7 +821,12 @@ func _on_dock_log_snapshot_requested(after_sequence: int) -> void:
 
 func _on_dock_plugin_reload_requested(reason: String) -> void:
 	Telemetry.record_pending_plugin_reload(reason)
-	_reload_plugin_from_dock.call_deferred()
+	## The reload frees this plugin, so it must not run on one of this
+	## instance's own frames: defer the static call itself, never a method of
+	## this instance. A deferred method that reloads synchronously returns into
+	## a freed script and takes the editor down (SIGBUS/SIGABRT after
+	## "Bad address index").
+	PluginReload.reload_enabled_plugin.call_deferred()
 
 
 func _on_dock_settings_apply_requested(changes: Dictionary, reload: bool) -> void:
@@ -722,11 +844,6 @@ func _on_dock_settings_apply_requested(changes: Dictionary, reload: bool) -> voi
 		_on_dock_plugin_reload_requested("endpoint_settings")
 
 
-func _reload_plugin_from_dock() -> void:
-	EditorInterface.set_plugin_enabled("res://addons/godot_ai/plugin.cfg", false)
-	EditorInterface.set_plugin_enabled("res://addons/godot_ai/plugin.cfg", true)
-
-
 func _on_dock_update_requested() -> void:
 	if _update_manager != null and _update_manager.has_install_candidate():
 		_update_manager.start_install(_preflight_update())
@@ -740,6 +857,8 @@ func _on_update_check_completed(result: Dictionary) -> void:
 func _on_update_install_state_changed(state: Dictionary) -> void:
 	if not bool(state.get("install_in_flight", true)) and _client_jobs != null:
 		_client_jobs.resume_after_quiesce()
+	if not bool(state.get("install_in_flight", true)) and not _update_swapped:
+		UpdateInstaller.release_lock()
 	if _dock != null:
 		_dock.present_update_state(state)
 
@@ -752,6 +871,9 @@ func _on_update_activation_requested(package: Dictionary) -> void:
 ## resumes normally after recording its terminal outcome.
 func _begin_startup_release() -> void:
 	if str(_post_update_outcome.get("outcome", "")) != "success":
+		if not _post_update_outcome.is_empty():
+			_present_post_update_failure()
+			UpdateInstaller.clear_pending()
 		_fan_post_update_outcome()
 		_release_normal_startup()
 		return
@@ -770,7 +892,7 @@ func _begin_startup_release() -> void:
 	if _dock != null:
 		_dock.present_update_state({
 			"install_in_flight": true,
-			"button_text": "Migrating client configuration…",
+			"status_text": "Migrating client configuration…",
 			"button_disabled": true,
 			"label_text": "The server remains stopped until configured clients are repinned.",
 			"banner_visible": true,
@@ -784,12 +906,25 @@ func _on_post_update_repin_completed(result: Dictionary) -> void:
 	if not bool(result.get("ok", false)):
 		_present_post_update_barrier_failure(str(result.get("error", "Client migration failed.")))
 		return
+	for client_id in result.get("foreign_ids", []):
+		push_warning(
+			"MCP | the %s entry named godot-ai launches something else; it was left unchanged. Use Configure in the dock to replace it."
+			% str(client_id)
+		)
+	_post_update_deferred = []
+	for entry in result.get("deferred", []):
+		if entry is Dictionary:
+			_post_update_deferred.append((entry as Dictionary).duplicate(true))
+			push_warning(
+				"MCP | %s was not migrated automatically because %s; it was left unchanged. Use Configure in the dock."
+				% [str(entry.get("id", "")), str(entry.get("reason", ""))]
+			)
 	## A click cannot prove that an external client restarted. The enforceable
-	## boundary is the one we own: repin its configuration, durably acknowledge
-	## the exact activated tree, then start and authenticate that server. Clients
-	## reconnect to the stable endpoint; a stale client can still be restarted as
-	## remediation, but it must not hold a healthy installation behind ceremony.
-	_complete_post_update_startup()
+	## boundary is the one we own: repin its configuration, mark the update
+	## complete, then start and authenticate that server. A major upgrade can
+	## select independent ports; old clients must reload the migrated config,
+	## but cannot hold the new editor endpoint behind their existing leases.
+	_finish_post_update()
 
 
 func _present_post_update_barrier_failure(error: String) -> void:
@@ -799,6 +934,7 @@ func _present_post_update_barrier_failure(error: String) -> void:
 		_dock.present_update_state({
 			"install_in_flight": false,
 			"button_text": "Retry client migration",
+			"status_text": "Installed — client migration failed",
 			"button_disabled": false,
 			"label_text": "Server startup is blocked: %s" % error,
 			"banner_visible": true,
@@ -809,8 +945,54 @@ func _present_post_update_barrier_failure(error: String) -> void:
 func _on_dock_post_update_action_requested(action: String) -> void:
 	if action != _post_update_action:
 		return
-	if action == "retry":
+	if action == "retry_endpoints":
+		_activate_startup_endpoints()
+	elif action == "retry":
 		_begin_startup_release()
+
+
+func _finish_post_update() -> void:
+	print("MCP | client migration completed")
+	## The success marker stays as the durable record of the last update; the
+	## next swap overwrites it and preflight only refuses swapped/repair states.
+	## Recording the migration keeps later starts from repeating it.
+	var recorded := UpdateInstaller.record_clients_migrated()
+	if recorded != OK:
+		push_warning("MCP | could not record client migration in the update marker: %s" % error_string(recorded))
+	## In-editor updates retain old script graphs for undo. Keep their backing
+	## files until a fresh editor process can safely prune older generations.
+	if not get_tree().root.has_meta("godot_ai_retained_update_scripts"):
+		UpdateInstaller.prune_backups(str(_post_update_outcome.get("from_version", "")))
+	_post_update_replaced_version = str(_post_update_outcome.get("from_version", ""))
+	_post_update_reprobes_left = POST_UPDATE_REPROBE_LIMIT
+	_post_update_stale_reprobes_left = POST_UPDATE_STALE_REPROBE_LIMIT
+	_post_update_replacements_left = POST_UPDATE_REPLACEMENT_LIMIT
+	var to_version := str(_post_update_outcome.get("to_version", ""))
+	if McpServerVersionCheck.attached_bridges_follow(_post_update_replaced_version, to_version):
+		print("MCP | AI clients using v%s can reconnect to v%s; relaunch clients still using older versions" % [_post_update_replaced_version, to_version])
+	else:
+		print(
+			"MCP | Refresh the Godot AI MCP connection and reload its configuration once to use v%s; relaunch the AI app if it cannot reload the configuration"
+			% to_version
+		)
+	_present_post_update_complete()
+	_fan_post_update_outcome()
+	_release_normal_startup()
+
+
+func _present_post_update_failure() -> void:
+	var error := str(_post_update_outcome.get("error", ""))
+	var to_version := str(_post_update_outcome.get("to_version", ""))
+	push_error("MCP | update to %s failed; the previous version is live: %s" % [to_version, error])
+	if _dock != null:
+		_dock.present_update_state({
+			"install_in_flight": false,
+			"status_text": "Update failed — previous version restored",
+			"button_disabled": false,
+			"label_text": error,
+			"banner_visible": true,
+			"post_update_action": "",
+		})
 
 
 func _present_post_update_complete() -> void:
@@ -818,104 +1000,33 @@ func _present_post_update_complete() -> void:
 	if _dock != null:
 		_dock.present_update_state({
 			"install_in_flight": false,
-			"button_text": "Update complete",
+			"status_text": "Godot AI installed" if _post_update_deferred.is_empty() else "Installed — client setup needed",
 			"button_disabled": true,
-			"label_text": "",
-			"banner_visible": false,
+			"label_text": _post_update_complete_label(),
+			"banner_visible": true,
 			"post_update_action": "",
 			"outcome": "success",
 		})
 
 
-func _complete_post_update_startup() -> void:
-	if not _start_post_update_completion():
-		_present_post_update_barrier_failure(
-			"The transaction actor could not durably complete client migration."
-		)
-		return
-	return
-
-
-func _start_post_update_completion() -> bool:
-	if _update_actor_thread != null:
-		return false
-	var command: Array[String] = []
-	command.assign(_post_update_actor_command)
-	var transaction := str(_post_update_outcome.get("transaction", ""))
-	if command.is_empty() or transaction.is_empty():
-		return false
-	var manual := bool(_post_update_outcome.get("manual_migration", false))
-	var arguments: Array[String] = [
-		"complete-manual-migration" if manual else "complete-migration"
-	]
-	arguments.append_array(_transaction_identity_arguments())
-	if not manual:
-		var recovery_root := str(_post_update_outcome.get("recovery_root", ""))
-		if recovery_root.is_empty():
-			return false
-		arguments.append_array([
-			"--recovery-root", recovery_root,
-			"--transaction", transaction,
-		])
-	_set_update_startup_cancelled(false)
-	_update_actor_thread = Thread.new()
-	_update_actor_job = "migration_completion"
-	var error := int(_update_actor_thread.start(
-		Callable(self, "_run_post_update_completion_job").bind({
-			"arguments": arguments,
-			"command": command,
-			"expected_actor_version": _post_update_actor_version,
-			"transaction": transaction,
-		}, Callable(self, "_update_startup_cancel_requested"))
-	))
-	if error != OK:
-		_update_actor_thread = null
-		_update_actor_job = ""
-		return false
-	if _dock != null:
-		_dock.present_update_state({
-			"install_in_flight": true,
-			"button_text": "Recording completed migration…",
-			"button_disabled": true,
-			"label_text": "The server remains stopped until migration completion is durable.",
-			"banner_visible": true,
-			"post_update_action": "",
-		})
-	set_process(true)
-	return true
-
-
-static func _run_post_update_completion_job(
-	job: Dictionary,
-	cancel_check: Callable,
-) -> Dictionary:
-	var command: Array[String] = []
-	command.assign(job.get("command", []))
-	var arguments: Array[String] = []
-	arguments.assign(job.get("arguments", []))
-	var checked := _execute_update_command_value(
-		command,
-		arguments,
-		str(job.get("expected_actor_version", "")),
-		UPDATE_ACTOR_COMMAND_TIMEOUT_MS,
-		cancel_check,
+func _post_update_complete_label() -> String:
+	var to_version := str(_post_update_outcome.get("to_version", ""))
+	var from_version := str(_post_update_outcome.get("from_version", ""))
+	var text := (
+		"AI clients already using v%s can reconnect to v%s without restarting. Refresh older MCP connections and reload their configuration; relaunch the AI app if needed." % [from_version, to_version]
+		if McpServerVersionCheck.attached_bridges_follow(from_version, to_version)
+		else "Refresh the Godot AI MCP connection and reload its configuration once to use v%s. If the AI app cannot reload its configuration, quit and relaunch it."
+		% to_version
 	)
-	if not bool(checked.get("ok", false)):
-		return checked
-	if not _migration_completion_matches(
-		checked.get("data", {}), str(job.get("transaction", ""))
-	):
-		return {"ok": false, "error": "transaction actor returned an invalid migration completion"}
-	return {"ok": true}
-
-
-static func _migration_completion_matches(data: Variant, transaction: String) -> bool:
-	return (
-		data is Dictionary
-		and not transaction.is_empty()
-		and str(data.get("status", "")) == "migration_complete"
-		and str(data.get("transaction", "")) == transaction
-	)
+	if _post_update_deferred.is_empty():
+		return text
+	var named: Array[String] = []
+	for entry in _post_update_deferred:
+		var client_id := str(entry.get("id", ""))
+		var client := McpClientRegistry.get_by_id(client_id)
+		var name: String = client.display_name if client != null else client_id
+		named.append("%s (%s)" % [name, str(entry.get("reason", "not migrated"))])
+	return text + " Not migrated: %s. Use Configure to replace them." % ", ".join(named)
 
 
 ## Sole release point for ordinary work and the server lifecycle. Keeping
@@ -935,7 +1046,7 @@ func _release_normal_startup() -> void:
 		_telemetry.flush_pending_plugin_reload()
 
 
-## Fan one immutable terminal transaction value. It is held only in this
+## Fan one immutable terminal update outcome. It is held only in this
 ## instance's memory, never EditorSettings, and is cleared exactly once.
 func _fan_post_update_outcome() -> void:
 	if _post_update_outcome.is_empty():
@@ -949,452 +1060,32 @@ func _fan_post_update_outcome() -> void:
 			status = "failed_clean"
 		"repair_required", "quarantined":
 			status = "failed_mixed"
-	var error := "" if outcome == "success" else outcome.replace("_", " ")
+	var error := "" if outcome == "success" else str(_post_update_outcome.get("error", outcome.replace("_", " ")))
 	var from_version := str(_post_update_outcome.get("from_version", ""))
 	var to_version := str(_post_update_outcome.get("to_version", ""))
 	if _telemetry != null and not bool(_post_update_outcome.get("manual_migration", false)):
 		_telemetry.record_self_update(status, from_version, to_version, error)
 	_post_update_outcome.clear()
-	_post_update_actor_command.clear()
-	_post_update_actor_version = ""
 
 
-func _ensure_update_editor_nonce() -> void:
-	var inherited := OS.get_environment(UPDATE_EDITOR_NONCE_ENV)
-	if _valid_update_nonce(inherited):
-		_update_editor_nonce = inherited
-	elif not _valid_update_nonce(_update_editor_nonce):
-		_update_editor_nonce = Crypto.new().generate_random_bytes(16).hex_encode()
-
-
-static func _valid_update_nonce(value: String) -> bool:
-	if value.length() < 16 or value.length() > 128:
-		return false
-	for character in value:
-		if not "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-".contains(character):
-			return false
-	return true
-
-
-static func _update_roots() -> Dictionary:
-	return {
-		"project": ProjectSettings.globalize_path("res://").trim_suffix("/"),
-		"install": ProjectSettings.globalize_path("res://addons/godot_ai"),
-	}
-
-
-func _execute_update_command(
-	arguments: Array[String],
-	frozen_command: Array[String] = [],
-	expected_package_version: String = "",
-	timeout_ms: int = UPDATE_ACTOR_COMMAND_TIMEOUT_MS,
-) -> Dictionary:
-	if _update_actor_termination_unproven:
-		return {
-			"ok": false,
-			"error": "transaction actor termination is unproven; restart Godot before continuing",
-			"termination_unproven": true,
-		}
-	var command := (
-		frozen_command.duplicate()
-		if not frozen_command.is_empty()
-		else ClientConfigurator.get_update_transaction_command()
-	)
-	if command.is_empty():
-		return {"ok": false, "error": "transaction actor is unavailable"}
-	var expected := (
-		expected_package_version
-		if not expected_package_version.is_empty()
-		else ClientConfigurator.get_plugin_version()
-	)
-	var checked := _execute_update_command_value(
-		command,
-		arguments,
-		expected,
-		timeout_ms,
-		Callable(),
-	)
-	if bool(checked.get("termination_unproven", false)):
-		_update_actor_termination_unproven = true
-	return checked
-
-
-static func _execute_update_command_value(
-	command: Array[String],
-	arguments: Array[String],
-	expected_package_version: String,
-	timeout_ms: int,
-	cancel_check: Callable,
-) -> Dictionary:
-	if command.is_empty():
-		return {"ok": false, "error": "transaction actor is unavailable"}
-	var process_args: Array[String] = []
-	process_args.assign(command.slice(1))
-	process_args.append_array(arguments)
-	var executed := CliExec.run(
-		command[0],
-		process_args,
-		timeout_ms,
-		true,
-		cancel_check,
-		ClientConfigurator.update_actor_requires_uv_environment_isolation(command),
-	)
-	if bool(executed.get("termination_failed", false)):
-		return {
-			"ok": false,
-			"error": "transaction actor exceeded its deadline and could not be stopped safely",
-			"termination_unproven": true,
-		}
-	if bool(executed.get("timed_out", false)):
-		return {"ok": false, "error": "transaction actor timed out"}
-	if bool(executed.get("cancelled", false)):
-		return {"ok": false, "error": "transaction actor was cancelled"}
-	if bool(executed.get("spawn_failed", false)):
-		return {"ok": false, "error": "transaction actor could not be started"}
-	if int(executed.get("exit_code", -1)) != 0:
-		return {
-			"ok": false,
-			"error": _update_actor_refusal_message(str(executed.get("stderr", ""))),
-		}
-	var data: Variant = {}
-	var raw := str(executed.get("stdout", "")).strip_edges()
-	if not raw.is_empty():
-		data = JSON.parse_string(raw)
-		if not data is Dictionary:
-			return {"ok": false, "error": "transaction actor returned invalid JSON"}
-	if not _update_actor_identity_matches(data, expected_package_version):
-		return {"ok": false, "error": "transaction actor identity is incompatible"}
-	return {"ok": true, "data": data, "command": command.duplicate()}
-
-
-static func _update_actor_refusal_message(stderr_text: String) -> String:
-	## uvx/bootstrap diagnostics may echo credential-bearing index URLs. Reflect
-	## only the transaction actor's own stable error envelope, never arbitrary
-	## process output, and keep even that line bounded/control-free.
-	for raw_line in stderr_text.split("\n"):
-		var line := raw_line.strip_edges()
-		if (
-			not line.begins_with(UPDATE_ACTOR_ERROR_PREFIX)
-			or line.to_utf8_buffer().size() > MAX_UPDATE_ACTOR_ERROR_BYTES
-		):
-			continue
-		var safe := true
-		for index in line.length():
-			var code := line.unicode_at(index)
-			if code < 0x20 or code == 0x7f:
-				safe = false
-				break
-		if safe:
-			return line
-	return "transaction actor or exact-package resolver refused"
-
-
-static func _update_actor_identity_matches(data: Variant, expected_package: String) -> bool:
-	return (
-		data is Dictionary
-		and not expected_package.is_empty()
-		and int(data.get("protocol_version", 0)) == UPDATE_ACTOR_PROTOCOL_VERSION
-		and str(data.get("package_version", "")) == expected_package
-	)
-
-
-func _transaction_identity_arguments() -> Array[String]:
-	var roots := _update_roots()
-	return [
-		"--project", str(roots.project),
-		"--install", str(roots.install),
-		"--editor-pid", str(OS.get_process_id()),
-		"--editor-nonce", _update_editor_nonce,
-	]
-
-
-func _prepare_update_startup_barrier() -> Dictionary:
-	if not _loaded_update_version_matches(
-		_loaded_plugin_version, ClientConfigurator.get_plugin_version()
-	):
-		return {
-			"ok": false,
-			"error": "loaded plugin version differs from the current add-on tree",
-		}
-	var transaction := OS.get_environment(UPDATE_TRANSACTION_ENV)
-	var handoff := (
-		_parse_update_actor_handoff(
-			OS.get_environment(UPDATE_ACTOR_HANDOFF_ENV), transaction, _update_editor_nonce
-		)
-		if not transaction.is_empty()
-		else {}
-	)
-	var command: Array[String] = []
-	if not transaction.is_empty():
-		command.assign(handoff.get("command", []))
-	if not transaction.is_empty() and command.is_empty():
-		return {
-			"ok": false,
-			"error": "frozen transaction actor unavailable; refusing swapped-tree startup",
-		}
-	var arguments: Array[String] = ["startup"]
-	arguments.append_array(_transaction_identity_arguments())
-	if not transaction.is_empty():
-		arguments.append_array(["--transaction", transaction])
-	var expected_actor_version := str(
-		handoff.get("package_version", "")
-		if not transaction.is_empty()
-		else _loaded_plugin_version
-	)
-	return {
-		"ok": true,
-		"arguments": arguments,
-		"command": command,
-		"current_version": _loaded_plugin_version,
-		"discover_command": transaction.is_empty(),
-		"expected_actor_version": expected_actor_version,
-		"timeout_ms": (
-			UPDATE_ACTOR_HANDOFF_TIMEOUT_MS
-			if not transaction.is_empty()
-			else UPDATE_ACTOR_COLD_START_TIMEOUT_MS
-		),
-		"transaction": transaction,
-	}
-
-
-func _run_update_startup_barrier_job(
-	job: Dictionary,
-	cancel_check: Callable = Callable(),
-) -> Dictionary:
-	var command: Array[String] = []
-	command.assign(job.get("command", []))
-	if command.is_empty() and bool(job.get("discover_command", false)):
-		## Discovery may fork bounded login-shell/which probes. Keep it in this
-		## worker for interactive startup; the headless/export caller deliberately
-		## runs the same job synchronously because it has no editor UI to freeze.
-		command = ClientConfigurator.get_update_transaction_command()
-	if command.is_empty():
-		return {
-			"ok": false,
-			"error": "transaction actor unavailable; refusing unleased plugin startup",
-		}
-	var arguments: Array[String] = []
-	arguments.assign(job.get("arguments", []))
-	var checked := _execute_update_command_value(
-		command,
-		arguments,
-		str(job.get("expected_actor_version", "")),
-		int(job.get("timeout_ms", UPDATE_ACTOR_COLD_START_TIMEOUT_MS)),
-		cancel_check,
-	)
-	if not bool(checked.get("ok", false)):
-		return checked
-	var outcome: Dictionary = checked.get("data", {})
-	var transaction := str(job.get("transaction", ""))
-	if not _update_outcome_matches_startup(outcome, transaction):
-		return {"ok": false, "error": "transaction actor returned an invalid startup outcome"}
-	if transaction.is_empty() and str(outcome.get("status", "")) == "none":
-		return {"ok": true, "outcome": {}}
-	var current := str(job.get("current_version", ""))
-	match str(outcome.get("outcome", "")):
-		"success":
-			if current != str(outcome.get("to_version", "")):
-				return {"ok": false, "error": "successful update outcome targets another version"}
-		"rolled_back":
-			if current != str(outcome.get("from_version", "")):
-				return {"ok": false, "error": "rollback outcome targets another version"}
-		_:
-			return {"ok": false, "error": "transaction outcome is not startable"}
-	return {
-		"ok": true,
-		"actor_command": checked.get("command", []).duplicate(),
-		"actor_version": str(job.get("expected_actor_version", "")),
-		"outcome": outcome.duplicate(true),
-	}
-
-
-func _accept_update_startup_result(result: Dictionary) -> bool:
-	if bool(result.get("termination_unproven", false)):
-		_update_actor_termination_unproven = true
-	if not bool(result.get("ok", false)):
-		push_error("MCP | update startup refused: %s" % str(result.get("error", "")))
-		return false
-	var outcome: Dictionary = result.get("outcome", {})
-	if not outcome.is_empty():
-		_post_update_outcome = outcome.duplicate(true)
-		_post_update_actor_command.assign(result.get("actor_command", []))
-		_post_update_actor_version = str(result.get("actor_version", ""))
-	return true
-
-
-func _run_update_startup_barrier() -> bool:
-	var job := _prepare_update_startup_barrier()
-	if not bool(job.get("ok", false)):
-		push_error("MCP | update startup refused: %s" % str(job.get("error", "")))
-		return false
-	return _accept_update_startup_result(_run_update_startup_barrier_job(job))
-
-
-func _start_update_startup_barrier() -> bool:
-	var job := _prepare_update_startup_barrier()
-	if not bool(job.get("ok", false)):
-		push_error("MCP | update startup refused: %s" % str(job.get("error", "")))
-		return false
-	_set_update_startup_cancelled(false)
-	_update_actor_thread = Thread.new()
-	_update_actor_job = "startup"
-	var error: int = int(_update_actor_thread.start(
-		Callable(self, "_run_update_startup_barrier_job").bind(
-			job,
-			Callable(self, "_update_startup_cancel_requested"),
-		)
-	))
-	if error != OK:
-		_update_actor_thread = null
-		_update_actor_job = ""
-		push_error("MCP | update startup worker could not start")
-		return false
-	set_process(true)
-	print("MCP | checking the bounded update startup barrier in the background")
-	return true
-
-
-func _set_update_startup_cancelled(cancelled: bool) -> void:
-	_update_startup_cancel_mutex.lock()
-	_update_startup_cancelled = cancelled
-	_update_startup_cancel_mutex.unlock()
-
-
-func _update_startup_cancel_requested() -> bool:
-	_update_startup_cancel_mutex.lock()
-	var cancelled := _update_startup_cancelled
-	_update_startup_cancel_mutex.unlock()
-	return cancelled
-
-
-func _cancel_update_actor_thread() -> void:
-	if _update_actor_thread == null:
-		return
-	_set_update_startup_cancelled(true)
-	var result: Variant = _update_actor_thread.wait_to_finish()
-	_update_actor_thread = null
-	_update_actor_job = ""
-	if result is Dictionary and bool(result.get("termination_unproven", false)):
-		_update_actor_termination_unproven = true
-
-
-func _block_update_startup() -> void:
+func _block_update_startup(reason: String) -> void:
 	_update_barrier_blocked = true
-	push_error("MCP | update recovery barrier blocked plugin startup")
+	push_error("MCP | update recovery blocked plugin startup: %s" % reason)
 	_disable_after_update_barrier.call_deferred()
 
 
-static func _update_outcome_matches_startup(outcome: Dictionary, transaction: String) -> bool:
-	if transaction.is_empty():
-		var status := str(outcome.get("status", ""))
-		return (
-			status == "none"
-			or (
-				status == "migration_pending"
-				and not str(outcome.get("transaction", "")).is_empty()
-			)
-		)
-	return (
-		str(outcome.get("status", "")) == "claimed"
-		and str(outcome.get("transaction", "")) == transaction
-	)
-
-
-static func _loaded_update_version_matches(loaded: String, on_disk: String) -> bool:
-	return not loaded.is_empty() and loaded == on_disk
-
-
-static func _parse_update_actor_handoff(
-	raw: String, transaction: String, editor_nonce: String
-) -> Dictionary:
-	## The old, already-running actor owns the entire durable reducer across a
-	## v4 swap. New code only consumes this bounded versioned command envelope,
-	## so startup never resolves/downloads the new Python package mid-transaction.
-	if raw.is_empty() or raw.length() > 8192:
-		return {}
-	var parsed: Variant = JSON.parse_string(raw)
-	if not parsed is Dictionary or (parsed as Dictionary).size() != 6:
-		return {}
-	if (
-		int(parsed.get("schema_version", 0)) != UPDATE_ACTOR_HANDOFF_SCHEMA
-		or int(parsed.get("protocol_version", 0)) != UPDATE_ACTOR_PROTOCOL_VERSION
-		or str(parsed.get("package_version", "")).is_empty()
-		or str(parsed.get("transaction", "")) != transaction
-		or str(parsed.get("editor_nonce", "")) != editor_nonce
-	):
-		return {}
-	var values: Variant = parsed.get("command", [])
-	if not values is Array or values.is_empty() or values.size() > 32:
-		return {}
-	var command: Array[String] = []
-	for value in values:
-		if not value is String or value.is_empty() or value.length() > 2048:
-			return {}
-		for index in value.length():
-			var code: int = value.unicode_at(index)
-			if code < 0x20 or code == 0x7f:
-				return {}
-		command.append(value)
-	if not command[0].is_absolute_path():
-		return {}
-	return {
-		"command": command,
-		"package_version": str(parsed.package_version),
-		"protocol_version": UPDATE_ACTOR_PROTOCOL_VERSION,
-	}
-
-
 func _disable_after_update_barrier() -> void:
-	## An editor without the transaction actor cannot publish a trustworthy
-	## cross-editor lease. Remove the blocked shell as well as withholding all
-	## owners/update UI, so another editor never swaps beneath an active plugin.
+	## A live tree that neither matches its manifest nor has a backup to
+	## restore must not run. Disable the shell so nothing is built from it;
+	## the marker keeps the exact paths for manual recovery.
 	if _update_barrier_blocked:
 		print("MCP | disabling plugin after update barrier refusal")
 		EditorInterface.set_plugin_enabled("res://addons/godot_ai/plugin.cfg", false)
 
 
-func _preflight_update() -> Dictionary:
-	var download_id := "download-" + Crypto.new().generate_random_bytes(16).hex_encode()
-	var arguments: Array[String] = ["lease", "preflight"]
-	arguments.append_array(_transaction_identity_arguments())
-	arguments.append_array(["--download-id", download_id])
-	var checked := _execute_update_command(arguments)
-	var data: Dictionary = checked.get("data", {})
-	var recovery_root := str(data.get("recovery_root", "")).replace("\\", "/").trim_suffix("/")
-	var download_root := str(data.get("download_root", "")).replace("\\", "/").trim_suffix("/")
-	var expected_root := recovery_root.path_join("downloads").path_join(download_id)
-	var accepted := (
-		bool(checked.get("ok", false))
-		and not recovery_root.is_empty()
-		and download_root == expected_root
-	)
-	return {
-		"ok": accepted,
-		"error": (
-			str(checked.get("error", ""))
-			if not bool(checked.get("ok", false))
-			else "transaction actor returned an unbound download directory"
-		),
-		"download_root": download_root if accepted else "",
-	}
-
-
-func _release_update_lease() -> void:
-	if (
-		_update_editor_nonce.is_empty()
-		or _update_actor_termination_unproven
-		or not OS.get_environment(UPDATE_TRANSACTION_ENV).is_empty()
-	):
-		return
-	var arguments: Array[String] = ["lease", "release"]
-	arguments.append_array(_transaction_identity_arguments())
-	_execute_update_command(arguments, [], "", UPDATE_ACTOR_RELEASE_TIMEOUT_MS)
-
-
 func _exit_tree() -> void:
 	if _unsupported_engine:
 		return
-	_cancel_update_actor_thread()
 	set_process(false)
 	## Registered before the headless guard in _enter_tree, so it must be
 	## removed before the headless early-return here too.
@@ -1403,7 +1094,6 @@ func _exit_tree() -> void:
 		_export_plugin = null
 
 	if _headless_disabled:
-		_release_update_lease()
 		_headless_disabled = false
 		## Ported from upstream PR #936 at
 		## 537a490c865837bedb96042d10ee0fc74673cd99: `_lifecycle` is built in
@@ -1413,7 +1103,6 @@ func _exit_tree() -> void:
 		return
 
 	if _update_barrier_blocked:
-		_release_update_lease()
 		_update_barrier_blocked = false
 		_lifecycle = null
 		return
@@ -1440,16 +1129,17 @@ func _exit_tree() -> void:
 	if _connection:
 		_connection.teardown()
 
-	# Drop the dispatcher's Callables AND its lazily-constructed handler
-	# instances (#736: handlers live in the dispatcher's cache now). Handler
-	# destructors run here, while their scripts are still loaded.
-	if _dispatcher:
-		_dispatcher.clear()
 	if _vision_routing:
 		_vision_routing.shutdown()
 		_vision_routing = null
+	# Transport is stopped and both worker owners have joined. Release the
+	# ordinary plugin-lifetime graph; this is not the stronger hot script-swap
+	# authorization (prepare_for_update_reload still requires clear()).
+	if _dispatcher:
+		_dispatcher.release_after_teardown()
 
 	if _dock:
+		_dock.release_editor_progress_dialog()
 		remove_control_from_docks(_dock)
 		_dock.queue_free()
 		_dock = null
@@ -1484,42 +1174,9 @@ func _exit_tree() -> void:
 	_lifecycle.teardown_for_editor_exit()
 	_lifecycle = null
 	print("MCP | plugin unloaded")
-	## Keep the cross-editor lease until every worker is joined, every
-	## plugin-script-holding owner is gone, and teardown has emitted its final
-	## diagnostic. This must remain the last effect in the normal exit path.
-	_release_update_lease()
 
 
 func _process(_delta: float) -> void:
-	if _update_actor_thread != null and not _update_actor_thread.is_alive():
-		var result: Variant = _update_actor_thread.wait_to_finish()
-		var job := _update_actor_job
-		_update_actor_thread = null
-		_update_actor_job = ""
-		if job == "migration_completion":
-			if result is Dictionary and bool(result.get("termination_unproven", false)):
-				_update_actor_termination_unproven = true
-			if not result is Dictionary or not bool(result.get("ok", false)):
-				_present_post_update_barrier_failure(
-					str(result.get("error", "Migration completion failed."))
-					if result is Dictionary
-					else "Migration completion failed."
-				)
-				return
-			print("MCP | client migration durably completed")
-			_present_post_update_complete()
-			_fan_post_update_outcome()
-			_release_normal_startup()
-			return
-		if job != "startup":
-			_block_update_startup()
-			return
-		set_process(false)
-		if not result is Dictionary or not _accept_update_startup_result(result):
-			_block_update_startup()
-			return
-		_continue_enter_tree_after_update_barrier()
-		return
 	if _vision_routing != null:
 		_vision_routing.poll_completed()
 
@@ -1692,6 +1349,7 @@ func _capture_lifecycle_plan() -> Dictionary:
 		"expected_version": ClientConfigurator.get_plugin_version(),
 		"server_command": ClientConfigurator.get_server_command(),
 		"pid_file": ProjectSettings.globalize_path(PortResolver.SERVER_PID_FILE),
+		"startup_report": ProjectSettings.globalize_path(PortResolver.SERVER_STARTUP_REPORT),
 		"http_port_reserved": WindowsPortReservation.is_port_excluded(http_port),
 		"excluded_domains": str(policy.get("excluded_domains", "")),
 		"allow_hosts": str(policy.get("allow_hosts", "")),
@@ -1711,9 +1369,13 @@ static func _supports_godot_version(version_info: Dictionary) -> bool:
 
 
 func _on_lifecycle_snapshot_changed(snapshot: Dictionary) -> void:
+	if int(snapshot.get("episode_id", 0)) != _post_update_retry_episode or str(snapshot.get("episode_state", "")) != "BLOCKED":
+		_post_update_retry_episode = 0
 	if _connection != null and bool(snapshot.get("connection_blocked", true)):
 		_connection.connect_blocked = true
 		_connection.connect_block_reason = str(snapshot.get("message", ""))
+	_replace_server_left_by_update(snapshot)
+	_log_lifecycle_block(snapshot)
 	if _client_jobs != null:
 		_client_jobs.set_client_health_blocked(
 			ServerStateScript.blocks_client_health(
@@ -1721,6 +1383,106 @@ func _on_lifecycle_snapshot_changed(snapshot: Dictionary) -> void:
 			)
 		)
 	_publish_dock_status_snapshots()
+
+
+## The dock shows why a server start blocked; the editor log should too, once
+## per distinct reason, so a report from the field carries it.
+func _log_lifecycle_block(snapshot: Dictionary) -> void:
+	if str(snapshot.get("episode_state", "")) != "BLOCKED":
+		_last_logged_block = ""
+		return
+	var message := str(snapshot.get("message", ""))
+	if message.is_empty() or message == _last_logged_block:
+		return
+	_last_logged_block = message
+	var retry_pending := bool(_lifecycle_snapshot_for_dock().get("handoff_retry_pending", false))
+	print("MCP | %s: %s" % ["server handoff retry pending" if retry_pending else "server start blocked", message])
+
+
+## Once, right after an update: a godot-ai server at the version we just
+## replaced is on our port (typically spawned by an attach bridge that lost
+## server A during the restart). Replace it instead of asking the user to.
+## Any other conflict keeps the dock's explicit Restart Server authority.
+func _replace_server_left_by_update(snapshot: Dictionary) -> void:
+	if _post_update_replaced_version.is_empty():
+		return
+	if not bool(snapshot.get("connection_blocked", true)):
+		_post_update_replaced_version = ""
+		return
+	if not bool(snapshot.get("can_recover_incompatible", false)):
+		## Any other block right after an update is the bridge's backend in
+		## flight: bound but not answering yet, or bound between our probe and
+		## our launch so our server exited on bind. Probe again shortly, a
+		## bounded number of times; the re-probe finds that backend answering
+		## and takes the replacement path. Then the dock's Restart Server is
+		## the remaining path.
+		if str(snapshot.get("episode_state", "")) != "BLOCKED":
+			return
+		var episode_id := int(snapshot.get("episode_id", 0))
+		if episode_id <= 0 or episode_id == _post_update_retry_episode:
+			return
+		if str(snapshot.get("blocked_hint", "")) == ServerLifecycleManager.STALE_PRE_V4_HINT:
+			if _post_update_stale_reprobes_left <= 0:
+				return
+			if _post_update_stale_reprobes_left == POST_UPDATE_STALE_REPROBE_LIMIT:
+				print(
+					"MCP | a pre-v4 godot-ai server holds port %d; waiting for it to exit once its AI client is relaunched"
+					% int(snapshot.get("conflict_port", 0))
+				)
+			_post_update_stale_reprobes_left -= 1
+			_post_update_retry_episode = episode_id
+			get_tree().create_timer(POST_UPDATE_STALE_REPROBE_SECONDS).timeout.connect(
+				_reprobe_after_update.bind(episode_id), CONNECT_ONE_SHOT
+			)
+			return
+		if _post_update_reprobes_left > 0:
+			_post_update_reprobes_left -= 1
+			_post_update_retry_episode = episode_id
+			get_tree().create_timer(1.0).timeout.connect(_reprobe_after_update.bind(episode_id), CONNECT_ONE_SHOT)
+		return
+	var version := str(snapshot.get("conflict_version", ""))
+	if not _update_may_replace(version):
+		return
+	if _post_update_replacements_left <= 0:
+		return
+	_post_update_replacements_left -= 1
+	print(
+		"MCP | replacing the v%s server left on port %d by the update"
+		% [version, int(snapshot.get("conflict_port", 0))]
+	)
+	if not _lifecycle.request_replacement():
+		push_warning(
+			"MCP | could not replace the v%s server automatically; use Restart Server in the dock"
+			% version
+		)
+
+
+## The server the update superseded, or any older server of our major
+## version an attach bridge left on the port (a client pinned further back).
+## Never a newer one: that is another editor's server, and adoption or the
+## dock's explicit Restart Server decides there.
+func _update_may_replace(conflict_version: String) -> bool:
+	if conflict_version.is_empty():
+		return false
+	if conflict_version == _post_update_replaced_version:
+		return true
+	return McpServerVersionCheck.is_older_same_major(
+		conflict_version, ClientConfigurator.get_plugin_version()
+	)
+
+
+func _reprobe_after_update(episode_id: int) -> void:
+	if episode_id != _post_update_retry_episode:
+		return
+	_post_update_retry_episode = 0
+	if _post_update_replaced_version.is_empty() or _lifecycle == null or not _normal_start_released:
+		_publish_dock_status_snapshots()
+		return
+	var snapshot: Dictionary = _lifecycle.get_status_dict()
+	if int(snapshot.get("episode_id", 0)) != episode_id or str(snapshot.get("episode_state", "")) != "BLOCKED":
+		_publish_dock_status_snapshots()
+		return
+	_lifecycle.start_server()
 
 
 func _on_lifecycle_transport_ready(ws_port: int, ws_capability: String) -> void:
@@ -1785,8 +1547,17 @@ func _resolve_ws_port(configured_port: int) -> int:
 
 
 func prepare_for_update_reload() -> Dictionary:
-	## Stop the exact managed process first: this is the only expected refusal
-	## point and leaves command/vision composition untouched on failure.
+	## Refuse while frame-yielding work is still live, before stopping any
+	## owner. These probes are non-mutating; retry after the work completes.
+	if _dispatcher != null:
+		var handlers_ready: Dictionary = _dispatcher.quiesce_for_script_swap()
+		if not bool(handlers_ready.get("ok", false)):
+			return handlers_ready
+	if _debugger_plugin != null:
+		var debugger_ready: Dictionary = _debugger_plugin.quiesce_for_script_swap()
+		if not bool(debugger_ready.get("ok", false)):
+			return debugger_ready
+	## Stop the exact managed process only after the non-mutating probes.
 	var lifecycle_quiesced: Dictionary = _lifecycle.prepare_for_update_reload()
 	if not bool(lifecycle_quiesced.get("ok", false)):
 		return lifecycle_quiesced
@@ -1804,112 +1575,165 @@ func prepare_for_update_reload() -> Dictionary:
 	return {"ok": true}
 
 
-## Authenticate and stage while the old plugin is fully live. Only after that
-## succeeds do we quiesce and detach a value-only coordinator. The coordinator
-## survives disable because it is parented under the editor, but its already-
-## compiled script never reads or writes the tree the Python actor swaps.
-func install_downloaded_update(package: Dictionary) -> void:
-	_ensure_update_editor_nonce()
-	var command := ClientConfigurator.get_update_transaction_command()
-	if command.is_empty():
-		_on_update_install_state_changed({
-			"install_in_flight": false,
-			"button_text": "Update blocked — transaction actor unavailable",
-			"button_disabled": false,
-		})
+## Refuse to start a download while an earlier update is unresolved or another
+## live editor holds this project's update lock. The lock is taken here, before
+## the download, and released by every failure path before the swap.
+func _preflight_update() -> Dictionary:
+	var pending: Dictionary = UpdateInstaller.read_pending()
+	var status := str(pending.get("status", ""))
+	if status == "swapped" or status == "repair_required":
+		return {"ok": false, "error": "an earlier update is unresolved (%s)" % status, "download_root": ""}
+	var pid := OS.get_process_id()
+	var lock: Dictionary = UpdateInstaller.acquire_lock(pid, McpPortResolver.process_fingerprint(pid))
+	if not bool(lock.get("ok", false)):
+		return {"ok": false, "error": str(lock.get("error", "")), "download_root": ""}
+	var download_root := ProjectSettings.globalize_path("user://godot_ai_update/download").trim_suffix("/")
+	if DirAccess.dir_exists_absolute(download_root):
+		_remove_tree(download_root)
+	if DirAccess.make_dir_recursive_absolute(download_root) != OK:
+		UpdateInstaller.release_lock()
+		return {"ok": false, "error": "could not create the download directory", "download_root": ""}
+	return {"ok": true, "error": "", "download_root": download_root}
+
+
+static func _remove_tree(path: String) -> void:
+	var dir := DirAccess.open(path)
+	if dir == null:
 		return
-	var transaction := Crypto.new().generate_random_bytes(16).hex_encode()
-	var roots := _update_roots()
-	var arguments: Array[String] = [
-		"prepare",
-		"--archive", str(package.get("archive", "")),
-		"--manifest", str(package.get("manifest", "")),
-		"--signature", str(package.get("signature", "")),
-		"--project", str(roots.project),
-		"--install", str(roots.install),
-		"--transaction", transaction,
-		"--channel", str(package.get("channel", "")),
-		"--tag", str(package.get("tag", "")),
-		"--version", str(package.get("version", "")),
-		"--source", str(package.get("source", "")),
-		"--editor-pid", str(OS.get_process_id()),
-		"--editor-nonce", _update_editor_nonce,
-	]
-	var checked := _execute_update_command(arguments, command)
+	dir.include_hidden = true
+	for name in dir.get_directories():
+		_remove_tree(path.path_join(name))
+	for name in dir.get_files():
+		DirAccess.remove_absolute(path.path_join(name))
+	DirAccess.remove_absolute(path)
+
+
+## Verify, stage, quiesce, then hand activation to an independent runner. Every check runs in this editor
+## against the downloaded bytes; nothing outside the editor is executed. The
+## live tree is touched only by the two renames inside `swap`, and only after
+## the staged tree has been re-hashed against the signed manifest.
+## Activation runs on the main thread: verification hashes the archive,
+## staging extracts it, and the worker quiescence waits for threads. Each
+## phase names itself in the dock and yields one frame first so the label
+## repaints; without that the dock sat on "Downloading…" for seconds after
+## the download had finished, looking frozen.
+func install_downloaded_update(package: Dictionary) -> void:
+	await _present_install_phase("Verifying signed update…")
+	var manifest_bytes := FileAccess.get_file_as_bytes(str(package.get("manifest", "")))
+	var signature := FileAccess.get_file_as_bytes(str(package.get("signature", "")))
+	var verified: Dictionary = ReleaseVerifier.verify_manifest(
+		manifest_bytes,
+		signature,
+		{
+			"repository": str(package.get("repository", "")),
+			"channel": str(package.get("channel", "")),
+			"version": str(package.get("version", "")),
+			"current_version": ClientConfigurator.get_plugin_version(),
+		},
+		UpdateManager.RELEASE_SIGNING_PUBLIC_KEY_PEM,
+	)
+	var manifest: Dictionary = verified.get("manifest", {})
+	var checked: Dictionary = verified
+	if bool(verified.get("ok", false)):
+		checked = ReleaseVerifier.verify_archive(str(package.get("archive", "")), manifest)
+	if not bool(checked.get("ok", false)):
+		_fail_update("Update verification failed", "signed update refused: %s" % str(checked.get("error", "")))
+		return
+	await _present_install_phase("Staging the verified tree…")
+	var staged: Dictionary = UpdateInstaller.stage(str(package.get("archive", "")), manifest)
+	if not bool(staged.get("ok", false)):
+		_fail_update("Update staging failed", "update staging refused: %s" % str(staged.get("error", "")))
+		return
 	if _update_manager != null:
 		_update_manager.discard_downloads()
-	if not bool(checked.get("ok", false)):
-		_on_update_install_state_changed({
-			"install_in_flight": false,
-			"button_text": "Update verification failed",
-			"button_disabled": false,
-		})
-		push_error("MCP | signed update refused: %s" % str(checked.get("error", "")))
-		return
-	var prepared: Dictionary = checked.get("data", {})
-	prepared.merge({
-		"project_root": str(roots.project),
-		"install_root": str(roots.install),
-		"from_version": ClientConfigurator.get_plugin_version(),
-		"to_version": str(package.get("version", "")),
-	}, true)
+	await _present_install_phase("Waiting for client workers…")
 	if _client_jobs != null:
 		var jobs_quiesced: Dictionary = _client_jobs.quiesce(
 			Time.get_ticks_msec() + ClientConfigurator.PREWARM_TIMEOUT_MS
 		)
 		if not bool(jobs_quiesced.get("ok", false)):
-			_abort_prepared_update(prepared, command)
-			push_error("MCP | client workers refused update quiescence")
+			UpdateInstaller.discard_stage()
+			_fail_update("Update cancelled safely", "client workers refused update quiescence")
 			return
 	var script_quiesced := prepare_for_update_reload()
 	if not bool(script_quiesced.get("ok", false)):
-		_abort_prepared_update(prepared, command)
+		UpdateInstaller.discard_stage()
+		_fail_update("Update cancelled safely", "command workers refused update quiescence")
 		if bool(script_quiesced.get("reload_required", false)):
-			_reload_plugin_after_failed_update.call_deferred()
-		push_error("MCP | command workers refused update quiescence")
+			_reload_plugin_after_failed_update()
 		return
 	_on_update_install_state_changed({
 		"install_in_flight": true,
-		"button_text": "Activating verified update…",
+		"status_text": "Activating verified update…",
 		"button_disabled": true,
 	})
-	var coordinator = UpdateCoordinator.new()
-	var parent: Node = EditorInterface.get_base_control()
-	if parent == null:
-		parent = get_tree().root
-	parent.add_child(coordinator)
-	coordinator.start(prepared, command, _update_editor_nonce)
+	var to_version := str(manifest.get("version", ""))
+	var record := {
+		"from_version": ClientConfigurator.get_plugin_version(),
+		"to_version": to_version,
+		"manifest_sha256": ReleaseVerifier.sha256_bytes(manifest_bytes),
+		"expected_tree_sha256": str(staged.get("tree_sha256", "")),
+		"editor_nonce": Crypto.new().generate_random_bytes(16).hex_encode(),
+		"replace_owned_mismatches": false,
+	}
+	## Compile an independent script with no resource path. Loading this as a
+	## normal Script would let the filesystem scan replace our live runner.
+	var runner_script := GDScript.new()
+	runner_script.source_code = FileAccess.get_file_as_string(
+		"res://addons/godot_ai/utils/update_activation_runner.gd"
+	)
+	if runner_script.source_code.is_empty() or runner_script.reload() != OK:
+		UpdateInstaller.discard_stage()
+		_fail_update("Update cancelled safely", "could not compile the independent activation runner")
+		_reload_plugin_after_failed_update()
+		return
+	var runner = runner_script.new()
+	get_tree().root.add_child(runner)
+	if not runner.start({"stage_root": str(staged.get("stage_root", "")), "record": record}):
+		var refusal_reason := str(runner.refusal_reason)
+		runner.queue_free()
+		UpdateInstaller.discard_stage()
+		_fail_update("Update cancelled safely", refusal_reason)
+		_reload_plugin_after_failed_update()
+		return
+	## The runner now owns the lock. Teardown's cancellation signal must not
+	## release it before the deferred disable/drain/swap sequence completes.
+	_update_swapped = true
+	## Return: no frame of this plugin may be suspended across source replacement.
+
+
+
+## Name the activation phase in the dock and let it repaint before the
+## phase's main-thread work begins.
+func _present_install_phase(status_text: String) -> void:
+	_on_update_install_state_changed({
+		"install_in_flight": true,
+		"status_text": status_text,
+		"button_disabled": true,
+	})
+	var tree := get_tree()
+	if tree != null:
+		await tree.process_frame
+
+
+func _fail_update(status_text: String, error: String) -> void:
+	if _update_manager != null:
+		_update_manager.discard_downloads()
+	push_error("MCP | %s" % error)
+	_on_update_install_state_changed({
+		"install_in_flight": false,
+		"status_text": status_text,
+		"button_disabled": false,
+	})
 
 
 func _reload_plugin_after_failed_update() -> void:
 	## The signed prepared tree was aborted before mutation. Reconstruct the
 	## unchanged old composition if any later quiescence step had already
-	## stopped vision or released handler references.
-	EditorInterface.set_plugin_enabled("res://addons/godot_ai/plugin.cfg", false)
-	EditorInterface.set_plugin_enabled("res://addons/godot_ai/plugin.cfg", true)
-
-
-func _abort_prepared_update(prepared: Dictionary, command: Array[String]) -> bool:
-	var arguments: Array[String] = [
-		"abort-prepared",
-		"--project", str(prepared.project_root),
-		"--install", str(prepared.install_root),
-		"--recovery-root", str(prepared.recovery_root),
-		"--transaction", str(prepared.transaction),
-		"--editor-pid", str(OS.get_process_id()),
-		"--editor-nonce", _update_editor_nonce,
-	]
-	var checked := _execute_update_command(arguments, command)
-	_on_update_install_state_changed({
-		"install_in_flight": false,
-		"button_text": (
-			"Update cancelled safely"
-			if bool(checked.get("ok", false))
-			else "Update blocked — cleanup required"
-		),
-		"button_disabled": false,
-	})
-	return bool(checked.get("ok", false))
+	## stopped vision or released handler references. The reload frees this
+	## plugin, so it must not run on one of this plugin's own frames: defer
+	## the static call itself, not a method of this instance.
+	PluginReload.reload_enabled_plugin.call_deferred()
 
 
 func can_recover_incompatible_server() -> bool:
@@ -1942,7 +1766,16 @@ func restart_or_start_managed_server() -> bool:
 		_lifecycle.force_restart_server()
 		return true
 	var port := ClientConfigurator.http_port()
-	if PortResolver.is_port_in_use(port):
+	var occupied: bool
+	if OS.get_name() == "Windows":
+		var occupancy := PortResolver.windows_port_occupancy(port)
+		if occupancy == PortResolver.PortOccupancy.UNKNOWN:
+			_lifecycle.start_server()
+			return true
+		occupied = occupancy == PortResolver.PortOccupancy.OCCUPIED
+	else:
+		occupied = PortResolver.is_port_in_use(port)
+	if occupied:
 		push_warning(
 			"MCP | refusing to restart the unowned server on port %d; stop it from its launcher"
 			% port
