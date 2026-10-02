@@ -100,6 +100,78 @@ func test_lookup_failure_distinguishes_absence_from_failed_observation() -> void
 		assert_eq(McpCliFinder._lookup_failure({"exit_code": 1, flag: true}, true), flag)
 
 
+func test_inherited_path_trace_records_uvx_candidates() -> void:
+	var records: Array = []
+	var sink := func(record: Dictionary) -> void: records.append(record)
+	var first := "C:\\Tools\\uv\\uvx.exe"
+	var second := "C:\\Windows\\uvx.exe"
+	var lookup := func(_command: String, _exe_name: String) -> Dictionary:
+		return {
+			"exit_code": 0,
+			"stdout": first + "\r\n" + second + "\r\nPRIVATE_LOOKUP_CANARY\r\n",
+		}
+
+	var resolved: String = McpCliFinder._resolve_inherited_path("uvx.exe", true, sink, lookup)
+
+	assert_eq(resolved, first, "the first usable Windows .exe is the resolved uvx")
+	assert_eq(records.size(), 1)
+	assert_eq(records[0].status, "resolved")
+	assert_eq(records[0].resolved_path, first)
+	assert_true(records[0].candidate_paths.has(first))
+	assert_true(records[0].candidate_paths.has(second))
+	assert_false(JSON.stringify(records).contains("PRIVATE_LOOKUP_CANARY"))
+
+
+func test_inherited_path_trace_preserves_where_timeout_and_partial_candidates() -> void:
+	var records: Array = []
+	var sink := func(record: Dictionary) -> void: records.append(record)
+	var partial := "C:\\Tools\\uv\\uvx.exe"
+	var lookup := func(_command: String, _exe_name: String) -> Dictionary:
+		return {"exit_code": -1, "timed_out": true, "stdout": partial}
+
+	var resolved: String = McpCliFinder._resolve_inherited_path("uvx.exe", true, sink, lookup)
+
+	assert_eq(resolved, "")
+	assert_eq(records.size(), 1)
+	assert_eq(records[0].status, "timed_out")
+	assert_true(records[0].timed_out)
+	assert_eq(records[0].resolved_path, "")
+	assert_true(records[0].candidate_paths.has(partial))
+
+
+func test_inherited_path_trace_preserves_where_nonzero_and_candidates() -> void:
+	var records: Array = []
+	var sink := func(record: Dictionary) -> void: records.append(record)
+	var candidate := "C:\\Tools\\uv\\uvx.exe"
+	var lookup := func(_command: String, _exe_name: String) -> Dictionary:
+		return {"exit_code": 2, "stdout": candidate}
+
+	var resolved: String = McpCliFinder._resolve_inherited_path("uvx.exe", true, sink, lookup)
+
+	assert_eq(resolved, "")
+	assert_eq(records.size(), 1)
+	assert_eq(records[0].status, "nonzero_exit")
+	assert_eq(records[0].exit_code, 2)
+	assert_eq(records[0].resolved_path, "")
+	assert_true(records[0].candidate_paths.has(candidate))
+
+
+func test_inherited_path_trace_classifies_empty_where_output() -> void:
+	var records: Array = []
+	var sink := func(record: Dictionary) -> void: records.append(record)
+	var lookup := func(_command: String, _exe_name: String) -> Dictionary:
+		return {"exit_code": 0, "stdout": " \r\n\t"}
+
+	var resolved: String = McpCliFinder._resolve_inherited_path("uvx.exe", true, sink, lookup)
+
+	assert_eq(resolved, "")
+	assert_eq(records.size(), 1)
+	assert_eq(records[0].status, "empty_output")
+	assert_eq(records[0].exit_code, 0)
+	assert_eq(records[0].resolved_path, "")
+	assert_true(records[0].candidate_paths.is_empty())
+
+
 func test_lookup_trace_excludes_raw_result_fields() -> void:
 	var records: Array = []
 	var sink := func(record: Dictionary) -> void: records.append(record)
@@ -117,8 +189,10 @@ func test_lookup_trace_excludes_raw_result_fields() -> void:
 	assert_true(records[0].timed_out)
 	assert_false(records[0].cache_hit)
 	assert_true(records[0].elapsed_ms >= 0)
+	assert_eq(records[0].resolved_path, "")
+	assert_true(records[0].candidate_paths.is_empty())
 	assert_false(JSON.stringify(records).contains("PRIVATE_LOOKUP_CANARY"))
-	assert_eq(records[0].size(), 9, "Only the fixed diagnostic schema leaves the finder")
+	assert_eq(records[0].size(), 11, "Only the fixed diagnostic schema leaves the finder")
 
 
 func test_lookup_trace_preserves_cached_miss_and_hit() -> void:

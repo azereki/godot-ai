@@ -45,8 +45,10 @@ Launcher discovery adds `lookup=` records when startup tracing is enabled.
 Each record names the lookup tier and result, elapsed milliseconds, and
 execution flags. A `cached_miss` means an earlier lookup returned no path;
 it does not establish that the executable is absent or explain the earlier
-failure. The records omit executable paths, output, and environment values.
-The dock's explicit Refresh retains its existing negative-cache recovery.
+failure. Failed and successful lookups also retain the bounded absolute
+candidate paths and the selected path when available; raw command output and
+environment values are omitted. The dock's explicit Refresh retains its
+existing negative-cache recovery.
 
 A failed Windows launch can also report bounded snapshot diagnostics naming
 the capture pair or its first or final member and a fixed failure category.

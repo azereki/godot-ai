@@ -61,6 +61,13 @@ def test_runtime_rejects_a_row_labeled_as_another_platform(monkeypatch, tmp_path
         )
 
 
+def test_runtime_qualification_enables_launcher_diagnostics(tmp_path):
+    environment = runtime._isolated_environment(
+        tmp_path / "environment", "http://127.0.0.1/index"
+    )
+    assert environment["GODOT_AI_STARTUP_TRACE"] == "1"
+
+
 def test_required_rows_are_the_trimmed_release_matrix():
     keys = qualification.required_row_keys()
     runtime_keys = {key for key in keys if key[0] == "runtime"}

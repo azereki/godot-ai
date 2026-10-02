@@ -251,6 +251,7 @@ def _isolated_environment(root: Path, index: str) -> dict[str, str]:
             "GODOT_AI_ALLOW_HEADLESS": "1",
             "GODOT_AI_MODE": "user",
             "GODOT_AI_QUALIFICATION_PYTHON_INDEX": "1",
+            "GODOT_AI_STARTUP_TRACE": "1",
             "UV_INDEX": index,
             "UV_DEFAULT_INDEX": index,
             "UV_PYTHON": sys.executable,
