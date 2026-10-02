@@ -156,8 +156,13 @@ func _process(_delta: float) -> void:
 	## through the debugger packet path in a single tick. Surplus stays in
 	## `_pending_outbound` and bleeds out across subsequent frames.
 	if not _logger_attached or _logger == null:
+		_pending_outbound.clear()
 		return
 	if not EngineDebugger.is_active():
+		## No remote can consume these lines. Drop current and already-drained
+		## batches so a detached/headless run cannot retain logs indefinitely (#1123).
+		_logger.clear()
+		_pending_outbound.clear()
 		return
 	if _pending_outbound.is_empty():
 		if not _logger.has_pending():
