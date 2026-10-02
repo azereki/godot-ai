@@ -1151,7 +1151,6 @@ func _seed_server_row(server_ver: String) -> void:
 	_dock._setup_server_label = Label.new()
 	_dock._version_restart_btn = Button.new()
 	_dock._version_restart_btn.visible = false
-	_dock._last_rendered_server_text = ""
 
 
 func _cleanup_server_row() -> void:
@@ -1249,6 +1248,50 @@ func test_server_version_label_repaints_color_when_state_changes_without_text_ch
 	assert_false(_dock._version_restart_btn.visible, "incompatible state must hide Restart")
 
 	_cleanup_server_row()
+
+
+func test_server_version_label_steady_refresh_does_not_restyle() -> void:
+	## #1121: `_process` re-runs this refresh every frame, and Godot's
+	## `add_theme_color_override` has no same-value short-circuit — each call
+	## re-sends NOTIFICATION_THEME_CHANGED and queues a redraw, so re-applying
+	## an unchanged color kept the idle editor redrawing every frame. Only an
+	## in-tree Control gets the notification: parent the hidden label under the
+	## editor root while counting.
+	_seed_server_row("1.2.3-stale-for-test")
+	_dock.present_lifecycle_snapshot({
+		"state": McpServerState.READY,
+		"actual_version": "1.2.3-stale-for-test",
+		"expected_version": "2.2.0",
+	})
+	var label: Label = _dock._setup_server_label
+	label.hide()
+	var root := EditorInterface.get_base_control().get_tree().root
+	root.add_child(label)
+	_dock._refresh_server_version_label()
+	var restyles := [0]
+	var count_restyle := func() -> void: restyles[0] += 1
+	label.theme_changed.connect(count_restyle)
+
+	for _i in 3:
+		_dock._refresh_server_version_label()
+	var steady_restyles: int = restyles[0]
+
+	_dock.present_lifecycle_snapshot({
+		"state": McpServerState.INCOMPATIBLE,
+		"actual_version": "1.2.3-stale-for-test",
+		"expected_version": "2.2.0",
+	})
+	for _i in 3:
+		_dock._refresh_server_version_label()
+	var state_change_restyles: int = restyles[0] - steady_restyles
+	var repainted_color: Color = label.get_theme_color("font_color")
+
+	label.theme_changed.disconnect(count_restyle)
+	root.remove_child(label)
+	_cleanup_server_row()
+	assert_eq(steady_restyles, 0, "an unchanged refresh must not restyle the label (#1121)")
+	assert_eq(state_change_restyles, 1, "a same-text state change must restyle exactly once")
+	assert_eq(repainted_color, Color.RED, "that restyle must apply the incompatible red")
 
 
 func test_server_version_label_shows_restart_for_recoverable_incompatible_server() -> void:
