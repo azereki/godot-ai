@@ -157,7 +157,7 @@ func test_mutation_cancel_before_commit_preserves_source() -> void:
 	var source := MUTATION_ROOT + ".txt"
 	_mutation_write(source, "source")
 	var result: Dictionary = await Mutation.new().run({"path": source, "new_path": MUTATION_ROOT + "_moved.txt"}, "move", func() -> bool: return false)
-	assert_is_error(result, "INVALID_PARAMS")
+	assert_is_error(result, "FILESYSTEM_DISCOVERY_FAILED")
 	assert_eq(result.error.data.outcome, "unchanged")
 	assert_eq(FileAccess.get_file_as_string(source), "source")
 	_mutation_cleanup()
@@ -370,7 +370,7 @@ func test_mutation_large_tree_yields_and_cancels_before_disk_effects() -> void:
 	var result: Dictionary = await Mutation.new().run({"path": source, "new_path": MUTATION_ROOT + "_moved.txt"}, "move", func() -> bool: return frames[0] == 0)
 	tree.process_frame.disconnect(tick)
 	assert_true(frames[0] > 0, "discovery must return control to a real process frame")
-	assert_is_error(result, "INVALID_PARAMS")
+	assert_is_error(result, "FILESYSTEM_DISCOVERY_FAILED")
 	assert_eq(result.error.data.outcome, "unchanged")
 	assert_eq(FileAccess.get_file_as_string(source), "keep")
 	assert_false(FileAccess.file_exists(MUTATION_ROOT + "_moved.txt"))
@@ -516,10 +516,213 @@ func test_mutation_binary_string_owner_is_not_cleared_by_dependencies() -> void:
 	var refused: Dictionary = await Mutation.new().run({"path": source, "new_path": destination}, "move")
 	assert_is_error(refused, "INVALID_PARAMS")
 	if refused.has("error"):
-		assert_contains(refused.error.message, "Binary dependency discovery is unsupported")
+		assert_contains(refused.error.message, "dependency path rewrites")
 		assert_eq(refused.error.data.outcome, "unchanged")
 	assert_true(FileAccess.file_exists(source), "unknown binary ownership must preserve source")
 	assert_false(FileAccess.file_exists(destination), "unknown binary ownership must not move")
+	for path in [owner, owner + ".uid"]:
+		if FileAccess.file_exists(path):
+			DirAccess.remove_absolute(path)
+	EditorInterface.get_resource_filesystem().update_file(owner)
+	_mutation_cleanup()
+
+
+func test_mutation_unrelated_binary_owner_does_not_block_move() -> void:
+	_mutation_cleanup()
+	var source := MUTATION_ROOT + ".txt"
+	var destination := MUTATION_ROOT + "_moved.txt"
+	var owner := MUTATION_ROOT + "_unrelated.res"
+	_mutation_write(source, "keep")
+	var resource := Resource.new()
+	resource.set_meta("fixture", "unrelated")
+	assert_eq(ResourceSaver.save(resource, owner), OK, "unrelated binary owner must save")
+	var result: Dictionary = await Mutation.new().run({"path": source, "new_path": destination}, "move")
+	assert_has_key(result, "data", str(result))
+	assert_eq(FileAccess.get_file_as_string(destination), "keep")
+	assert_false(FileAccess.file_exists(source))
+	for path in [owner, owner + ".uid"]:
+		if FileAccess.file_exists(path):
+			DirAccess.remove_absolute(path)
+	_mutation_cleanup()
+
+
+func test_mutation_large_unrelated_binary_owner_does_not_block_move() -> void:
+	_mutation_cleanup()
+	var source := MUTATION_ROOT + ".txt"
+	var destination := MUTATION_ROOT + "_moved.txt"
+	var owner := MUTATION_ROOT + "_large_binary_owner.res"
+	_mutation_write(source, "keep")
+	var resource := Resource.new()
+	var blob := PackedByteArray()
+	blob.resize(Mutation.MAX_FILE_BYTES + 1)
+	resource.set_meta("blob", blob)
+	assert_eq(ResourceSaver.save(resource, owner), OK, "large unrelated binary owner must save")
+	var result: Dictionary = await Mutation.new().run({"path": source, "new_path": destination}, "move")
+	assert_has_key(result, "data", str(result))
+	assert_eq(FileAccess.get_file_as_string(destination), "keep")
+	assert_false(FileAccess.file_exists(source))
+	for path in [owner, owner + ".uid"]:
+		if FileAccess.file_exists(path):
+			DirAccess.remove_absolute(path)
+	_mutation_cleanup()
+
+
+func test_mutation_compressed_binary_string_owner_fails_closed() -> void:
+	## The editor saves binary resources compressed by default, and a compressed
+	## container shows none of its serialized paths to a raw byte scan.
+	_mutation_cleanup()
+	var source := MUTATION_ROOT + ".gd"
+	var destination := MUTATION_ROOT + "_moved.gd"
+	var owner_script := MUTATION_ROOT + "_owner.gd"
+	var owner := MUTATION_ROOT + "_compressed_owner.res"
+	_mutation_uid_script(source)
+	_mutation_write(owner_script, "@tool\nextends Resource\n@export var file_path: String = \"\"\n@export var file_uid: String = \"\"\n")
+	var holder: Resource = load(owner_script).new()
+	holder.set("file_path", source)
+	assert_eq(ResourceSaver.save(holder, owner, ResourceSaver.FLAG_COMPRESS), OK, "compressed binary owner must save")
+	var raw := FileAccess.get_file_as_bytes(owner)
+	assert_eq(raw.slice(0, 4).get_string_from_ascii(), Mutation.COMPRESSED_MAGIC, "fixture must be a compressed container")
+	assert_false(Mutation.new()._bytes_contains_ci(raw, source.to_utf8_buffer()), "the raw container hides the serialized path")
+	var refused: Dictionary = await Mutation.new().run({"path": source, "new_path": destination}, "move")
+	assert_is_error(refused, "INVALID_PARAMS")
+	if refused.has("error"):
+		assert_contains(refused.error.message, "dependency path rewrites")
+		assert_eq(refused.error.data.outcome, "unchanged")
+	assert_true(FileAccess.file_exists(source), "a compressed owner's reference must preserve source")
+	assert_false(FileAccess.file_exists(destination), "a compressed owner's reference must not move")
+	for path in [owner, owner + ".uid"]:
+		if FileAccess.file_exists(path):
+			DirAccess.remove_absolute(path)
+	EditorInterface.get_resource_filesystem().update_file(owner)
+	_mutation_cleanup()
+
+
+func test_mutation_unrelated_compressed_binary_owner_does_not_block_move() -> void:
+	_mutation_cleanup()
+	var source := MUTATION_ROOT + ".txt"
+	var destination := MUTATION_ROOT + "_moved.txt"
+	var owner := MUTATION_ROOT + "_unrelated_compressed.res"
+	_mutation_write(source, "keep")
+	var resource := Resource.new()
+	resource.set_meta("fixture", "unrelated")
+	assert_eq(ResourceSaver.save(resource, owner, ResourceSaver.FLAG_COMPRESS), OK, "unrelated compressed owner must save")
+	var result: Dictionary = await Mutation.new().run({"path": source, "new_path": destination}, "move")
+	assert_has_key(result, "data", str(result))
+	assert_eq(FileAccess.get_file_as_string(destination), "keep")
+	assert_false(FileAccess.file_exists(source))
+	for path in [owner, owner + ".uid"]:
+		if FileAccess.file_exists(path):
+			DirAccess.remove_absolute(path)
+	_mutation_cleanup()
+
+
+func test_mutation_binary_ext_resource_owner_blocks_move() -> void:
+	## A binary ext_resource stores its UID as an integer. Once the stored
+	## fallback path is stale, no byte scan can find the reference: only the
+	## engine's dependency records still name the target.
+	_mutation_cleanup()
+	var stale := MUTATION_ROOT + "_stale.gd"
+	var source := MUTATION_ROOT + ".gd"
+	var destination := MUTATION_ROOT + "_moved.gd"
+	var owner := MUTATION_ROOT + "_script_owner.res"
+	_mutation_write(stale, "extends Resource\n")
+	var uid := ResourceUID.create_id()
+	_mutation_write(stale + ".uid", ResourceUID.id_to_text(uid))
+	ResourceUID.add_id(uid, stale)
+	var holder := Resource.new()
+	holder.set_script(load(stale))
+	assert_eq(ResourceSaver.save(holder, owner, ResourceSaver.FLAG_COMPRESS), OK, "script-owning binary must save")
+	holder = null
+	assert_eq(DirAccess.rename_absolute(stale, source), OK, "fixture script must move")
+	assert_eq(DirAccess.rename_absolute(stale + ".uid", source + ".uid"), OK, "fixture sidecar must move")
+	ResourceUID.set_id(uid, source)
+	var job := Mutation.new()
+	var payload: Variant = job._binary_scan_bytes(owner, FileAccess.get_file_as_bytes(owner))
+	assert_true(payload is PackedByteArray and not payload.is_empty(), "owner payload must expand")
+	if payload is PackedByteArray:
+		assert_false(job._bytes_contains_ci(payload, source.to_utf8_buffer()), "the owner stores only the stale path")
+		assert_false(job._bytes_contains_ci(payload, ResourceUID.id_to_text(uid).to_utf8_buffer()), "the owner stores no UID text")
+	var refused: Dictionary = await Mutation.new().run({"path": source, "new_path": destination}, "move")
+	assert_is_error(refused, "INVALID_PARAMS")
+	if refused.has("error"):
+		assert_contains(refused.error.message, "dependency path rewrites")
+	assert_true(FileAccess.file_exists(source), "a binary ext_resource reference must preserve source")
+	assert_false(FileAccess.file_exists(destination), "a binary ext_resource reference must not move")
+	for path in [owner, owner + ".uid", stale, stale + ".uid"]:
+		if FileAccess.file_exists(path):
+			DirAccess.remove_absolute(path)
+	EditorInterface.get_resource_filesystem().update_file(owner)
+	_mutation_cleanup()
+
+
+func test_mutation_compressed_container_expands_across_blocks() -> void:
+	## Godot's own compressed writer produces the same container under a
+	## different magic, which pins the block layout this parser assumes.
+	var path := "user://_filesystem_mutation_container.bin"
+	for size in [10000, 8192, 100]:
+		var original := PackedByteArray()
+		original.resize(size)
+		for index in size:
+			original[index] = (index * 31 + 7) % 251
+		var file := FileAccess.open_compressed(path, FileAccess.WRITE, FileAccess.COMPRESSION_ZSTD)
+		assert_true(file != null, "compressed fixture must open")
+		if file == null:
+			return
+		file.store_buffer(original)
+		file.close()
+		var raw := FileAccess.get_file_as_bytes(path)
+		DirAccess.remove_absolute(path)
+		var magic := Mutation.COMPRESSED_MAGIC.to_ascii_buffer()
+		for index in magic.size():
+			raw[index] = magic[index]
+		var job := Mutation.new()
+		var expanded: Variant = job._binary_scan_bytes(path, raw)
+		assert_true(expanded is PackedByteArray and expanded == original, "a %d-byte payload must expand intact" % size)
+		assert_eq(job._fault, "", "a valid container sets no fault")
+		if size == 10000:
+			var truncated := Mutation.new()
+			assert_true(truncated._binary_scan_bytes(path, raw.slice(0, raw.size() / 2)) == null, "a truncated container cannot be inspected")
+			assert_eq(truncated._fault_code, "FILESYSTEM_DISCOVERY_FAILED")
+
+
+func test_mutation_malformed_compressed_binary_owner_fails_discovery() -> void:
+	_mutation_cleanup()
+	var source := MUTATION_ROOT + ".txt"
+	var destination := MUTATION_ROOT + "_moved.txt"
+	var owner := MUTATION_ROOT + "_malformed.res"
+	_mutation_write(source, "keep")
+	_mutation_write(owner, Mutation.COMPRESSED_MAGIC + "not a container")
+	var result: Dictionary = await Mutation.new().run({"path": source, "new_path": destination}, "move")
+	assert_is_error(result, "FILESYSTEM_DISCOVERY_FAILED")
+	if result.has("error"):
+		assert_contains(result.error.message, "compressed binary owner")
+	assert_true(FileAccess.file_exists(source), "an unreadable owner must preserve source")
+	assert_false(FileAccess.file_exists(destination), "an unreadable owner must not move")
+	for path in [owner, owner + ".uid"]:
+		if FileAccess.file_exists(path):
+			DirAccess.remove_absolute(path)
+	_mutation_cleanup()
+
+
+func test_mutation_large_text_owner_fails_closed() -> void:
+	_mutation_cleanup()
+	var source := MUTATION_ROOT + ".txt"
+	var destination := MUTATION_ROOT + "_moved.txt"
+	var owner := MUTATION_ROOT + "_large_text_owner.gd"
+	_mutation_write(source, "keep")
+	var file := FileAccess.open(owner, FileAccess.WRITE)
+	assert_true(file != null, "large text owner fixture must open")
+	if file != null:
+		file.store_string("@tool\nextends RefCounted\nconst Target = \"%s\"\n" % source)
+		for _index in 30000:
+			file.store_string("# padding for the oversized-owner branch\n")
+		file.close()
+	EditorInterface.get_resource_filesystem().update_file(owner)
+	var result: Dictionary = await Mutation.new().run({"path": source, "new_path": destination}, "move")
+	assert_is_error(result, "FILESYSTEM_DISCOVERY_FAILED")
+	assert_contains(result.error.message, "exceeds")
+	assert_true(FileAccess.file_exists(source), "oversized text owner must preserve source")
+	assert_false(FileAccess.file_exists(destination), "oversized text owner must not move")
 	for path in [owner, owner + ".uid"]:
 		if FileAccess.file_exists(path):
 			DirAccess.remove_absolute(path)

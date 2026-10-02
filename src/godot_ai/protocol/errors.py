@@ -30,6 +30,11 @@ class ErrorCode(StrEnum):
     UNKNOWN_COMMAND = "UNKNOWN_COMMAND"
     INTERNAL_ERROR = "INTERNAL_ERROR"
     DEFERRED_TIMEOUT = "DEFERRED_TIMEOUT"
+    # #1120: filesystem mutation discovery failed before any disk effect
+    # (deadline/cancellation, entry/byte limits, or unreadable owner metadata).
+    # Kept separate from INVALID_PARAMS so callers can distinguish an
+    # environmental discovery failure from a bad filesystem_manage request.
+    FILESYSTEM_DISCOVERY_FAILED = "FILESYSTEM_DISCOVERY_FAILED"
     # A test run aborted at its between-test ceiling before finishing;
     # error.data carries the partial summary and get_test_results keeps the
     # partial results. Keep in sync with utils/error_codes.gd.
