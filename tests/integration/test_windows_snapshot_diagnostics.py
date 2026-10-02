@@ -47,6 +47,10 @@ def test_snapshot_diagnostics_classify_real_collector_controls(tmp_path, control
     result["same_without_sink"] = snapshot == Ports.parse_process_snapshot(raw, target)
     result["failed"] = Ports.capture_failed(snapshot)
     result["diagnostics"] = diagnostics
+    result["failure_category"] = (
+        Ports.snapshot_failure_category(diagnostics[0].category, diagnostics[0].depth)
+        if not diagnostics.is_empty() else ""
+    )
     result["fingerprint"] = not Ports.process_fingerprint(target, snapshot).is_empty()
     result["brand"] = Ports.pid_cmdline_is_godot_ai(target, snapshot)
     var rows: Variant = JSON.parse_string(raw)
@@ -71,3 +75,4 @@ def test_snapshot_diagnostics_classify_real_collector_controls(tmp_path, control
         assert result["diagnostics"] == [
             {"category": category, "stage": "single", "depth": 1, "elapsed_ms": -1, "count": 1}
         ]
+        assert result["failure_category"] == "ancestor_capture"

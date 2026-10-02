@@ -119,12 +119,34 @@ def test_real_lifecycle_proof_revalidates_pid_hints_and_final_identity(tmp_path:
             result = json.loads((project / "result.json").read_text(encoding="utf-8"))
             assert result["failures"] == [], result
             assert {row["case"]: row["reason"] for row in result["rows"]} == {
-                "initial_capture_failure": "identity_unavailable",
-                "final_capture_failure": "identity_unavailable", "exited_launcher": "launch_gone",
-                "owned_child": "ok", "changed_hint": "ok", "stale_hint_corrected": "ok",
+                "launch_capture_failure": "identity_unavailable",
+                "first_server_capture_failure": "identity_unavailable",
+                "final_capture_failure": "identity_unavailable",
+                "exited_launcher": "launch_gone", "owned_child": "ok",
+                "changed_hint": "ok", "stale_hint_corrected": "ok",
                 "unrelated_hint_corrected": "ok", "unrelated_hint_retained": "listener_pid",
                 "wrong_launch_identity": "launch_replaced",
                 "final_pid_changed": "final_capture_window",
+            }
+            evidence = {row["case"]: row for row in result["rows"]}
+            launch_evidence = evidence["launch_capture_failure"]
+            first_evidence = evidence["first_server_capture_failure"]
+            final_evidence = evidence["final_capture_failure"]
+            assert (launch_evidence["stage"], launch_evidence["category"]) == (
+                "launch", "process_query"
+            )
+            assert (first_evidence["stage"], first_evidence["category"]) == (
+                "first_server", "json_shape"
+            )
+            assert (final_evidence["stage"], final_evidence["category"]) == (
+                "final_server", "ancestor_capture"
+            )
+            assert evidence["wrong_launch_identity"]["category"] == "identity_mismatch"
+            assert evidence["final_pid_changed"]["category"] == "identity_mismatch"
+            assert launch_evidence["pid"] == os.getpid()
+            assert evidence["wrong_launch_identity"]["pid"] == os.getpid()
+            assert evidence["owned_child"]["attempts"] == {
+                "launch": 1, "first_server": 1, "final_server": 1
             }
         finally:
             try:

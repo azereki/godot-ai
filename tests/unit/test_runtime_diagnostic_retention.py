@@ -80,12 +80,13 @@ def boundary(monkeypatch, tmp_path):
         stdout="editor output",
         stderr="editor error",
         exit_code=41,
+        result_payload=None,
     ):
         def command(_executable, project):
             code = "from pathlib import Path; import sys,time; "
             if not missing:
                 result_path = str(project / "runtime-result.json")
-                payload = json.dumps({"error": "driver timed out"})
+                payload = json.dumps(result_payload or {"error": "driver timed out"})
                 code += f"Path({result_path!r}).write_text({payload!r}, encoding='utf-8'); "
             code += f"print({stdout!r},flush=True); print({stderr!r},file=sys.stderr,flush=True); "
             code += "time.sleep(20)" if timeout else f"raise SystemExit({exit_code})"
@@ -131,6 +132,27 @@ def test_failed_editor_retains_written_files_after_bridge_exit(boundary, kind):
     statuses = json.loads((output / "runtime-diagnostics.json").read_text(encoding="utf-8"))
     assert statuses["runtime-progress.json"] == "absent"
     assert statuses["runtime-result.json"] == "retained"
+
+
+@pytest.mark.parametrize("kind", ["predecessor", "a-to-b"])
+def test_identity_unavailable_failure_retains_bridge_and_runtime_result(boundary, kind):
+    invoke, output, bridge = boundary
+    diagnostic = {
+        "stage": "first_server",
+        "category": "json_shape",
+        "pid": 4242,
+        "creation_identity": "creation",
+        "attempt": 3,
+        "elapsed_ms": 19,
+    }
+    with pytest.raises(support.ReleaseError, match="update failed"):
+        invoke(kind, result_payload={"reason": "identity_unavailable", "diagnostic": diagnostic})
+    assert bridge.stopped
+    assert (output / "attached-bridge.log").read_text(encoding="utf-8") == "bridge stopped\n"
+    assert json.loads((output / "runtime-result.json").read_text(encoding="utf-8")) == {
+        "reason": "identity_unavailable",
+        "diagnostic": diagnostic,
+    }
 
 
 @pytest.mark.parametrize("kind", ["predecessor", "a-to-b"])
