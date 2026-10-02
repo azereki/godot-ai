@@ -160,6 +160,16 @@ func reparent_node(params: Dictionary) -> Dictionary:
 	_undo_redo.add_do_method(new_parent, "add_child", node, true)
 	_undo_redo.add_do_method(node, "set_owner", scene_root)
 	for child in descendants:
+		## Preserve intentional null owners and owners that live inside the
+		## moved subtree. `remove_child` clears owners outside the subtree, so
+		## only those need to be re-normalized to scene_root. The subtree is
+		## still intact here because the recorded do-methods have not run yet.
+		##
+		## Re-owning an instance's internal nodes with scene_root flattened the
+		## sub-scene on save and dropped its overrides (#1118).
+		var prior_owner: Node = child.owner
+		if prior_owner == null or prior_owner == node or node.is_ancestor_of(prior_owner):
+			continue
 		_undo_redo.add_do_method(child, "set_owner", scene_root)
 	_undo_redo.add_do_reference(node)
 	_undo_redo.add_undo_method(new_parent, "remove_child", node)

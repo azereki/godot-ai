@@ -463,10 +463,10 @@ func test_reparent_preserves_descendant_owner_on_undo() -> void:
 	chain.teardown.call()
 
 
-func test_reparent_restores_owned_and_unowned_descendants_on_undo_redo() -> void:
-	## Upstream PR #927 review: undo must restore a null owner unchanged rather
-	## than substituting scene_root. One subtree with both a scene-owned and an
-	## unowned child covers do / undo / redo.
+func test_reparent_preserves_owned_and_unowned_descendants_on_undo_redo() -> void:
+	## Issue #1118 requires a null owner to stay null through do, undo, and
+	## redo rather than being substituted with scene_root. One subtree with
+	## both a scene-owned and an unowned child covers all three paths.
 	var parent_res := _handler.create_node({
 		"type": "Node3D",
 		"name": "_McpTestMixParent",
@@ -513,7 +513,7 @@ func test_reparent_restores_owned_and_unowned_descendants_on_undo_redo() -> void
 	assert_has_key(result, "data")
 	assert_true(result.data.undoable, "reparent should be undoable")
 	assert_eq(owned.owner, scene_root, "owned child is scene-owned after reparent")
-	assert_eq(unowned.owner, scene_root, "unowned child is scene-owned after reparent")
+	assert_eq(unowned.owner, null, "unowned child stays unowned after reparent")
 
 	assert_true(editor_undo(_undo_redo), "undo reparent should succeed")
 	assert_eq(owned.owner, scene_root, "owned child owner restored to scene root on undo")
@@ -521,7 +521,7 @@ func test_reparent_restores_owned_and_unowned_descendants_on_undo_redo() -> void
 
 	assert_true(editor_redo(_undo_redo), "redo reparent should succeed")
 	assert_eq(owned.owner, scene_root, "owned child is scene-owned after redo")
-	assert_eq(unowned.owner, scene_root, "unowned child is scene-owned after redo")
+	assert_eq(unowned.owner, null, "unowned child stays unowned after redo")
 
 	assert_true(editor_undo(_undo_redo), "undo reparent after redo should succeed")
 	assert_eq(owned.owner, scene_root, "owned child owner restored after second undo")
@@ -531,6 +531,79 @@ func test_reparent_restores_owned_and_unowned_descendants_on_undo_redo() -> void
 	assert_true(editor_undo(_undo_redo), "undo unowned create should succeed")
 	assert_true(editor_undo(_undo_redo), "undo owned create should succeed")
 	assert_true(editor_undo(_undo_redo), "undo parent create should succeed")
+
+
+func test_reparent_keeps_instance_internal_owner() -> void:
+	## Issue #1118: the do path forced scene_root as the owner of EVERY
+	## descendant, so a node owned by an instanced sub-scene's root became
+	## scene-owned. Saving then wrote the instance's internals into the parent
+	## `.tscn` as local nodes and its overrides were dropped.
+	##
+	## Everything lives in a throwaway host + a freshly instanced snowman so
+	## the shared scene fixture is never mutated, and every create is unwound
+	## through the undo history at the end.
+	var host_res := _handler.create_node({
+		"type": "Node3D",
+		"name": "_McpTestInstanceHost",
+		"parent_path": "/Main",
+	})
+	assert_has_key(host_res, "data")
+	var instance_res := _handler.create_node({
+		"scene_path": "res://snowman.tscn",
+		"name": "_McpTestInstance",
+		"parent_path": "/Main/_McpTestInstanceHost",
+	})
+	assert_has_key(instance_res, "data")
+	var dest_res := _handler.create_node({
+		"type": "Node3D",
+		"name": "_McpTestInstanceDest",
+		"parent_path": "/Main",
+	})
+	assert_has_key(dest_res, "data")
+
+	var scene_root := EditorInterface.get_edited_scene_root()
+	var instance_root := scene_root.get_node_or_null("_McpTestInstanceHost/_McpTestInstance")
+	assert_ne(instance_root, null, "precondition: the sub-scene instance exists")
+	var inner := instance_root.get_node_or_null("Head")
+	assert_ne(inner, null, "precondition: the instance has an internal child")
+	assert_eq(inner.owner, instance_root,
+		"precondition: an instance internal node is owned by the instance root")
+
+	var result := _handler.reparent_node({
+		"path": "/Main/_McpTestInstanceHost",
+		"new_parent": "/Main/_McpTestInstanceDest",
+	})
+	assert_has_key(result, "data")
+	assert_true(result.data.undoable, "reparent should be undoable")
+
+	var moved_instance := scene_root.get_node_or_null(
+		"_McpTestInstanceDest/_McpTestInstanceHost/_McpTestInstance"
+	)
+	assert_ne(moved_instance, null, "the instance must move with its host")
+	assert_eq(moved_instance.owner, scene_root, "the instance root stays scene-owned")
+	var moved_inner := moved_instance.get_node_or_null("Head")
+	assert_ne(moved_inner, null, "the instance internals must survive the reparent")
+	assert_eq(moved_inner.owner, moved_instance,
+		"instance internals must keep the instance root as owner (#1118)")
+
+	assert_true(editor_undo(_undo_redo), "undo reparent should succeed")
+	var undone_instance := scene_root.get_node_or_null("_McpTestInstanceHost/_McpTestInstance")
+	assert_ne(undone_instance, null, "the instance must return under its host")
+	assert_eq(undone_instance.get_node_or_null("Head").owner, undone_instance,
+		"instance internals keep their owner after undo")
+
+	assert_true(editor_redo(_undo_redo), "redo reparent should succeed")
+	var redone_instance := scene_root.get_node_or_null(
+		"_McpTestInstanceDest/_McpTestInstanceHost/_McpTestInstance"
+	)
+	assert_ne(redone_instance, null, "the instance must move again on redo")
+	assert_eq(redone_instance.get_node_or_null("Head").owner, redone_instance,
+		"instance internals keep their owner after redo")
+
+	assert_true(editor_undo(_undo_redo), "undo reparent after redo should succeed")
+	assert_true(editor_undo(_undo_redo), "undo dest create should succeed")
+	assert_true(editor_undo(_undo_redo), "undo instance create should succeed")
+	assert_true(editor_undo(_undo_redo), "undo host create should succeed")
 
 
 ## Build a nested chain of throwaway Node3D test nodes under /Main, returning
