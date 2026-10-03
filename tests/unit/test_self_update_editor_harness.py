@@ -125,6 +125,120 @@ def test_timeout_reports_progress_without_suppressing_failure(
     assert "remaining=4s" in capsys.readouterr().out
 
 
+def _hanging_editor(monkeypatch: pytest.MonkeyPatch, now: list[int]) -> None:
+    """An editor that never answers: Popen writes its logs, poll never ends."""
+
+    class Process:
+        pid = 4321
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.returncode = -15
+
+        def wait(self, timeout):
+            return self.returncode
+
+    def popen(command, **kwargs):
+        kwargs["stdout"].write("fixture stdout\nfixture stderr\n")
+        Path(command[command.index("--log-file") + 1]).write_text("godot log\n", encoding="utf-8")
+        return Process()
+
+    monkeypatch.setattr(fixture.subprocess, "Popen", popen)
+    monkeypatch.setattr(fixture.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(fixture.time, "sleep", lambda _seconds: now.__setitem__(0, now[0] + 16))
+    monkeypatch.setattr(fixture, "load_smoke_script", lambda: SimpleNamespace(
+        diagnostic_reports_snapshot=lambda: set(),
+    ))
+
+
+def test_failed_run_retains_logs_only_where_diagnostics_dir_points(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    now = [0]
+    _hanging_editor(monkeypatch, now)
+    project = tmp_path / "v3-bridge-update"
+    project.mkdir()
+    diagnostics = tmp_path / "diagnostics"
+
+    monkeypatch.delenv(fixture.HARNESS_DIAGNOSTICS_ENV, raising=False)
+    with pytest.raises(AssertionError, match="timed out after 20 seconds"):
+        fixture.run_godot_editor(project, "godot", allow_headless=True, timeout=20)
+    assert not diagnostics.exists()
+    assert "retained" not in capsys.readouterr().out
+
+    monkeypatch.setenv(fixture.HARNESS_DIAGNOSTICS_ENV, str(diagnostics))
+    for attempt in ("v3-bridge-update-editor", "v3-bridge-update-editor-2"):
+        if attempt.endswith("-2"):
+            (project / "_test_restarted_editor.log").write_text(
+                "replacement output\n", encoding="utf-8"
+            )
+        with pytest.raises(AssertionError, match="timed out after 20 seconds"):
+            fixture.run_godot_editor(project, "godot", allow_headless=True, timeout=20)
+        retained = diagnostics / attempt
+        assert (retained / "godot.log").read_text(encoding="utf-8") == "godot log\n"
+        assert (retained / "editor-output.log").read_text(encoding="utf-8") == (
+            "fixture stdout\nfixture stderr\n"
+        )
+        restarted = retained / "restarted-editor.log"
+        assert restarted.exists() == attempt.endswith("-2")
+        progress = capsys.readouterr().out
+        assert f"v3-bridge-update/editor: retained {retained / 'godot.log'}" in progress
+    restarted = diagnostics / "v3-bridge-update-editor-2" / "restarted-editor.log"
+    assert restarted.read_text(encoding="utf-8") == "replacement output\n"
+    assert sorted(path.name for path in diagnostics.iterdir()) == [
+        "v3-bridge-update-editor", "v3-bridge-update-editor-2",
+    ]
+
+
+def test_retention_failure_keeps_the_editor_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    now = [0]
+    _hanging_editor(monkeypatch, now)
+    project = tmp_path / "v3-bridge-update"
+    project.mkdir()
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("occupied\n", encoding="utf-8")
+    monkeypatch.setenv(fixture.HARNESS_DIAGNOSTICS_ENV, str(blocker))
+
+    with pytest.raises(AssertionError, match="timed out after 20 seconds"):
+        fixture.run_godot_editor(project, "godot", allow_headless=True, timeout=20)
+    progress = capsys.readouterr().out
+    assert "v3-bridge-update/editor: could not retain editor logs:" in progress
+    assert "retained " not in progress
+
+
+def test_successful_run_retains_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Process:
+        pid = 4321
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    def popen(command, **kwargs):
+        kwargs["stdout"].write("fixture stdout\n")
+        return Process()
+
+    monkeypatch.setattr(fixture.subprocess, "Popen", popen)
+    monkeypatch.setattr(fixture, "load_smoke_script", lambda: SimpleNamespace(
+        diagnostic_reports_snapshot=lambda: set(),
+    ))
+    diagnostics = tmp_path / "diagnostics"
+    monkeypatch.setenv(fixture.HARNESS_DIAGNOSTICS_ENV, str(diagnostics))
+    project = tmp_path / "signed-self-update"
+    project.mkdir()
+
+    assert fixture.run_godot_editor(project, "godot", allow_headless=True) == "fixture stdout\n"
+    assert not diagnostics.exists()
+    assert "retained" not in capsys.readouterr().out
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("capability_env", ["LOCALAPPDATA", "GODOT_AI_CAPABILITY_DIR"])
 async def test_attached_agent_uses_python_and_the_editors_isolated_environment(
